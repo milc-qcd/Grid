@@ -156,17 +156,6 @@ void stdRead(Field &vec, const std::string filestem)
 }
 
 template <typename Field>
-void limeWrite(const std::string filestem, Field &vec)
-{
-  emptyUserRecord   record;
-  ScidacWriter binWriter(vec.Grid()->IsBoss());
-
-  binWriter.open(filestem + ".lime.bin");
-  binWriter.writeScidacFieldRecord(vec, record);
-  binWriter.close();
-}
-
-template <typename Field>
 void limeRead(Field &vec, const std::string filestem)
 {
   emptyUserRecord   record;

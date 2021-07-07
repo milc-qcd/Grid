@@ -115,7 +115,7 @@ assert(GRID_FIELD_NORM_CALC(FieldNormMetaData_, n2ck) < 1.0e-5);
    return stream.str();
  }
  
- template<class vobj> std::string ScidacRecordTypeString(Lattice<vobj> & lat,int &colors, int &spins, int & typesize,int &datacount) { 
+ template<class vobj> std::string ScidacRecordTypeString(const Lattice<vobj> & lat,int &colors, int &spins, int & typesize,int &datacount) { 
    return ScidacRecordTypeString<vobj>(colors,spins,typesize,datacount);
  };
 
@@ -123,7 +123,7 @@ assert(GRID_FIELD_NORM_CALC(FieldNormMetaData_, n2ck) < 1.0e-5);
  ////////////////////////////////////////////////////////////
  // Helper to fill out metadata
  ////////////////////////////////////////////////////////////
-template<class vobj> void ScidacMetaData(Lattice<vobj> & field,
+template<class vobj> void ScidacMetaData(const Lattice<vobj> & field,
 					  FieldMetaData &header,
 					  scidacRecord & _scidacRecord,
 					  scidacFile   & _scidacFile) 
@@ -407,7 +407,7 @@ class GridLimeWriter : public BinaryIO
   // in communicator used by the field.Grid()
   ////////////////////////////////////////////////////
   template<class vobj>
-  void writeLimeLatticeBinaryObject(Lattice<vobj> &field,std::string record_name)
+  void writeLimeLatticeBinaryObject(const Lattice<vobj> &field,std::string record_name)
   {
     ////////////////////////////////////////////////////////////////////
     // NB: FILE and iostream are jointly writing disjoint sequences in the
@@ -510,7 +510,7 @@ class ScidacWriter : public GridLimeWriter {
   // Write generic lattice field in scidac format
   ////////////////////////////////////////////////
   template <class vobj, class userRecord>
-  void writeScidacFieldRecord(Lattice<vobj> &field,userRecord _userRecord,
+  void writeScidacFieldRecord(const Lattice<vobj> &field,userRecord _userRecord,
                               const unsigned int recordScientificPrec = 0) 
   {
     GridBase * grid = field.Grid();
@@ -537,6 +537,18 @@ class ScidacWriter : public GridLimeWriter {
   }
 };
 
+template <typename Field>
+void limeWrite(const std::string filestem, const Field &vec)
+{
+  emptyUserRecord   record;
+  ScidacWriter binWriter(vec.Grid()->IsBoss());
+  //typedef typename std::remove_const<Field>::type VariableField;
+  //VariableField vec2(vec);
+  
+  binWriter.open(filestem + ".lime.bin");
+  binWriter.writeScidacFieldRecord(vec, record);
+  binWriter.close();
+}
 
 class ScidacReader : public GridLimeReader {
  public:

@@ -110,7 +110,7 @@ int main (int argc, char ** argv)
       latt = {l*mpi[0], l*mpi[1], l*mpi[2], l*mpi[3]};
 
       MSG << "-- Local volume " << l << "^4" << std::endl;
-      writeBenchmark<LatticeFermion>(latt, filestem(l), limeWrite<LatticeFermion>);
+      writeBenchmark<LatticeFermion>(latt, filestem(l), limeWrite<const LatticeFermion>);
       perf[i](volInd(l), gWrite) = BinaryIO::lastPerf.mbytesPerSecond;
     }
 

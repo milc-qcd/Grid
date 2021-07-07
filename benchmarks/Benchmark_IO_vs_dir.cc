@@ -42,7 +42,7 @@ int main (int argc, char ** argv)
   {
     MSG << "-- Directory " << d << std::endl;
     writeBenchmark<LatticeFermion>(GridDefaultLatt(), d + "/ioBench", 
-                                   stdWrite<LatticeFermion>, Ls, rb);
+                                   stdWrite<const LatticeFermion>, Ls, rb);
   }
   MSG << SEP << std::endl;
   MSG << "Benchmark Grid std read" << std::endl;
@@ -62,7 +62,7 @@ int main (int argc, char ** argv)
   {
     MSG << "-- Directory " << d << std::endl;
     writeBenchmark<LatticeFermion>(GridDefaultLatt(), d + "/ioBench", 
-                                   limeWrite<LatticeFermion>, Ls, rb);
+                                   limeWrite<const LatticeFermion>, Ls, rb);
   }
   MSG << SEP << std::endl;
   MSG << "Benchmark Grid C-Lime read" << std::endl;
