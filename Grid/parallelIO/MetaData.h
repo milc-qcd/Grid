@@ -167,7 +167,7 @@ inline void MachineCharacteristics(FieldMetaData &header)
   s << "FLOATING_POINT = "  << field.floating_point   << std::endl;	\
   s << "END_HEADER"         << std::endl;
 
-template<class vobj> inline void PrepareMetaData(Lattice<vobj> & field, FieldMetaData &header)
+template<class vobj> inline void PrepareMetaData(const Lattice<vobj> & field, FieldMetaData &header)
 {
   GridBase *grid = field.Grid();
   std::string format = getFormatString<vobj>();
@@ -188,7 +188,7 @@ public:
 };
 typedef GaugeStatistics<PeriodicGimplD> PeriodicGaugeStatistics;
 typedef GaugeStatistics<ConjugateGimplD> ConjugateGaugeStatistics;
-template<> inline void PrepareMetaData<vLorentzColourMatrixD>(Lattice<vLorentzColourMatrixD> & field, FieldMetaData &header)
+template<> inline void PrepareMetaData<vLorentzColourMatrixD>(const Lattice<vLorentzColourMatrixD> & field, FieldMetaData &header)
 {
   GridBase *grid = field.Grid();
   std::string format = getFormatString<vLorentzColourMatrixD>();

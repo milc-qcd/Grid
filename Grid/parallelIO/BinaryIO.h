@@ -575,7 +575,7 @@ class BinaryIO {
   // Write a Lattice of object
   //////////////////////////////////////////////////////////////////////////////////////
   template<class vobj,class fobj,class munger>
-    static inline void writeLatticeObject(Lattice<vobj> &Umu,
+    static inline void writeLatticeObject(const Lattice<vobj> &Umu,
 					  std::string file,
 					  munger munge,
 					  uint64_t offset,
