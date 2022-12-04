@@ -1637,6 +1637,7 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
 
       stagphase[mu]=1.0;        
       if ( gammas[mu] == Gamma::Algebra::Gamma5 ) stagphase[mu] = where( mod(lin_5,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
+      else if ( gammas[mu] == Gamma::Algebra::Identity ) {}
       else if ( gammas[mu] == Gamma::Algebra::GammaX ) stagphase[mu] = where( mod(lin_x,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
       else if ( gammas[mu] == Gamma::Algebra::GammaY ) stagphase[mu] = where( mod(lin_y,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
       else if ( gammas[mu] == Gamma::Algebra::GammaZ ) stagphase[mu] = where( mod(lin_z,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
