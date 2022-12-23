@@ -45,14 +45,14 @@ public:
   static void StagMesonFieldLocalMILC(TensorType &mat,
                              const FermionField *lhs_wi,
                              const FermionField *rhs_vj,
-                             std::vector<Gamma::Algebra> gammas,
+                             std::vector<StagGamma> gammas,
                              const std::vector<ComplexField > &mom,
                              int orthogdim, double *t_kernel = nullptr);
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   static void StagMesonFieldMILC(TensorType &mat,
                              const FermionField *lhs_wi,
                              const FermionField *rhs_vj,
-                             std::vector<Gamma::Algebra> gammas,
+                             std::vector<StagGamma> gammas,
                              const std::vector<ComplexField > &mom,
                              int orthogdim, double *t_kernel = nullptr, double *t_gsum = nullptr);
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
@@ -1517,7 +1517,7 @@ template <typename TensorType>
 void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
                                      const FermionField *lhs_wi,
                                      const FermionField *rhs_vj,
-                                     std::vector<Gamma::Algebra> gammas,
+                                     std::vector<StagGamma> gammas,
                                      const std::vector<ComplexField > &mom,
                                      int orthogdim, double *t_kernel)
 {
@@ -1634,17 +1634,8 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
 
   std::vector<ComplexField> stagphase(Ngamma,grid);   
   for (int mu = 0; mu < Ngamma; mu++) {
-
-      stagphase[mu]=1.0;        
-      if ( gammas[mu] == Gamma::Algebra::Gamma5 ) stagphase[mu] = where( mod(lin_5,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
-      else if ( gammas[mu] == Gamma::Algebra::Identity ) {}
-      else if ( gammas[mu] == Gamma::Algebra::GammaX ) stagphase[mu] = where( mod(lin_x,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
-      else if ( gammas[mu] == Gamma::Algebra::GammaY ) stagphase[mu] = where( mod(lin_y,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
-      else if ( gammas[mu] == Gamma::Algebra::GammaZ ) stagphase[mu] = where( mod(lin_z,2)==(Integer)0, stagphase[mu],-stagphase[mu]);
-      else {
-          std::cout << gammas[mu] << " not implemented for staggered fermion meson field" << std::endl;
-          assert(0);
-      }
+      stagphase[mu]=1.0;
+      stagphase[mu] = stagphase[mu]*gammas[mu];
   }
 
   // Setup lists of pointers to share with accelerators
@@ -1842,7 +1833,7 @@ template <typename TensorType>
 void A2Autils<FImpl>::StagMesonFieldMILC(TensorType &mat,
                                      const FermionField *lhs_wi,
                                      const FermionField *rhs_vj,
-                                     std::vector<Gamma::Algebra> gammas,
+                                     std::vector<StagGamma> gammas,
                                      const std::vector<ComplexField > &mom,
                                      int orthogdim, double *t_kernel, double *t_gsum)
 {
