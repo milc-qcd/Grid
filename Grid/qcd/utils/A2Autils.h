@@ -10,6 +10,8 @@ template <typename FImpl>
 class A2Autils 
 {
 public:
+  typedef std::pair<Gamma::Algebra, Gamma::Algebra> GammaPair;
+
   typedef typename FImpl::ComplexField ComplexField;
   typedef typename FImpl::FermionField FermionField;
   typedef typename FImpl::PropagatorField PropagatorField;
@@ -45,16 +47,16 @@ public:
   static void StagMesonFieldLocalMILC(TensorType &mat,
                              const FermionField *lhs_wi,
                              const FermionField *rhs_vj,
-                             std::vector<StagGamma> gammas,
-                             const std::vector<ComplexField > &mom,
-                             int orthogdim, double *t_kernel = nullptr);
+                             const std::vector<StagGamma::SpinTastePair>& gammas,
+                             const std::vector<ComplexField> &mom,
+                             int orthogdim, LatticeGaugeField* U = nullptr, double *t_kernel = nullptr);
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   static void StagMesonFieldMILC(TensorType &mat,
                              const FermionField *lhs_wi,
                              const FermionField *rhs_vj,
-                             std::vector<StagGamma> gammas,
-                             const std::vector<ComplexField > &mom,
-                             int orthogdim, double *t_kernel = nullptr, double *t_gsum = nullptr);
+                             const std::vector<StagGamma::SpinTastePair>& gammas,
+                             const std::vector<ComplexField> &mom,
+                             int orthogdim, LatticeGaugeField* U = nullptr, double *t_kernel = nullptr, double *t_gsum = nullptr);
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   static void StagMesonFieldCC(TensorType &mat,
                                //const LatticeGaugeField &U,
@@ -1517,14 +1519,20 @@ template <typename TensorType>
 void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
                                      const FermionField *lhs_wi,
                                      const FermionField *rhs_vj,
-                                     std::vector<StagGamma> gammas,
+                                     const std::vector<StagGamma::SpinTastePair>& gammas,
                                      const std::vector<ComplexField > &mom,
-                                     int orthogdim, double *t_kernel)
+                                     int orthogdim, 
+                                     LatticeGaugeField* U, double *t_kernel)
 {
   typedef decltype(coalescedRead(Scalar_v())) calcScalar;
   typedef decltype(coalescedRead(vobj())) calcSpinor;
   
 
+  // SimpleCompressor<vobj> compressor;
+  // CartesianStencil<vobj,vobj,int> Stencil;
+  // CartesianStencil<vobj,vobj,int> StencilEven;
+  // CartesianStencil<vobj,vobj,int> StencilOdd;
+  
   int Lblock = mat.dimension(3);
   int Rblock = mat.dimension(4);
 
@@ -1549,6 +1557,7 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
       assert(cb == rhs_vj[0].Checkerboard());
     }
   }
+  
   if(checkerR) {
     sizeR = Rblock/2;
     hgrid = rhs_vj[0].Grid();
@@ -1585,19 +1594,19 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
     lsSum[r]=scalar_type(0.0);
   });
 
-  int nBlocks = grid->_slice_nblock[orthogdim];
   int vecsPerSlicePerBlock = grid->_slice_block[orthogdim];
+  int nBlocks      = grid->_slice_nblock[orthogdim];
   int blockStride  = grid->_slice_stride[orthogdim];
-  int rtStride   = grid->_ostride[orthogdim];
+  int rtStride     = grid->_ostride[orthogdim];
 
   if (checkerR || checkerL) {
     // Global sum fails at end if checkerboard dim is orthogdim
     assert(hgrid->CheckerBoarded(orthogdim) != 1);
 
-    nBlocks = hgrid->_slice_nblock[orthogdim];
     vecsPerSlicePerBlock = hgrid->_slice_block[orthogdim];
+    nBlocks      = hgrid->_slice_nblock[orthogdim];
     blockStride  = hgrid->_slice_stride[orthogdim];
-    rtStride   = hgrid->_ostride[orthogdim];
+    rtStride     = hgrid->_ostride[orthogdim];
 
     thread_for(ss,grid->oSites(),{
       int cbos;
@@ -1613,29 +1622,19 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
     });
   }
 
-
-  // potentially wasting cores here if local time extent too small
   if (t_kernel) *t_kernel = -usecond();
   
-  // based on phases in Grid/qcd/action/fermion/FermionOperatorImpl.h
-  // Pretty cute implementation, if I may say so myself (!) (-PAB)
-  // Staggered Phases for local, taste non-singlet meson operators.
-  // See Degrand and Detar, Ch 11.2
-  
-  Lattice<iScalar<vInteger> > x(grid); LatticeCoordinate(x,0);
-  Lattice<iScalar<vInteger> > y(grid); LatticeCoordinate(y,1);
-  Lattice<iScalar<vInteger> > z(grid); LatticeCoordinate(z,2);
-  Lattice<iScalar<vInteger> > t(grid); LatticeCoordinate(t,3);
-  
-  Lattice<iScalar<vInteger> > lin_x(grid); lin_x=y+z+t;
-  Lattice<iScalar<vInteger> > lin_y(grid); lin_y=x+z+t;
-  Lattice<iScalar<vInteger> > lin_z(grid); lin_z=x+y+t;
-  Lattice<iScalar<vInteger> > lin_5(grid); lin_5=x+y+z+t;
+  StagGamma spinTaste;
+  if (U != nullptr) {
+    spinTaste.setGaugeField(*U);
+  }
 
   std::vector<ComplexField> stagphase(Ngamma,grid);   
+
   for (int mu = 0; mu < Ngamma; mu++) {
-      stagphase[mu]=1.0;
-      stagphase[mu] = stagphase[mu]*gammas[mu];
+    spinTaste.setSpinTaste(gammas[mu]);
+    stagphase[mu]=1.0;
+    spinTaste.applyPhase(stagphase[mu],stagphase[mu]); // store spin-taste phase
   }
 
   // Setup lists of pointers to share with accelerators
@@ -1788,7 +1787,8 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
   int pd = grid->_processors[orthogdim];
   int pc = grid->_processor_coor[orthogdim];
 
-  thread_for_collapse(2,lt,ld,{
+  // thread_for_collapse(2,lt,ld,{
+    for(int lt=0;lt<ld;lt++){
     for(int pt=0;pt<pd;pt++){
       int t = lt + pt*ld;
       // Fill mat only with the data you have locally
@@ -1817,7 +1817,8 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
         }
       }
     }
-  });
+  // });
+  }
 
   if (t_kernel) *t_kernel += usecond();
 
@@ -1833,12 +1834,14 @@ template <typename TensorType>
 void A2Autils<FImpl>::StagMesonFieldMILC(TensorType &mat,
                                      const FermionField *lhs_wi,
                                      const FermionField *rhs_vj,
-                                     std::vector<StagGamma> gammas,
+                                     const std::vector<StagGamma::SpinTastePair>& gammas,
                                      const std::vector<ComplexField > &mom,
-                                     int orthogdim, double *t_kernel, double *t_gsum)
+                                     int orthogdim, 
+                                     LatticeGaugeField* U, 
+                                     double *t_kernel, double *t_gsum)
 {
 
-  StagMesonFieldLocalMILC(mat,lhs_wi,rhs_vj,gammas,mom,orthogdim,t_kernel);
+  StagMesonFieldLocalMILC(mat,lhs_wi,rhs_vj,gammas,mom,orthogdim,U,t_kernel);
 
   // Combine local mat objects from all processors so that it's completely filled in.
   ////////////////////////////////////////////////////////////////////
