@@ -211,13 +211,21 @@ template<class obj>
 void StagGamma::oneLink(Lattice<obj> &lhs, const Lattice<obj> &rhs, int shift_dir) const {
 
   Lattice<obj> temp(rhs.Grid());
-  LatticeColourMatrix Umu(U->Grid());
+  LatticeColourMatrix Umu(rhs.Grid());
 
-  Umu  = PeekIndex<LorentzIndex>(*U,shift_dir);
-  temp = adj(Umu)*rhs;
-  lhs  = Cshift(temp,shift_dir,-1);
-  temp = Cshift(rhs,shift_dir,1);
-  lhs +=  Umu*temp;
+  if (rhs.Grid()->_isCheckerBoarded) {
+    LatticeColourMatrix Umu_full(U->Grid());
+    Umu_full  = PeekIndex<LorentzIndex>(*U,shift_dir);
+    pickCheckerboard(rhs.Checkerboard(),Umu,Umu_full);
+    temp = adj(Umu)*rhs;
+    pickCheckerboard(lhs.Checkerboard(),Umu,Umu_full);
+  } else {
+    Umu  = PeekIndex<LorentzIndex>(*U,shift_dir);
+    temp = adj(Umu)*rhs;
+  }
+    lhs  = Cshift(temp,shift_dir,-1);
+    temp = Cshift(rhs,shift_dir,1);
+    lhs +=  Umu*temp;
 }
 
 

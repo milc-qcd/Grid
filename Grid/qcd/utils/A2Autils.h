@@ -1672,14 +1672,6 @@ void A2Autils<FImpl>::StagMesonFieldLocalMILC(TensorType &mat,
 
   Coordinate *icoor_p = &icoorContainer[0];
 
-  // Hack to prefetch fields onto device memory. There's probably a more explicit way to do it?
-  accelerator_forNB(index,sizeL+sizeR,1,{
-    if (index < sizeL)
-      auto a = view_pW[index][0];
-    else
-      auto a = view_pV[index-sizeL][0];                                                                                                                                                                                
-  });  
-
   accelerator_for2d(l_index,sizeL,r_index,sizeR,Nsimd,{
 
     // Spawn threads for each time slice on the local processor
