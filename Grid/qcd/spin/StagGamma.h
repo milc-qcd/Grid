@@ -9,7 +9,7 @@ NAMESPACE_BEGIN(Grid)
 class StagGamma {
   public:
     // XYZT convention
-    GRID_SERIALIZABLE_ENUM(StagAlgebra, undef,
+/*    GRID_SERIALIZABLE_ENUM(StagAlgebra, undef,
                            G1     , 0,
                            GT     , 1,
                            GZ     , 2,
@@ -25,26 +25,26 @@ class StagGamma {
                            GXY    , 12,
                            G5Z    , 13,
                            G5T    , 14,
-                           G5     , 15);
+                           G5     , 15);*/
 
     // TXYZ convention
-    // GRID_SERIALIZABLE_ENUM(StagAlgebra, undef,
-    //                        G1     , 0,
-    //                        GZ     , 1,
-    //                        GY     , 2,
-    //                        GYZ    , 3,
-    //                        GX     , 4,
-    //                        GZX    , 5,
-    //                        GXY    , 6,
-    //                        G5T    , 7,
-    //                        GT     , 8,
-    //                        GZT    , 9,
-    //                        GYT    , 10,
-    //                        G5X    , 11,
-    //                        GXT    , 12,
-    //                        G5Y    , 13,
-    //                        G5Z    , 14,
-    //                        G5     , 15);
+    GRID_SERIALIZABLE_ENUM(StagAlgebra, undef,
+                           G1     , 0,
+                           GZ     , 1,
+                           GY     , 2,
+                           GYZ    , 3,
+                           GX     , 4,
+                           GZX    , 5,
+                           GXY    , 6,
+                           G5T    , 7,
+                           GT     , 8,
+                           GZT    , 9,
+                           GYT    , 10,
+                           G5X    , 11,
+                           GXT    , 12,
+                           G5Y    , 13,
+                           G5Z    , 14,
+                           G5     , 15);
 
   typedef std::pair<StagAlgebra, StagAlgebra> SpinTastePair;
 
@@ -109,9 +109,6 @@ class StagGamma {
     void applyPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) const;
 
     template<typename obj>
-    void applyShift(Lattice<obj> &lhs, const Lattice<obj> &rhs) const;
-
-    template<typename obj>
     void oneLink(Lattice<obj> &lhs, const Lattice<obj> &rhs, int shift_dir) const;
 
     template<typename obj>
@@ -123,7 +120,7 @@ class StagGamma {
     static inline StagAlgebra LessThan(StagAlgebra g);
     static inline StagAlgebra GreaterThan(StagAlgebra g);
 
-    // Assign negative orientations to StagAlgebra gammas according to xyzt oriented euclidean space.
+    // Assign negative orientations to StagAlgebra gammas according to txyz (or xyzt?) oriented euclidean space.
     inline int  getOrientation(StagAlgebra g);
 
     // Implements eqn. E3 of Follana (2007)
@@ -175,14 +172,9 @@ inline StagGamma::StagAlgebra StagGamma::GreaterThan(StagAlgebra g) {
 
 template<class obj>
 void StagGamma::applyGamma(Lattice<obj> &lhs, const Lattice<obj> &rhs) const {
-  applyShift(lhs,rhs);
-  applyPhase(lhs,lhs);
-}
-
-template<class obj>
-void StagGamma::applyShift(Lattice<obj> &lhs, const Lattice<obj> &rhs) const {
   uint16_t shift = _spin^_taste;
 
+  // Dir index according to Grid convention, XYZT
   int dir = 0;
 
   if (shift != 0) {
@@ -191,7 +183,7 @@ void StagGamma::applyShift(Lattice<obj> &lhs, const Lattice<obj> &rhs) const {
 
   switch(shift) {
   case StagAlgebra::G1:
-    lhs = rhs;
+    applyPhase(lhs,rhs);
     break;
   case StagAlgebra::GT:
     dir++;
@@ -201,6 +193,7 @@ void StagGamma::applyShift(Lattice<obj> &lhs, const Lattice<obj> &rhs) const {
     dir++;
   case StagAlgebra::GX:
     oneLink(lhs,rhs,dir);
+    applyPhase(lhs,lhs);
     break;
   default:
     assert(0);
@@ -220,12 +213,12 @@ void StagGamma::oneLink(Lattice<obj> &lhs, const Lattice<obj> &rhs, int shift_di
     temp = adj(Umu)*rhs;
     pickCheckerboard(lhs.Checkerboard(),Umu,Umu_full);
   } else {
-    Umu  = PeekIndex<LorentzIndex>(*U,shift_dir);
+    Umu = PeekIndex<LorentzIndex>(*U,shift_dir);
     temp = adj(Umu)*rhs;
   }
-    lhs  = Cshift(temp,shift_dir,-1);
-    temp = Cshift(rhs,shift_dir,1);
-    lhs +=  Umu*temp;
+  lhs  = Cshift(temp,shift_dir,-1);
+  temp = Cshift(rhs,shift_dir,1);
+  lhs += Umu*temp;
 }
 
 
@@ -308,9 +301,9 @@ void StagGamma::applyPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) const {
     stag_dirs = Zero();
   }
 
-  for (int i = 0; i < gmu.size(); i++) {
-    if (gmu[i] & _oscillateDirs) {
-      LatticeCoordinate(coor,i);
+  for (int dir = 0; dir < gmu.size(); dir++) {
+    if (gmu[dir] & _oscillateDirs) { // gmu[dir] maps Grid XYZT convention to our current binary convention
+      LatticeCoordinate(coor,dir);
       stag_dirs += coor;
     }
   }
