@@ -277,6 +277,7 @@ inline void StagGamma::calculatePhase() {
     assert(0);
   }
 
+  _negated = false;
   calculateOscillation();
   calculateNegation();
 
