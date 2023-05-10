@@ -42,10 +42,9 @@ public:
   typedef typename ComplexField::vector_object cobj;
   typedef LatticeView<cobj> ComplexView;
 
-private:
+public:
   struct utilHelper {
   public:
-    std::map<std::string, std::vector<StagGamma::SpinTastePair> > gammaSets;
     std::vector<int> shiftDirs, shiftDisplacements;
     Vector<GaugeView> viewGauge;
     Vector<ComplexView> viewGamma, viewMom;
@@ -110,7 +109,6 @@ public:
 
   static void init(const std::vector<StagGamma::SpinTastePair>& gammas, LatticeGaugeField* U, GridBase *grid, utilHelper &helper){
 
-    helper.gammaSets = {{"comm",{}},{"local",{}}};
 
     StagGamma spinTaste;
     if (U != nullptr) {
@@ -123,7 +121,6 @@ public:
       spinTaste.setSpinTaste(gammas[i]);
       int shift = (spinTaste._spin ^ spinTaste._taste);
       if (shift != 0) {
-        helper.gammaSets["comm"].push_back(gammas[i]);
         helper.gammaIndicesComm.push_back(i);
 
         // Assume 1-link for now -- break loop when you find a shift direction
@@ -135,12 +132,11 @@ public:
           }
         }
       } else {
-        helper.gammaSets["local"].push_back(gammas[i]);
         helper.gammaIndicesLocal.push_back(i);
       }
     }
 
-    if (helper.gammaSets["local"].size() > MF_SUM_ARRAY_SIZE || helper.gammaSets["comm"].size() > MF_SUM_ARRAY_SIZE) {
+    if (helper.gammaIndicesLocal.size() > MF_SUM_ARRAY_SIZE || helper.gammaIndicesComm.size() > MF_SUM_ARRAY_SIZE) {
       std::cout << GridLogError << "Parameter space too large: Need num Momenta * num Gammas < " << MF_SUM_ARRAY_SIZE << "." << std::endl;
       assert(0);
     }
@@ -252,9 +248,6 @@ void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   helper.grid = grid;
   GridBase *cbGrid = nullptr;
 
-  const int numDims  = grid->_ndimension;
-  const int simdSize = grid->Nsimd();
-  
   helper.checkerL = lhs_wi_e[0].Grid()->_isCheckerBoarded;
   helper.checkerR = rhs_vj_e[0].Grid()->_isCheckerBoarded;
 
@@ -272,8 +265,8 @@ void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   init(gammas,U,grid, helper);
 
   int nGamma       = gammas.size();
-  int nGamma_comm  = helper.gammaSets["comm"].size();
-  int nGamma_local = helper.gammaSets["local"].size();
+  int nGamma_comm  = helper.gammaIndicesComm.size();
+  int nGamma_local = helper.gammaIndicesLocal.size();
 
   std::vector<ComplexField> stagPhase(nGamma,grid);
 
@@ -769,7 +762,7 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(commVector<Scalar_v>& result, int
 
   accelerator_for2dNB_no_err(l_index,sizeL,r_index,sizeR,simdSize,{
 
-    int so, ss, base, sumIndex;
+    int so, ss, base, sumIndex, ssL, ssR, fullss;
     calcSpinor left, right;
     calcScalar temp_site, gamma_phase, momentum_phase, sum[MF_SUM_ARRAY_SIZE];
 
@@ -786,9 +779,7 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(commVector<Scalar_v>& result, int
       for(int n=0;n<nBlocks;n++)
       for(int b=0;b<vecsPerSlicePerBlock;b++){
 
-          int ss = so+n*blockStride+b;
-
-          int ssL, ssR, fullss = ss;
+          ssL = ssR = fullss = so+n*blockStride+b;
 
           if (checkerL || checkerR) {
             fullss = oCoords_p[ss];

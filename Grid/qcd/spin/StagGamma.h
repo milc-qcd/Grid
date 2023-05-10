@@ -124,13 +124,13 @@ class StagGamma {
     inline int  getOrientation(StagAlgebra g);
 
     // Implements eqn. E3 of Follana (2007)
-    inline void calculatePhase();
+    accelerator_inline void calculatePhase();
 
     // Implements (-1)^(x[mu] * ( _taste^< + _spin^> ) ( see eqn. E3 of Follana (2007) )
-    inline void calculateOscillation();
+    accelerator_inline void calculateOscillation();
 
     // Implements (-1)^(_spin * (_spin + _taste)^<) ( see eqn. E3 of Follana (2007) )
-    inline void calculateNegation();
+    accelerator_inline void calculateNegation();
 
     inline void toggleNegation() { _negated = !_negated; }
   public:
@@ -147,7 +147,7 @@ class StagGamma {
     RealD _scaling;
 };
 
-inline StagGamma::StagAlgebra StagGamma::LessThan(StagAlgebra g) {
+accelerator_inline StagGamma::StagAlgebra StagGamma::LessThan(StagAlgebra g) {
   uint8_t ret = 0;
   uint8_t mask = g;
 
@@ -158,7 +158,7 @@ inline StagGamma::StagAlgebra StagGamma::LessThan(StagAlgebra g) {
   return ret;
 }
 
-inline StagGamma::StagAlgebra StagGamma::GreaterThan(StagAlgebra g) {
+accelerator_inline StagGamma::StagAlgebra StagGamma::GreaterThan(StagAlgebra g) {
   uint8_t ret = 0;
   uint8_t mask = g;
 
@@ -245,7 +245,7 @@ inline int StagGamma::getOrientation(StagAlgebra g) {
   return 1;
 }
 
-inline void StagGamma::calculateNegation() {
+accelerator_inline void StagGamma::calculateNegation() {
   StagAlgebra result = _spin & LessThan(_spin ^ _taste);
 
   for (auto &dir : StagGamma::gmu) {
@@ -255,12 +255,12 @@ inline void StagGamma::calculateNegation() {
   }
 }
 
-inline void StagGamma::calculateOscillation() {
+accelerator_inline void StagGamma::calculateOscillation() {
 
   _oscillateDirs = LessThan(_taste) ^ GreaterThan(_spin);
 }
 
-inline void StagGamma::calculatePhase() {
+accelerator_inline void StagGamma::calculatePhase() {
 
   // scale down according to number of terms in symmetric shift
   switch(_spin ^ _taste) {
