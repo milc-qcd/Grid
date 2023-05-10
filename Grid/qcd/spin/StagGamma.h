@@ -117,8 +117,8 @@ class StagGamma {
     }
   private:
     // Calculate the < and > operations as defined in Follana (2007) eqns A5 and A7.
-    static inline StagAlgebra LessThan(StagAlgebra g);
-    static inline StagAlgebra GreaterThan(StagAlgebra g);
+    static accelerator_inline StagAlgebra LessThan(StagAlgebra g);
+    static accelerator_inline StagAlgebra GreaterThan(StagAlgebra g);
 
     // Assign negative orientations to StagAlgebra gammas according to txyz (or xyzt?) oriented euclidean space.
     inline int  getOrientation(StagAlgebra g);
