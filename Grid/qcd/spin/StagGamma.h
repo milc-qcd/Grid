@@ -132,7 +132,7 @@ class StagGamma {
     // Implements (-1)^(_spin * (_spin + _taste)^<) ( see eqn. E3 of Follana (2007) )
     accelerator_inline void calculateNegation();
 
-    inline void toggleNegation() { _negated = !_negated; }
+    accelerator_inline void toggleNegation() { _negated = !_negated; }
   public:
     static constexpr unsigned int nGamma = 16;
     static const std::array<const char *, nGamma>                name;
