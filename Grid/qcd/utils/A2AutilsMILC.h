@@ -102,7 +102,7 @@ public:
   static void contractSimd(TensorType &result, bool do_comm, 
                             commVector<Scalar_v> &simd_sum_e, commVector<Scalar_v> &simd_sum_o, utilHelper &helper);
   template <typename TensorType>
-  static void contractSimd(TensorType &result, commVector<Scalar_v> &simd_sum, Vector<Integer> gamma_indices, utilHelper &helper);
+  static void contractSimd(TensorType &result, commVector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper);
 
   static void spatialContractComm(commVector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
   static void spatialContractLocal(commVector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
@@ -300,23 +300,23 @@ void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   std::vector<std::unique_ptr<FermStencil> > stencilLeft_o(helper.checkerL ? helper.sizeL : 0);
   std::vector<std::unique_ptr<FermStencil> > stencilRight_o(helper.checkerR ? helper.sizeR : 0);
 
-  for (auto &item : stencilLeft_e) {
-    item = std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0));
-  }
-  for (auto &item : stencilRight_e) {
-    item = std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0));
-  }
-  for (auto &item : stencilLeft_o) {
-    item = std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0));
-  }
-  for (auto &item : stencilRight_o) {
-    item = std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0));
-  }
-
   std::vector<LatticeColourMatrix> Umu(nGamma_comm,grid);
 
   // Run any nonlocal gamma operators
   if (nGamma_comm > 0) {
+    for (auto &item : stencilLeft_e) {
+      item = std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0));
+    }
+    for (auto &item : stencilRight_e) {
+      item = std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0));
+    }
+    for (auto &item : stencilLeft_o) {
+      item = std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0));
+    }
+    for (auto &item : stencilRight_o) {
+      item = std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0));
+    }
+
     makeStencilView(helper.viewStencilLeft_e,  stencilLeft_e,  lhs_wi_e, helper.sizeL);
     makeStencilView(helper.viewStencilRight_e, stencilRight_e, rhs_vj_e, helper.sizeR);
     if (helper.checkerL)
@@ -490,7 +490,7 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, commVec
 
 template <class FImpl>
 template <typename TensorType>
-void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,commVector<Scalar_v> &simd_sum, Vector<Integer> gamma_indices, utilHelper &helper) {
+void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,commVector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper) {
 
   if (simd_sum.size() == 0)
     return;
@@ -779,7 +779,8 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(commVector<Scalar_v>& result, int
       for(int n=0;n<nBlocks;n++)
       for(int b=0;b<vecsPerSlicePerBlock;b++){
 
-          ssL = ssR = fullss = so+n*blockStride+b;
+          ss = so+n*blockStride+b;
+          ssL = ssR = fullss = ss;
 
           if (checkerL || checkerR) {
             fullss = oCoords_p[ss];
