@@ -100,12 +100,12 @@ public:
 
   template <typename TensorType>
   static void contractSimd(TensorType &result, bool do_comm, 
-                            commVector<Scalar_v> &simd_sum_e, commVector<Scalar_v> &simd_sum_o, utilHelper &helper);
+                            Vector<Scalar_v> &simd_sum_e, Vector<Scalar_v> &simd_sum_o, utilHelper &helper);
   template <typename TensorType>
-  static void contractSimd(TensorType &result, commVector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper);
+  static void contractSimd(TensorType &result, Vector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper);
 
-  static void spatialContractComm(commVector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
-  static void spatialContractLocal(commVector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
+  static void spatialContractComm(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
+  static void spatialContractLocal(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
 
   static void init(const std::vector<StagGamma::SpinTastePair>& gammas, LatticeGaugeField* U, GridBase *grid, utilHelper &helper){
 
@@ -279,8 +279,8 @@ void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
     }
   }
 
-  commVector<Scalar_v> simd_sum_comm_e, simd_sum_comm_o;
-  commVector<Scalar_v> simd_sum_local_e, simd_sum_local_o;
+  Vector<Scalar_v> simd_sum_comm_e, simd_sum_comm_o;
+  Vector<Scalar_v> simd_sum_local_e, simd_sum_local_o;
 
   makeView(helper.viewGamma,&stagPhase[0],nGamma);
   makeView(helper.viewMom,  &mom[0],helper.nMom);
@@ -390,8 +390,8 @@ void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
 
 template <class FImpl>
 template <typename TensorType>
-void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, commVector<Scalar_v> &simd_sum_e, 
-                                        commVector<Scalar_v> &simd_sum_o, utilHelper &helper) {
+void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, Vector<Scalar_v> &simd_sum_e, 
+                                        Vector<Scalar_v> &simd_sum_o, utilHelper &helper) {
 
   if (simd_sum_e.size() == 0)
     return;
@@ -490,7 +490,7 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, commVec
 
 template <class FImpl>
 template <typename TensorType>
-void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,commVector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper) {
+void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,Vector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper) {
 
   if (simd_sum.size() == 0)
     return;
@@ -551,7 +551,7 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,commVector<Scalar_v> &
 }
 
 template <class FImpl>
-void A2AutilsMILC<FImpl>::spatialContractComm(commVector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper)
+void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper)
 {
   Vector<FermView> &viewLeft  = helper.getView(true,  checkerboardL);
   Vector<FermView> &viewRight = helper.getView(false, checkerboardR);
@@ -707,7 +707,7 @@ void A2AutilsMILC<FImpl>::spatialContractComm(commVector<Scalar_v>& result, int 
 }
 
 template <class FImpl>
-void A2AutilsMILC<FImpl>::spatialContractLocal(commVector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper)
+void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper)
 {
   Vector<FermView> &viewLeft  = helper.getView(true,  checkerboardL);
   Vector<FermView> &viewRight = helper.getView(false, checkerboardR);
