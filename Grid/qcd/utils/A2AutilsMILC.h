@@ -305,16 +305,16 @@ void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   // Run any nonlocal gamma operators
   if (nGamma_comm > 0) {
     for (auto &item : stencilLeft_e) {
-      item = std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0));
+      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0)));
     }
     for (auto &item : stencilRight_e) {
-      item = std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0));
+      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0)));
     }
     for (auto &item : stencilLeft_o) {
-      item = std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0));
+      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0)));
     }
     for (auto &item : stencilRight_o) {
-      item = std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0));
+      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0)));
     }
 
     makeStencilView(helper.viewStencilLeft_e,  stencilLeft_e,  lhs_wi_e, helper.sizeL);
