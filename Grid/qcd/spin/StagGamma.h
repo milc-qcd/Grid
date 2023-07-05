@@ -86,6 +86,23 @@ class StagGamma {
       setSpinTaste(g.first,g.second);
     }
 
+    static std::vector<StagGamma::SpinTastePair> ParseSpinTasteString(std::string str, bool applyG5 = false) {
+      auto gammas = strToVec<StagGamma::SpinTastePair>(str);
+
+      if (applyG5) {
+        StagGamma st;
+        StagGamma g5(StagGamma::StagAlgebra::G5,StagGamma::StagAlgebra::G5);
+
+        for (auto &g : gammas) {
+            st.setSpinTaste(g);
+            st = st*g5;
+            g.first = st._spin;
+            g.second = st._taste;
+        }
+      }
+
+      return gammas;
+    }
     static std::string GetName(StagAlgebra spin,StagAlgebra taste) {
 
       std::string name = StagGamma::name[spin];
@@ -337,6 +354,19 @@ inline StagGamma operator*(const StagGamma &g1, const StagGamma &g2) {
   }
 
   return ret;
+}
+
+template<class obj>
+inline Lattice<obj> operator*(const StagGamma &g1, const Lattice<obj> &lat) {
+
+  Lattice<obj> temp(lat.Grid());
+  g1.applyGamma(temp,lat);
+  return temp;
+}
+
+template<class obj>
+inline Lattice<obj> operator*(const Lattice<obj> &lat, const StagGamma &g1) {
+  return g1*lat;
 }
 
 NAMESPACE_END(Grid)

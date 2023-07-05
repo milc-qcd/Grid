@@ -38,6 +38,8 @@ public:
   typedef CartesianStencilView<vobj,vobj,int> FermStencilView;
 
   typedef LatticeView<vColourMatrix> GaugeView;
+  typedef CartesianStencil<vColourMatrix,vColourMatrix,int> GaugeStencil;
+  typedef CartesianStencilView<vColourMatrix,vColourMatrix,int> GaugeStencilView;
 
   typedef typename ComplexField::vector_object cobj;
   typedef LatticeView<cobj> ComplexView;
@@ -45,392 +47,502 @@ public:
 public:
   struct utilHelper {
   public:
-    std::vector<int> shiftDirs, shiftDisplacements;
-    Vector<GaugeView> viewGauge;
-    Vector<ComplexView> viewGamma, viewMom;
-    Vector<Coordinate> iCoorContainer;
-    Vector<Integer> oCoordsEven, oCoordsOdd, gammaIndicesComm, gammaIndicesLocal;
-    int checkerL, checkerR, sizeL, sizeR, sizeLOut, sizeROut, nMom, orthogDir;
-    GridBase *grid;
-    Vector<FermView> viewLeft_e, viewLeft_o, viewRight_e, viewRight_o;
-    Vector<FermStencilView> viewStencilRight_e, viewStencilRight_o;
-    Vector<FermStencilView> viewStencilLeft_e,  viewStencilLeft_o;
+    utilHelper(const std::vector<StagGamma::SpinTastePair>& gammas, LatticeGaugeField* U, GridBase *grid, GridBase *cbGrid)
+    :_gammas(gammas){
 
-    Vector<FermView> &getView(bool leftView, int checkerboard) {
-      if (checkerboard == Even) {
-        if (leftView) {
-          return viewLeft_e;
+      StagGamma spinTaste;
+      if (U != nullptr) {
+        spinTaste.setGaugeField(*U);
+      }
+
+      // Organize gammas into local/non-local
+      for (int i = 0; i < gammas.size(); i++) {
+    
+        spinTaste.setSpinTaste(gammas[i]);
+        int shift = (spinTaste._spin ^ spinTaste._taste);
+        if (shift != 0) {
+          _gamma_indices_comm.push_back(i);
+
+          // Assume 1-link for now -- break loop when you find a shift direction
+          for (int j = 0; j < StagGamma::gmu.size(); j++) {
+            if (StagGamma::gmu[j] & shift) {
+              _shift_dirs.push_back(j);
+              _shift_dirs.push_back(j);
+              _shift_displacements.push_back(1);
+              _shift_displacements.push_back(-1);
+              break;
+            }
+          }
         } else {
-          return viewRight_e;
+          _gamma_indices_local.push_back(i);
+        }
+      }
+
+      if (_gamma_indices_local.size() > MF_SUM_ARRAY_SIZE || _gamma_indices_comm.size() > MF_SUM_ARRAY_SIZE) {
+        std::cout << GridLogError << "Parameter space too large: Need num Momenta * num Gammas < " << MF_SUM_ARRAY_SIZE << "." << std::endl;
+        assert(0);
+      }
+
+      // Grab SIMD coordinates from indices
+      _i_coor_container.resize(grid->Nsimd(), Coordinate(grid->_ndimension));
+      for(int p = 0; p < grid->Nsimd(); p++) {
+        grid->iCoorFromIindex(_i_coor_container[p],p);
+      }
+
+      // Map checkerboarded indices to full lattice indices
+      if (cbGrid != nullptr) {
+        _o_coords_E.resize(cbGrid->oSites(),0);
+        _o_coords_O.resize(cbGrid->oSites(),0);
+
+        // Create map between checkerboarded indices and full lattice indices
+        thread_for(so,grid->oSites(),{
+          int oSiteCheckerboard;
+          Coordinate coor;
+
+          grid->oCoorFromOindex(coor,so);
+          oSiteCheckerboard=cbGrid->CheckerBoard(coor);
+            
+          int cbSite=cbGrid->oIndex(coor);
+
+          if (oSiteCheckerboard == Even)
+            _o_coords_E[cbSite]=so;
+          else
+            _o_coords_O[cbSite]=so;
+        });
+      }
+    }
+
+    const FermionField* getRight() {
+      if (_checker_R && _checkerboard_R == Odd) {
+        return _right_O;
+      } else {
+        return _right_E;
+      }
+    }
+
+    const FermionField* getLeft() {
+      if (_checker_L && _checkerboard_L == Odd) {
+        return _left_O;
+      } else {
+        return _left_E;
+      }
+    }
+
+    Vector<Integer> &getRightCoords() {
+      if (_checker_R && _checkerboard_R == Odd) {
+        return _o_coords_O;
+      } else {
+        return _o_coords_E;
+      }
+    }
+
+    Vector<Integer> &getLeftCoords() {
+      if (_checker_L && _checkerboard_L == Odd) {
+        return _o_coords_O;
+      } else {
+        return _o_coords_E;
+      }
+    }
+
+    // Setup lists of pointers to share with accelerators
+    template <class Vtype>
+    void makeView(Vector<LatticeView<Vtype> >& view, const Lattice<Vtype> *field,int size)
+    {
+      if (view.size() != 0 || size == 0)
+        return;
+
+      view.reserve(size);
+
+      for(int p=0;p<size;p++) {
+        view.push_back(field[p].View(AcceleratorRead));
+      }
+    }
+
+    void makeGammaView(const ComplexField *field) { makeView(_view_gamma,field,_gamma_indices_local.size()); }
+
+    void makeMomentumView(const ComplexField *field) { makeView(_view_mom,field,_N_mom); }
+
+    void makeLeftView(Vector<FermView> &view) {//const FermionField *field, int checkerboard) { 
+      if (_checkerboard_L == Odd)
+        makeView(view,_left_O,_size_L); 
+      else
+        makeView(view,_left_E,_size_L); 
+    }
+
+    void makeRightView(Vector<FermView> &view) {//const FermionField *field, int checkerboard) { 
+      if (_checkerboard_R == Odd)
+        makeView(view,_right_O,_size_R); 
+      else
+        makeView(view,_right_E,_size_R); 
+    }
+
+    void makeGauge(std::vector<LatticeColourMatrix> &Umu, int checkerboard = -1)
+    {
+      StagGamma spinTaste;
+      LatticeColourMatrix Umu_temp(_U->Grid());
+      int mu, size = _gamma_indices_comm.size();
+
+      for (int i = 0; i < size; i++) {
+        mu = _gamma_indices_comm[i];
+        spinTaste.setSpinTaste(_gammas[mu]);
+
+        if (checkerboard != -1 ) {
+          Umu_temp = PeekIndex<LorentzIndex>(*_U,_shift_dirs[2*i]); // Store full lattice links in shift direction
+
+          spinTaste.applyPhase(Umu_temp,Umu_temp); // store spin-taste phase
+
+          pickCheckerboard(checkerboard,Umu[i],Umu_temp);
+        } else {
+          Umu[i] = PeekIndex<LorentzIndex>(*_U,_shift_dirs[2*i]);
+          spinTaste.applyPhase(Umu[i],Umu[i]); // store spin-taste phase
+        }
+
+      }
+    }
+
+    void makeGaugeLeft()
+    {
+      _Umu_L.resize(_gamma_indices_comm.size(),_grid_L);
+
+      if (_checker_L) {
+        if (_checkerboard_L == Odd) {
+          makeGauge(_Umu_L,Odd);
+        } else {
+          makeGauge(_Umu_L,Even);
         }
       } else {
-        if (leftView) {
-          return viewLeft_o;
+        makeGauge(_Umu_L);
+      }
+    }
+
+    void makeGaugeRight()
+    {
+      _Umu_R.resize(_gamma_indices_comm.size(),_grid_R);
+
+      if (_checker_R) {
+        if (_checkerboard_R == Odd) {
+          makeGauge(_Umu_R,Odd);
         } else {
-          return viewRight_o;
+          makeGauge(_Umu_R,Even);
+        }
+      } else {
+        makeGauge(_Umu_R);
+      }
+    }
+
+    void makeGaugeViewLeft(Vector<GaugeView> &view)
+    {
+      makeView(view, &_Umu_L[0],_gamma_indices_comm.size());
+    }
+
+    void makeGaugeViewRight(Vector<GaugeView> &view)
+    {
+      makeView(view, &_Umu_R[0],_gamma_indices_comm.size());
+    }
+
+    // Setup lists of pointers to share with accelerators
+    template <class Vtype>
+    void makeStencil(Vector<Vtype> &buffer, std::unique_ptr<CartesianStencil<Vtype,Vtype,int> > &stencil, 
+                          const Lattice<Vtype>* field, int size)
+    {
+      GridBase *grid = field[0].Grid();
+      SimpleCompressor<Vtype> compressor;
+
+      int comm_buf_size;
+      Vtype *buf_p;
+
+      for(int p=0;p<size;p++) {
+
+        stencil->HaloExchange(field[p],compressor);
+
+        if (p == 0) {
+          comm_buf_size = stencil->_unified_buffer_size;
+          buffer.resize(size*comm_buf_size);
+          buf_p = &buffer[0];
+        }
+        if (comm_buf_size > 0) {
+          Vtype *comm_buf_p = stencil->CommBuf();
+          accelerator_for(i,comm_buf_size,1,{
+            buf_p[p*comm_buf_size+i] = comm_buf_p[i];
+          });
         }
       }
     }
 
-    Vector<FermStencilView> &getStencilView(bool leftView, int checkerboard) {
-      if (checkerboard == Even) {
-        if (leftView) {
-          return viewStencilLeft_e;
-        } else {
-          return viewStencilRight_e;
+    void makeGaugeStencil(Vector<vColourMatrix> &buffer, std::vector<std::unique_ptr<GaugeStencil> > &stencil, 
+                          Vector<GaugeStencilView> &stencilView) {
+
+      Vector<vColourMatrix> bufMu;
+      int size = _shift_dirs.size()/2;
+
+      _gauge_stencil_buf_offsets.resize(size);
+
+      stencilView.reserve(size);
+      for (int i=0;i<size;i++) {
+        stencil[i] = std::move(std::unique_ptr<GaugeStencil>(new GaugeStencil(_grid_R, 1, _checkerboard_R, {_shift_dirs[2*i]}, {-1}, 0)));
+
+        makeStencil(bufMu,stencil[i],&_Umu_R[i],1);
+
+        _gauge_stencil_buf_offsets[i] = buffer.size();
+
+        buffer.resize(buffer.size()+bufMu.size());
+
+        if (bufMu.size() > 0) {
+          vColourMatrix *buf_p = &buffer[_gauge_stencil_buf_offsets[i]], *bufMu_p = &bufMu[0];
+          accelerator_for(i,bufMu.size(),1,{
+            buf_p[i] = bufMu_p[i];
+          });
         }
-      } else {
-        if (leftView) {
-          return viewStencilLeft_o;
-        } else {
-          return viewStencilRight_o;
-        }
+
+        stencilView.push_back(stencil[i]->View(AcceleratorRead));
       }
     }
+
+    void makeRightStencil(Vector<vobj> &buffer, std::unique_ptr<FermStencil> &stencil) {
+      stencil = std::move(std::unique_ptr<FermStencil>(new FermStencil(_grid_R, _shift_dirs.size(), _checkerboard_R, _shift_dirs, _shift_displacements, 0)));
+      makeStencil(buffer, stencil, getRight(), _size_R);
+    }
+
+  public:
+    GridBase *_grid_L, *_grid_R;
+    LatticeGaugeField *_U;
+    std::vector<LatticeColourMatrix> _Umu_L,_Umu_R;
+    const std::vector<StagGamma::SpinTastePair> &_gammas;
+    const FermionField *_left_E, *_left_O, *_right_E, *_right_O;
+    Vector<ComplexView> _view_gamma, _view_mom;
+    std::vector<int> _shift_dirs, _shift_displacements;
+    Vector<Integer> _o_coords_E, _o_coords_O, _gamma_indices_comm, _gamma_indices_local, _gauge_stencil_buf_offsets;
+    Vector<Coordinate> _i_coor_container;
+    int _checker_L, _checkerboard_L, _size_L, _size_L_out;
+    int _checker_R, _checkerboard_R, _size_R, _size_R_out;
+    int _N_mom, _orthog_dir;
+
   };
 
 public:
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   static void StagMesonFieldNoGlobalSum(TensorType &mat,
-                                     const FermionField *lhs_wi_e, const FermionField *lhs_wi_o,
-                                     const FermionField *rhs_vj_e, const FermionField *rhs_vj_o,
+                                     const FermionField *lhs_wi_E, const FermionField *lhs_wi_O,
+                                     const FermionField *rhs_vj_E, const FermionField *rhs_vj_O,
                                      const std::vector<StagGamma::SpinTastePair>& gammas,
                                      const std::vector<ComplexField > &mom,
-                                     int orthogDir, LatticeGaugeField* U = nullptr, double *t_kernel = nullptr);
+                                     int orthog_dir, LatticeGaugeField* U = nullptr, double *t_kernel = nullptr);
 
   template <typename TensorType>
   static void contractSimd(TensorType &result, bool do_comm, 
-                            Vector<Scalar_v> &simd_sum_e, Vector<Scalar_v> &simd_sum_o, utilHelper &helper);
+                            Vector<Scalar_v> &simd_sum_E, Vector<Scalar_v> &simd_sum_O, utilHelper &helper);
   template <typename TensorType>
   static void contractSimd(TensorType &result, Vector<Scalar_v> &simd_sum, Vector<Integer> &gamma_indices, utilHelper &helper);
 
-  static void spatialContractComm(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
-  static void spatialContractLocal(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper);
-
-  static void init(const std::vector<StagGamma::SpinTastePair>& gammas, LatticeGaugeField* U, GridBase *grid, utilHelper &helper){
-
-
-    StagGamma spinTaste;
-    if (U != nullptr) {
-      spinTaste.setGaugeField(*U);
-    }
-
-    // Organize gammas into local/non-local
-    for (int i = 0; i < gammas.size(); i++) {
-  
-      spinTaste.setSpinTaste(gammas[i]);
-      int shift = (spinTaste._spin ^ spinTaste._taste);
-      if (shift != 0) {
-        helper.gammaIndicesComm.push_back(i);
-
-        // Assume 1-link for now -- break loop when you find a shift direction
-        for (int i = 0; i < StagGamma::gmu.size(); i++) {
-          if (StagGamma::gmu[i] & shift) {
-            helper.shiftDirs.push_back(i);
-            helper.shiftDisplacements.push_back(1);
-            break;
-          }
-        }
-      } else {
-        helper.gammaIndicesLocal.push_back(i);
-      }
-    }
-
-    if (helper.gammaIndicesLocal.size() > MF_SUM_ARRAY_SIZE || helper.gammaIndicesComm.size() > MF_SUM_ARRAY_SIZE) {
-      std::cout << GridLogError << "Parameter space too large: Need num Momenta * num Gammas < " << MF_SUM_ARRAY_SIZE << "." << std::endl;
-      assert(0);
-    }
-
-    // Grab SIMD coordinates from indices
-    helper.iCoorContainer.resize(grid->Nsimd(), Coordinate(grid->_ndimension));
-    for(int p = 0; p < grid->Nsimd(); p++) {
-      grid->iCoorFromIindex(helper.iCoorContainer[p],p);
-    }
-
-    // Map checkerboarded indices to full lattice indices
-    if (helper.checkerR || helper.checkerL) {
-      auto cbGrid = helper.grid;
-
-      assert(cbGrid->CheckerBoarded(helper.orthogDir) != 1);
-
-      helper.oCoordsEven.resize(cbGrid->oSites(),0);
-      helper.oCoordsOdd.resize(cbGrid->oSites(),0);
-
-      // Create map between checkerboarded indices and full lattice indices
-      thread_for(so,grid->oSites(),{
-        int oSiteCheckerboard;
-        Coordinate coor;
-
-        grid->oCoorFromOindex(coor,so);
-        oSiteCheckerboard=cbGrid->CheckerBoard(coor);
-          
-        int cbSite=cbGrid->oIndex(coor);
-
-        if (oSiteCheckerboard == Even)
-          helper.oCoordsEven[cbSite]=so;
-        else
-          helper.oCoordsOdd[cbSite]=so;
-      });
-    }
-  }
-
-  // Setup lists of pointers to share with accelerators
-  template <class Vtype>
-  static void makeView(Vector<LatticeView<Vtype> >& view, const Lattice<Vtype> *field, int size)
-  {
-    if (view.size() != 0)
-      return;
-
-    view.reserve(size);
-
-    for(int p=0;p<size;p++) {
-      view.push_back(field[p].View(AcceleratorRead));
-    }
-  }
-
-  // Setup lists of pointers to share with accelerators
-  static void makeView(Vector<GaugeView>& view, std::vector<LatticeColourMatrix> &Umu, 
-                  const LatticeGaugeField *U, std::vector<int> shift_dirs)
-  {
-    int size = shift_dirs.size();
-    if (view.size() != 0)
-      return;
-
-    for(int p=0;p<size;p++) {
-      Umu[p] = PeekIndex<LorentzIndex>(*U,shift_dirs[p]); // Store full lattice links in shift direction
-    }
-    makeView(view, &Umu[0], size);
-  }
-
-  // Setup lists of pointers to share with accelerators
-  static void makeStencilView(Vector<FermStencilView> &view, std::vector<std::unique_ptr<FermStencil> > &stencil, 
-                        const FermionField* field, int size)
-  {
-    if (view.size() != 0)
-      return;
-
-    GridBase *grid = field[0].Grid();
-    SimpleCompressor<vobj> compressor;
-
-    view.reserve(size);
-
-    for(int p=0;p<size;p++) {
-      stencil[p]->HaloExchange(field[p],compressor);
-      view.push_back(stencil[p]->View(AcceleratorRead));
-    }
-  }
+  static void spatialContractComm(Vector<Scalar_v>& result, utilHelper &helper);
+  static void spatialContractLocal(Vector<Scalar_v>& result, utilHelper &helper);
 };
+
 template <class FImpl>
 template <typename TensorType>
 void A2AutilsMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
-                                     const FermionField *lhs_wi_e,
-                                     const FermionField *lhs_wi_o,
-                                     const FermionField *rhs_vj_e,
-                                     const FermionField *rhs_vj_o,
+                                     const FermionField *lhs_wi_E,
+                                     const FermionField *lhs_wi_O,
+                                     const FermionField *rhs_vj_E,
+                                     const FermionField *rhs_vj_O,
                                      const std::vector<StagGamma::SpinTastePair>& gammas,
                                      const std::vector<ComplexField > &mom,
-                                     int orthogDir, 
+                                     int orthog_dir, 
                                      LatticeGaugeField* U, double *t_kernel)
 {
   if (t_kernel) *t_kernel = -usecond();
 
-  utilHelper helper;
-
-  helper.sizeL = mat.dimension(3);
-  helper.sizeR = mat.dimension(4);
-  helper.sizeLOut = mat.dimension(3);
-  helper.sizeROut = mat.dimension(4);
-  helper.nMom   = mom.size();
-  helper.orthogDir = orthogDir;
-
   GridBase *grid  = mom[0].Grid();
-
-  helper.grid = grid;
   GridBase *cbGrid = nullptr;
+  if (lhs_wi_E[0].Grid()->_isCheckerBoarded)
+    cbGrid = lhs_wi_E[0].Grid();
+  if (rhs_vj_E[0].Grid()->_isCheckerBoarded)
+    cbGrid = rhs_vj_E[0].Grid();
 
-  helper.checkerL = lhs_wi_e[0].Grid()->_isCheckerBoarded;
-  helper.checkerR = rhs_vj_e[0].Grid()->_isCheckerBoarded;
+  assert(cbGrid->CheckerBoarded(orthog_dir) != 1);
 
-  if (helper.checkerL) {
-    helper.sizeL /= 2;
-    cbGrid = lhs_wi_e[0].Grid();
-    helper.grid = cbGrid;
+  utilHelper helper(gammas,U,grid,cbGrid);
+
+  helper._size_L = mat.dimension(3);
+  helper._size_R = mat.dimension(4);
+  helper._size_L_out = mat.dimension(3);
+  helper._size_R_out = mat.dimension(4);
+  helper._N_mom   = mom.size();
+  helper._orthog_dir = orthog_dir;
+
+  helper._grid_L = grid;
+  helper._grid_R = grid;
+
+  helper._checker_L = lhs_wi_E[0].Grid()->_isCheckerBoarded;
+  helper._checker_R = rhs_vj_E[0].Grid()->_isCheckerBoarded;
+
+  if (helper._checker_L) {
+    helper._size_L /= 2;
+    cbGrid = lhs_wi_E[0].Grid();
+    helper._grid_L = cbGrid;
   } 
-  if(helper.checkerR) {
-    helper.sizeR /= 2;
-    cbGrid = rhs_vj_e[0].Grid();
-    helper.grid = cbGrid;
+
+  if(helper._checker_R) {
+    helper._size_R /= 2;
+    cbGrid = rhs_vj_E[0].Grid();
+    helper._grid_R = cbGrid;
   }
 
-  init(gammas,U,grid, helper);
+  helper._left_E = lhs_wi_E;
+  helper._left_O = lhs_wi_O;
+  helper._right_E = rhs_vj_E;
+  helper._right_O = rhs_vj_O;
+  helper._U = U;
 
   int nGamma       = gammas.size();
-  int nGamma_comm  = helper.gammaIndicesComm.size();
-  int nGamma_local = helper.gammaIndicesLocal.size();
+  int nGamma_local = helper._gamma_indices_local.size();
 
-  std::vector<ComplexField> stagPhase(nGamma,grid);
+  std::vector<ComplexField> stagPhase(nGamma_local,grid);
 
   { // Set up staggered phases
     StagGamma spinTaste;
-    for (int mu = 0; mu < nGamma; mu++) {
-      stagPhase[mu] = 1.0;
+    int mu;
+    for (int i = 0; i < nGamma_local; i++) {
+      mu = helper._gamma_indices_local[i];
+      stagPhase[i] = 1.0;
       spinTaste.setSpinTaste(gammas[mu]);
-      spinTaste.applyPhase(stagPhase[mu],stagPhase[mu]); // store spin-taste phase
+      spinTaste.applyPhase(stagPhase[i],stagPhase[i]); // store spin-taste phase
     }
   }
 
-  Vector<Scalar_v> simd_sum_comm_e, simd_sum_comm_o;
-  Vector<Scalar_v> simd_sum_local_e, simd_sum_local_o;
+  Vector<Scalar_v> simd_sum_comm_E, simd_sum_comm_O;
+  Vector<Scalar_v> simd_sum_local_E, simd_sum_local_O;
 
-  makeView(helper.viewGamma,&stagPhase[0],nGamma);
-  makeView(helper.viewMom,  &mom[0],helper.nMom);
-
-  makeView(helper.viewLeft_e,  lhs_wi_e, helper.sizeL);
-  makeView(helper.viewRight_e, rhs_vj_e, helper.sizeR);
-  if (helper.checkerL)
-    makeView(helper.viewLeft_o,  lhs_wi_o, helper.sizeL);
-  if (helper.checkerR)
-    makeView(helper.viewRight_o, rhs_vj_o, helper.sizeR);
-
-  auto lgrid = helper.checkerL?cbGrid:grid;
-  auto rgrid = helper.checkerR?cbGrid:grid;
-
-  std::vector<std::unique_ptr<FermStencil> > stencilLeft_e(helper.sizeL);
-  std::vector<std::unique_ptr<FermStencil> > stencilRight_e(helper.sizeR);
-  std::vector<std::unique_ptr<FermStencil> > stencilLeft_o(helper.checkerL ? helper.sizeL : 0);
-  std::vector<std::unique_ptr<FermStencil> > stencilRight_o(helper.checkerR ? helper.sizeR : 0);
-
-  std::vector<LatticeColourMatrix> Umu(nGamma_comm,grid);
+  helper.makeGammaView(&stagPhase[0]);
+  helper.makeMomentumView(&mom[0]);
 
   // Run any nonlocal gamma operators
-  if (nGamma_comm > 0) {
-    for (auto &item : stencilLeft_e) {
-      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0)));
-    }
-    for (auto &item : stencilRight_e) {
-      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Even, helper.shiftDirs, helper.shiftDisplacements, 0)));
-    }
-    for (auto &item : stencilLeft_o) {
-      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(lgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0)));
-    }
-    for (auto &item : stencilRight_o) {
-      item = std::move(std::unique_ptr<FermStencil>(new FermStencil(rgrid, nGamma_comm, Odd, helper.shiftDirs, helper.shiftDisplacements, 0)));
-    }
+  if (helper._gamma_indices_comm.size() > 0) {
 
-    makeStencilView(helper.viewStencilLeft_e,  stencilLeft_e,  lhs_wi_e, helper.sizeL);
-    makeStencilView(helper.viewStencilRight_e, stencilRight_e, rhs_vj_e, helper.sizeR);
-    if (helper.checkerL)
-      makeStencilView(helper.viewStencilLeft_o,  stencilLeft_o,  lhs_wi_o, helper.sizeL);
-    if (helper.checkerR)
-      makeStencilView(helper.viewStencilRight_o, stencilRight_o, rhs_vj_o, helper.sizeR);
+    helper._checkerboard_L = Even;
+    helper._checkerboard_R = Even;
+    if (helper._checker_L && helper._checker_R) {
 
-    makeView(helper.viewGauge, Umu, U,helper.shiftDirs);
+      helper._checkerboard_R = Odd;
+      spatialContractComm(simd_sum_comm_E, helper);
 
+      helper._checkerboard_L = Odd;
+      helper._checkerboard_R = Even;
+      spatialContractComm(simd_sum_comm_O, helper);
 
-    if (helper.checkerL && helper.checkerR) {
-      spatialContractComm(simd_sum_comm_e, Even, Odd, helper);
-      spatialContractComm(simd_sum_comm_o, Odd,  Even, helper);
-    } else if (helper.checkerL) {
-      spatialContractComm(simd_sum_comm_e, Even, Even, helper);
-      spatialContractComm(simd_sum_comm_o, Odd,  Even, helper);
-    } else if (helper.checkerR) {
-      spatialContractComm(simd_sum_comm_e, Even, Odd, helper);
-      spatialContractComm(simd_sum_comm_o, Even, Even, helper);
+    } else if (helper._checker_L) {
+
+      spatialContractComm(simd_sum_comm_E, helper);
+
+      helper._checkerboard_L = Odd;
+      spatialContractComm(simd_sum_comm_O, helper);
+
+    } else if (helper._checker_R) {
+
+      spatialContractComm(simd_sum_comm_O, helper);
+
+      helper._checkerboard_R = Odd;
+      spatialContractComm(simd_sum_comm_E, helper);
     } else {
-      spatialContractComm(simd_sum_comm_e, Even, Even, helper);
+      spatialContractComm(simd_sum_comm_E, helper);
     }
   }
 
   // Run any local gamma operators
   if (nGamma_local > 0) {
-    if (helper.checkerL && helper.checkerR) {
-      spatialContractLocal(simd_sum_local_e, Even, Even, helper);
-      spatialContractLocal(simd_sum_local_o, Odd,  Odd, helper);
-    } else if (helper.checkerL) {
-      spatialContractLocal(simd_sum_local_e, Even, Even, helper);
-      spatialContractLocal(simd_sum_local_o, Odd,  Even, helper);
-    } else if (helper.checkerR) {
-      spatialContractLocal(simd_sum_local_e, Even, Even, helper);
-      spatialContractLocal(simd_sum_local_o, Even, Odd, helper);
+
+    helper._checkerboard_L = Even;
+    helper._checkerboard_R = Even;
+    if (helper._checker_L && helper._checker_R) {
+
+      spatialContractLocal(simd_sum_local_E, helper);
+
+      helper._checkerboard_L = Odd;
+      helper._checkerboard_R = Odd;
+      spatialContractLocal(simd_sum_local_O, helper);
+    } else if (helper._checker_L) {
+
+      spatialContractLocal(simd_sum_local_E, helper);
+
+      helper._checkerboard_L = Odd;
+      spatialContractLocal(simd_sum_local_O, helper);
+    } else if (helper._checker_R) {
+
+      spatialContractLocal(simd_sum_local_E, helper);
+
+      helper._checkerboard_R = Odd;
+      spatialContractLocal(simd_sum_local_O, helper);
     } else {
-      spatialContractLocal(simd_sum_local_e, Even, Even, helper);
+
+      spatialContractLocal(simd_sum_local_E, helper);
     }
   }
 
   accelerator_barrier();
 
   // Contract SIMD vectors
-  if (helper.checkerL || helper.checkerR) {
-    contractSimd(mat, true, simd_sum_comm_e, simd_sum_comm_o, helper);
+  if (helper._checker_L || helper._checker_R) {
+    contractSimd(mat, true, simd_sum_comm_E, simd_sum_comm_O, helper);
 
-    contractSimd(mat, false, simd_sum_local_e, simd_sum_local_o, helper);
+    contractSimd(mat, false, simd_sum_local_E, simd_sum_local_O, helper);
   } else {
-    contractSimd(mat, simd_sum_comm_e, helper.gammaIndicesComm, helper);
+    contractSimd(mat, simd_sum_comm_E, helper._gamma_indices_comm, helper);
 
-    contractSimd(mat, simd_sum_local_e, helper.gammaIndicesLocal, helper);
+    contractSimd(mat, simd_sum_local_E, helper._gamma_indices_local, helper);
   }
 
   accelerator_barrier();
 
   if (t_kernel) *t_kernel += usecond();
 
-  for(int p=0;p<helper.viewLeft_e.size();p++)  helper.viewLeft_e[p].ViewClose();
-  for(int p=0;p<helper.viewRight_e.size();p++) helper.viewRight_e[p].ViewClose();
-  for(int p=0;p<helper.viewLeft_o.size();p++)  helper.viewLeft_o[p].ViewClose();
-  for(int p=0;p<helper.viewRight_o.size();p++) helper.viewRight_o[p].ViewClose();
-  for(int p=0;p<helper.viewStencilLeft_e.size();p++)  helper.viewStencilLeft_e[p].ViewClose();
-  for(int p=0;p<helper.viewStencilRight_e.size();p++) helper.viewStencilRight_e[p].ViewClose();
-  for(int p=0;p<helper.viewStencilLeft_o.size();p++)  helper.viewStencilLeft_o[p].ViewClose();
-  for(int p=0;p<helper.viewStencilRight_o.size();p++) helper.viewStencilRight_o[p].ViewClose();
-  for(int p=0;p<helper.viewGamma.size();p++)   helper.viewGamma[p].ViewClose();
-  for(int p=0;p<helper.viewGauge.size();p++)   helper.viewGauge[p].ViewClose();
-  for(int p=0;p<helper.viewMom.size();p++)     helper.viewMom[p].ViewClose();
+  for(int p=0;p<helper._view_gamma.size();p++)   helper._view_gamma[p].ViewClose();
+  for(int p=0;p<helper._view_mom.size();p++)     helper._view_mom[p].ViewClose();
 
 }
 
 template <class FImpl>
 template <typename TensorType>
-void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, Vector<Scalar_v> &simd_sum_e, 
-                                        Vector<Scalar_v> &simd_sum_o, utilHelper &helper) {
+void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, Vector<Scalar_v> &simd_sum_E, 
+                                        Vector<Scalar_v> &simd_sum_O, utilHelper &helper) {
 
-  if (simd_sum_e.size() == 0)
+  if (simd_sum_E.size() == 0)
     return;
 
-  if (simd_sum_o.size() == 0)
+  if (simd_sum_O.size() == 0)
     return;
 
-  auto grid = helper.grid;
-  int sizeL = helper.sizeL;
-  int sizeR = helper.sizeR;
-  int sizeLOut = helper.sizeLOut;
-  int sizeROut = helper.sizeROut;
-  int nMom  = helper.nMom;
-  int orthogDir = helper.orthogDir;
-  int checkerL  = helper.checkerL;
-  int checkerR  = helper.checkerR;
+  auto grid = helper._grid_L;
+  int sizeL = helper._size_L;
+  int sizeR = helper._size_R;
+  int sizeLOut = helper._size_L_out;
+  int sizeROut = helper._size_R_out;
+  int nMom  = helper._N_mom;
+  int orthogDir = helper._orthog_dir;
+  int checkerL  = helper._checker_L;
+  int checkerR  = helper._checker_R;
 
   const int simdSize       = grid->Nsimd();
 
-  int mult_l = checkerL ? 2 : 1;
-  int mult_r = checkerR ? 2 : 1;
+  int mult_L = checkerL ? 2 : 1;
+  int mult_R = checkerR ? 2 : 1;
 
   int reducedOrthogDimSize = grid->_rdimensions[orthogDir];
   int localOrthogDimSize   = grid->_ldimensions[orthogDir];
 
   int Nt     = grid->GlobalDimensions()[orthogDir];
-  int nGamma, nGammaTotal = helper.viewGamma.size();
+  int nGamma, nGammaTotal = helper._view_gamma.size();
 
-  Scalar_v   *simd_sum_e_p = & simd_sum_e[0];
-  Scalar_v   *simd_sum_o_p = & simd_sum_o[0];
-  Coordinate *icoor_p        = & helper.iCoorContainer[0];
+  Scalar_v   *simd_sum_E_p = & simd_sum_E[0];
+  Scalar_v   *simd_sum_O_p = & simd_sum_O[0];
+  Coordinate *icoor_p        = & helper._i_coor_container[0];
   Integer    *indexG_p;
 
   if (do_comm) {
-    nGamma = helper.gammaIndicesComm.size();
-    indexG_p = & helper.gammaIndicesComm[0]; 
+    nGamma = helper._gamma_indices_comm.size();
+    indexG_p = & helper._gamma_indices_comm[0]; 
   } else {
-    nGamma = helper.gammaIndicesLocal.size();
-    indexG_p = & helper.gammaIndicesLocal[0]; 
+    nGamma = helper._gamma_indices_local.size();
+    indexG_p = & helper._gamma_indices_local[0]; 
   }
 
   int pd = grid->_processors[orthogDir];
@@ -441,7 +553,7 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, Vector<
   for ( int m=0;m<nMom;m++){
     accelerator_forNB(l_index,sizeL,1,{
       // Sum across simd lanes in the plane, breaking out orthog dir.
-      ExtractBuffer<Scalar_s> extracted_e(simdSize),extracted_o(simdSize);
+      ExtractBuffer<Scalar_s> extracted_E(simdSize),extracted_O(simdSize);
 
       for(int r_index=0;r_index<sizeR;r_index++){
 
@@ -453,8 +565,8 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, Vector<
               // Thus, ignoring gamma and time we get the index of simd_sum
               int ij_rdx = base+mu*nMom+m;
               
-              extract(simd_sum_e_p[ij_rdx],extracted_e);
-              extract(simd_sum_o_p[ij_rdx],extracted_o);
+              extract(simd_sum_E_p[ij_rdx],extracted_E);
+              extract(simd_sum_O_p[ij_rdx],extracted_O);
               
               for(int idx=0;idx<simdSize;idx++){
                   
@@ -463,23 +575,23 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result, bool do_comm, Vector<
                   // Calculate global time slice
                   int t = lt + pc*localOrthogDimSize;
 
-                  int ij_dx = mult_r*( r_index + sizeR*mult_l*( l_index + sizeL*( t + Nt*( indexG_p[mu] + nGammaTotal*m ) ) ) );
+                  int ij_dx = mult_R*( r_index + sizeR*mult_L*( l_index + sizeL*( t + Nt*( indexG_p[mu] + nGammaTotal*m ) ) ) );
 
                   // Fix Me: for > 1-link shift operations, this needs to be "if even odd shifts", not do_comm
-                  result_p[ij_dx]            = result_p[ij_dx] + extracted_e[idx];
-                  result_p[ij_dx]            = result_p[ij_dx] + extracted_o[idx];
-                  result_p[ij_dx+sizeROut]   = result_p[ij_dx+sizeROut] + extracted_e[idx];
-                  result_p[ij_dx+sizeROut]   = result_p[ij_dx+sizeROut] - extracted_o[idx];
+                  result_p[ij_dx]            = result_p[ij_dx] + extracted_E[idx];
+                  result_p[ij_dx]            = result_p[ij_dx] + extracted_O[idx];
+                  result_p[ij_dx+sizeROut]   = result_p[ij_dx+sizeROut] + extracted_E[idx];
+                  result_p[ij_dx+sizeROut]   = result_p[ij_dx+sizeROut] - extracted_O[idx];
                   if (do_comm) {
-                    result_p[ij_dx+1]          = result_p[ij_dx+1] + extracted_o[idx];
-                    result_p[ij_dx+1]          = result_p[ij_dx+1] - extracted_e[idx];
-                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] - extracted_e[idx];
-                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] - extracted_o[idx];
+                    result_p[ij_dx+1]          = result_p[ij_dx+1] + extracted_O[idx];
+                    result_p[ij_dx+1]          = result_p[ij_dx+1] - extracted_E[idx];
+                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] - extracted_E[idx];
+                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] - extracted_O[idx];
                   } else {
-                    result_p[ij_dx+1]          = result_p[ij_dx+1] + extracted_e[idx];
-                    result_p[ij_dx+1]          = result_p[ij_dx+1] - extracted_o[idx];
-                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] + extracted_e[idx];
-                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] + extracted_o[idx];
+                    result_p[ij_dx+1]          = result_p[ij_dx+1] + extracted_E[idx];
+                    result_p[ij_dx+1]          = result_p[ij_dx+1] - extracted_O[idx];
+                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] + extracted_E[idx];
+                    result_p[ij_dx+sizeROut+1] = result_p[ij_dx+sizeROut+1] + extracted_O[idx];
                   }
               }
             }
@@ -495,11 +607,11 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,Vector<Scalar_v> &simd
   if (simd_sum.size() == 0)
     return;
 
-  auto grid = helper.grid;
-  int sizeL = helper.sizeL;
-  int sizeR = helper.sizeR;
-  int nMom  = helper.nMom;
-  int orthogDir = helper.orthogDir;
+  auto grid = helper._grid_L;
+  int sizeL = helper._size_L;
+  int sizeR = helper._size_R;
+  int nMom  = helper._N_mom;
+  int orthogDir = helper._orthog_dir;
 
   const int simdSize       = grid->Nsimd();
 
@@ -508,10 +620,10 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,Vector<Scalar_v> &simd
 
   int Nt     = grid->GlobalDimensions()[orthogDir];
   int nGamma = gamma_indices.size();
-  int nGammaTotal = helper.viewGamma.size();
+  int nGammaTotal = helper._view_gamma.size();
 
   Scalar_v   *simd_sum_p = & simd_sum[0];
-  Coordinate *icoor_p        = & helper.iCoorContainer[0];
+  Coordinate *icoor_p        = & helper._i_coor_container[0];
   Integer    *indexG_p = & gamma_indices[0];
 
   int pd = grid->_processors[orthogDir];
@@ -551,21 +663,44 @@ void A2AutilsMILC<FImpl>::contractSimd(TensorType &result,Vector<Scalar_v> &simd
 }
 
 template <class FImpl>
-void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper)
+void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, utilHelper &helper)
 {
-  Vector<FermView> &viewLeft  = helper.getView(true,  checkerboardL);
-  Vector<FermView> &viewRight = helper.getView(false, checkerboardR);
+  const int nGamma = helper._gamma_indices_comm.size();
 
-  Vector<FermStencilView> &viewStencilLeft  = helper.getStencilView(true,  checkerboardL);
-  Vector<FermStencilView> &viewStencilRight = helper.getStencilView(false, checkerboardR);
+  std::unique_ptr<FermStencil>  stencilRight;
+  std::vector<std::unique_ptr<GaugeStencil> > stencilGauge(nGamma);
 
-  auto grid = helper.grid;
-  int sizeL = helper.sizeL;
-  int sizeR = helper.sizeR;
-  int nMom  = helper.nMom;
-  int orthogDir = helper.orthogDir;
-  int checkerL  = helper.checkerL;
-  int checkerR  = helper.checkerR;
+  Vector<FermView>  viewRight, viewLeft;
+  Vector<GaugeView> viewGaugeLeft,viewGaugeRight;
+  Vector<GaugeStencilView> viewStencilGauge;
+
+  Vector<vobj> haloBufferRight;
+  Vector<vColourMatrix> haloBufferGauge;
+
+  helper.makeGaugeLeft();
+  helper.makeGaugeRight();
+
+  helper.makeRightStencil(haloBufferRight, stencilRight);
+  helper.makeGaugeStencil(haloBufferGauge,   stencilGauge, viewStencilGauge);
+
+  int haloBuffRightSize = stencilRight->_unified_buffer_size;
+
+  helper.makeLeftView(viewLeft);
+  helper.makeRightView(viewRight);
+
+  helper.makeGaugeViewLeft(viewGaugeLeft);
+  helper.makeGaugeViewRight(viewGaugeRight);
+
+  GridBase* grid = helper._grid_L;
+  if (helper._checker_R)
+    grid = helper._grid_R;
+
+  int sizeL = helper._size_L;
+  int sizeR = helper._size_R;
+  int nMom  = helper._N_mom;
+  int orthogDir = helper._orthog_dir;
+  int checkerL  = helper._checker_L;
+  int checkerR  = helper._checker_R;
 
   const int simdSize     = grid->Nsimd();
 
@@ -577,7 +712,6 @@ void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, int chec
 
   // Output matrix dimensions
   const int reducedOrthogDimSize = grid->_rdimensions[orthogDir];
-  const int nGamma = helper.gammaIndicesComm.size();
 
   const int MFrvol = reducedOrthogDimSize *sizeL *sizeR *nMom * nGamma;
 
@@ -589,31 +723,31 @@ void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, int chec
   });  
 
   // Pass data to the device
-  FermView        *view_pL = & viewLeft[0];    // bra vectors
-  FermView        *view_pR = & viewRight[0];   // ket vectors
-  ComplexView     *view_pG = & helper.viewGamma[0];   // Gammas
-  ComplexView     *view_pM = & helper.viewMom[0];     // Momenta
-  GaugeView       *view_pU = & helper.viewGauge[0];   // Gauge links
+  ComplexView      *viewM_p  = & helper._view_mom[0];     // Momenta
+  FermView         *viewL_p  = & viewLeft[0];    // bra vectors
+  FermView         *viewR_p  = & viewRight[0];   // ket vectors
+  GaugeView        *viewGL_p = & viewGaugeLeft[0];   // Gauge links for bras
+  GaugeView        *viewGR_p = & viewGaugeRight[0];   // Gauge links for kets
+  GaugeStencilView *stencilG_p = & viewStencilGauge[0]; // Gauge tencil for shifted links
 
-  FermStencilView  *rightStencil = & viewStencilRight[0]; // Stencil for shifted kets
-  FermStencilView  *leftStencil = & viewStencilLeft[0]; // Stencil for shifted bras
+  vobj          *bufRight_p = &haloBufferRight[0]; // buffer for shifted kets in halo region
+  vColourMatrix *bufGauge_p = &haloBufferGauge[0]; // buffer for shifted links in halo region
 
-  Integer *oCoordsL_p= & helper.oCoordsEven[0]; // maps checkerboarded indices to corresponding full grid index
-  Integer *oCoordsR_p= & helper.oCoordsEven[0]; 
+  Integer *offsetG_p = & helper._gauge_stencil_buf_offsets[0]; // buffer offsets for shifted links in halo region
 
-  Integer *indexG_p= & helper.gammaIndicesComm[0]; 
+  {
+  autoView(stencilR_p,(*stencilRight),AcceleratorRead); // Stencil for shifted kets
 
-  if (checkerL && checkerboardL == Odd) {
-      oCoordsL_p = & helper.oCoordsOdd[0];
-  } else if (checkerR && checkerboardR == Odd) {
-      oCoordsR_p = & helper.oCoordsOdd[0];
-  }
+  Integer *oCoords_p = & (helper.getLeftCoords())[0]; // maps checkerboarded indices to corresponding full grid index
 
-  accelerator_for2dNB_no_err(l_index,sizeL,r_index,sizeR,simdSize,{
+  if (checkerR && !checkerL)
+    oCoords_p = & (helper.getRightCoords())[0];
 
-    calcColourMatrix link;
-    calcSpinor left, right, shift_ahead;
-    calcScalar temp_site, gamma_phase, momentum_phase, sum[MF_SUM_ARRAY_SIZE];
+  accelerator_for2d(l_index,sizeL,r_index,sizeR,simdSize,{
+
+    calcColourMatrix link_ahead, link_behind;
+    calcSpinor left, shift_ahead, shift_behind;
+    calcScalar temp_site, momentum_phase, sum[MF_SUM_ARRAY_SIZE];
     StencilEntry *SE;
     int ptype, so, base, sumIndex;
 
@@ -630,69 +764,55 @@ void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, int chec
       for(int b=0;b<vecsPerSlicePerBlock;b++){
 
         int ss = so+n*blockStride+b;
-        int ssL, ssR, fullssL, fullssR;
 
-        if (checkerL) {
-          fullssL = oCoordsL_p[ss];
-          ssL = ss;
-        } else {
-          ssL = oCoordsR_p[ss];
-          fullssL = ssL;
+        int fullss = ss, ssL = ss, ssR = ss;
+
+        if (checkerL && checkerR) {
+          fullss = oCoords_p[ss];
+        } else if (checkerL) {
+          fullss = oCoords_p[ss];
+          ssR = fullss;
+        } else if (checkerR) {
+          fullss = oCoords_p[ss];
+          ssL = fullss;
         }
         acceleratorSynchronise();
 
-        if (checkerR) {
-          fullssR = oCoordsR_p[ss];
-          ssR = ss;
-        } else {
-          ssR = oCoordsL_p[ss];
-          fullssR = ssR;
-        }
-        acceleratorSynchronise();
-
-        left   = coalescedRead(view_pL[l_index][ssL]);
-        right  = coalescedRead(view_pR[r_index][ssR]);
+        left   = coalescedRead(viewL_p[l_index][ssL]);
 
         sumIndex = 0;
         for (int mu = 0; mu < nGamma; mu++) {
-          gamma_phase = coalescedRead(view_pG[indexG_p[mu]][fullssL]);
-          link = coalescedRead(view_pU[mu][fullssL]);
+          link_ahead = coalescedRead(viewGL_p[mu][ssL]);
 
-          // Grab field from ahead of ssL
-          SE=rightStencil[r_index].GetEntry(ptype,mu,ssL);
+          SE=stencilR_p.GetEntry(ptype,2*mu,ssR);
           if(SE->_is_local) { 
-            shift_ahead = coalescedReadPermute(view_pR[r_index][SE->_offset],ptype,SE->_permute);
+            shift_ahead = coalescedReadPermute(viewR_p[r_index][SE->_offset],ptype,SE->_permute);
           } else {
-            shift_ahead = coalescedRead(rightStencil[r_index].CommBuf()[SE->_offset]);
+            shift_ahead = coalescedRead(bufRight_p[r_index*haloBuffRightSize+SE->_offset]);
           }
           acceleratorSynchronise();
 
-          shift_ahead =  link * shift_ahead;
-          temp_site = innerProduct(left,shift_ahead);
-
-          for ( int m=0;m<nMom;m++) {
-            momentum_phase = coalescedRead(view_pM[m][fullssL]);
-            sum[sumIndex+m]  += gamma_phase*momentum_phase*temp_site;
-          }
-
-          gamma_phase = coalescedRead(view_pG[indexG_p[mu]][fullssR]);
-          link = coalescedRead(view_pU[mu][fullssR]);
-
-          // Grab field from ahead of ssL
-          SE=leftStencil[l_index].GetEntry(ptype,mu,ssR);
+          SE=stencilR_p.GetEntry(ptype,2*mu+1,ssR);
           if(SE->_is_local) { 
-            shift_ahead = coalescedReadPermute(view_pL[l_index][SE->_offset],ptype,SE->_permute);
+            shift_behind = coalescedReadPermute(viewR_p[r_index][SE->_offset],ptype,SE->_permute);
           } else {
-            shift_ahead = coalescedRead(leftStencil[l_index].CommBuf()[SE->_offset]);
+            shift_behind = coalescedRead(bufRight_p[r_index*haloBuffRightSize+SE->_offset]);
           }
           acceleratorSynchronise();
 
-          shift_ahead =  link * shift_ahead;
-          temp_site = innerProduct(shift_ahead,right);
+          SE=stencilG_p[mu].GetEntry(ptype,0,ssR);
+          if(SE->_is_local) { 
+            link_behind = coalescedReadPermute(viewGR_p[mu][SE->_offset],ptype,SE->_permute);
+          } else {
+            link_behind = coalescedRead(bufGauge_p[offsetG_p[mu]+SE->_offset]);
+          }
+          acceleratorSynchronise();
+
+          temp_site = innerProduct(left,link_ahead*shift_ahead+adj(link_behind)*shift_behind);
 
           for ( int m=0;m<nMom;m++) {
-            momentum_phase = coalescedRead(view_pM[m][fullssR]);
-            sum[sumIndex+m]  += gamma_phase*momentum_phase*temp_site;
+            momentum_phase = coalescedRead(viewM_p[m][fullss]);
+            sum[sumIndex+m]  += momentum_phase*temp_site;
           }
 
           sumIndex+=nMom;
@@ -704,21 +824,30 @@ void A2AutilsMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result, int chec
       }
     }
   });
+  }
+  for(int p=0;p<viewLeft.size();p++)  viewLeft[p].ViewClose();
+  for(int p=0;p<viewRight.size();p++) viewRight[p].ViewClose();
+  for(int p=0;p<viewGaugeRight.size();p++)   viewGaugeRight[p].ViewClose();
+  for(int p=0;p<viewGaugeLeft.size();p++)   viewGaugeLeft[p].ViewClose();
+  for(int p=0;p<viewStencilGauge.size();p++)   viewStencilGauge[p].ViewClose();
 }
 
 template <class FImpl>
-void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, int checkerboardL, int checkerboardR, utilHelper &helper)
+void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, utilHelper &helper)
 {
-  Vector<FermView> &viewLeft  = helper.getView(true,  checkerboardL);
-  Vector<FermView> &viewRight = helper.getView(false, checkerboardR);
+  Vector<FermView> viewLeft; 
+  Vector<FermView> viewRight;
 
-  auto grid = helper.grid;
-  int sizeL = helper.sizeL;
-  int sizeR = helper.sizeR;
-  int orthogDir = helper.orthogDir;
-  int checkerL  = helper.checkerL;
-  int checkerR  = helper.checkerR;
-  const int nMom  = helper.nMom;
+  helper.makeLeftView(viewLeft);
+  helper.makeRightView(viewRight);
+
+  auto grid = helper._grid_L;
+  int sizeL = helper._size_L;
+  int sizeR = helper._size_R;
+  int orthogDir = helper._orthog_dir;
+  int checkerL  = helper._checker_L;
+  int checkerR  = helper._checker_R;
+  const int nMom  = helper._N_mom;
 
   const int simdSize             = grid->Nsimd();
   const int reducedOrthogDimSize = grid->_rdimensions[orthogDir];
@@ -728,7 +857,7 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, int che
   const int rtStride     = grid->_ostride[orthogDir];
   const int vecsPerSlicePerBlock = grid->_slice_block[orthogDir];
 
-  const int nGamma = helper.gammaIndicesLocal.size();
+  const int nGamma = helper._gamma_indices_local.size();
 
   const int MFrvol = reducedOrthogDimSize * sizeL * sizeR * nMom * nGamma;
 
@@ -740,27 +869,24 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, int che
   });  
 
   // Pointers for accelerator indexing
-  FermView     *view_pL    = &viewLeft[0];
-  FermView     *view_pR    = &viewRight[0];
+  FermView     *viewL_p    = &viewLeft[0];
+  FermView     *viewR_p    = &viewRight[0];
 
-  ComplexView  *view_pG    = & helper.viewGamma[0];
-  ComplexView  *view_pM    = & helper.viewMom[0];
+  ComplexView  *viewG_p    = & helper._view_gamma[0];
+  ComplexView  *viewM_p    = & helper._view_mom[0];
 
-  Integer      *indexG_p= & helper.gammaIndicesLocal[0]; 
+  Integer      *indexG_p  = & helper._gamma_indices_local[0]; 
   Integer      *oCoords_p;
 
 
   // If needed, Grab appropriate mapping between checkerboarded lattice and full lattice
-  if(checkerL || checkerR) {
-    if ((checkerL && checkerboardL == Odd)
-        || (checkerR && checkerboardR == Odd)) {
-      oCoords_p = & helper.oCoordsOdd[0];
-    } else {
-      oCoords_p = & helper.oCoordsEven[0];
-    }
+  if(checkerL) {
+    oCoords_p = & (helper.getLeftCoords())[0];
+  } else {
+    oCoords_p = & (helper.getRightCoords())[0];
   }
 
-  accelerator_for2dNB_no_err(l_index,sizeL,r_index,sizeR,simdSize,{
+  accelerator_for2d(l_index,sizeL,r_index,sizeR,simdSize,{
 
     int so, ss, base, sumIndex, ssL, ssR, fullss;
     calcSpinor left, right;
@@ -794,16 +920,16 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, int che
           }
           acceleratorSynchronise();
 
-          left  = coalescedRead(view_pL[l_index][ssL]);
-          right = coalescedRead(view_pR[r_index][ssR]);
+          left  = coalescedRead(viewL_p[l_index][ssL]);
+          right = coalescedRead(viewR_p[r_index][ssR]);
       
           temp_site  = innerProduct(left,right);
 
           sumIndex = 0;
           for (int mu = 0; mu < nGamma; mu++) {
-            gamma_phase = coalescedRead(view_pG[indexG_p[mu]][fullss]);
+            gamma_phase = coalescedRead(viewG_p[indexG_p[mu]][fullss]);
             for ( int m=0;m<nMom;m++) {
-              momentum_phase = coalescedRead(view_pM[m][fullss]);
+              momentum_phase = coalescedRead(viewM_p[m][fullss]);
               
               sum[sumIndex] += gamma_phase*momentum_phase*temp_site;
               sumIndex++;
@@ -816,6 +942,8 @@ void A2AutilsMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result, int che
       }
     }
   });
+  for(int p=0;p<viewLeft.size();p++)  viewLeft[p].ViewClose();
+  for(int p=0;p<viewRight.size();p++) viewRight[p].ViewClose();
 }
 
 NAMESPACE_END(Grid);
