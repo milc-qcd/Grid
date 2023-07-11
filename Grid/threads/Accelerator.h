@@ -107,6 +107,7 @@ void     acceleratorInit(void);
 
 extern int acceleratorAbortOnGpuError;
 extern cudaStream_t copyStream;
+extern cudaStream_t computeStream;
 
 accelerator_inline int acceleratorSIMTlane(int Nsimd) {
 #ifdef GRID_SIMT
@@ -134,7 +135,7 @@ inline void cuda_mem(void)
     };									\
     dim3 cu_threads(nsimd,acceleratorThreads(),1);			\
     dim3 cu_blocks ((num1+nt-1)/nt,num2,1);				\
-    LambdaApply<<<cu_blocks,cu_threads>>>(num1,num2,nsimd,lambda);	\
+    LambdaApply<<<cu_blocks,cu_threads,0,computeStream>>>(num1,num2,nsimd,lambda);	\
   }
 
 #define accelerator_for6dNB(iter1, num1,				\
@@ -153,7 +154,7 @@ inline void cuda_mem(void)
     };									\
     dim3 cu_blocks (num1,num2,num3);					\
     dim3 cu_threads(num4,num5,num6);					\
-    Lambda6Apply<<<cu_blocks,cu_threads>>>(num1,num2,num3,num4,num5,num6,lambda); \
+    Lambda6Apply<<<cu_blocks,cu_threads,0,computeStream>>>(num1,num2,num3,num4,num5,num6,lambda); \
   }
 
 template<typename lambda>  __global__
@@ -189,7 +190,7 @@ void Lambda6Apply(uint64_t num1, uint64_t num2, uint64_t num3,
 
 #define accelerator_barrier(dummy)					\
   {									\
-    cudaDeviceSynchronize();						\
+    cudaStreamSynchronize(computeStream);				\
     cudaError err = cudaGetLastError();					\
     if ( cudaSuccess != err ) {						\
       printf("accelerator_barrier(): Cuda error %s \n",			\
@@ -249,19 +250,25 @@ inline int  acceleratorIsCommunicable(void *ptr)
 //////////////////////////////////////////////
 
 #ifdef GRID_SYCL
-NAMESPACE_END(Grid);
-#include <CL/sycl.hpp>
-#include <CL/sycl/usm.hpp>
-
 #define GRID_SYCL_LEVEL_ZERO_IPC
 
-#ifdef GRID_SYCL_LEVEL_ZERO_IPC
+NAMESPACE_END(Grid);
+#if 0
+#include <CL/sycl.hpp>
+#include <CL/sycl/usm.hpp>
 #include <level_zero/ze_api.h>
 #include <CL/sycl/backend/level_zero.hpp>
+#else
+#include <sycl/CL/sycl.hpp>
+#include <sycl/usm.hpp>
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
 #endif
+
 NAMESPACE_BEGIN(Grid);
 
 extern cl::sycl::queue *theGridAccelerator;
+extern cl::sycl::queue *theCopyAccelerator;
 
 #ifdef __SYCL_DEVICE_ONLY__
 #define GRID_SIMT
@@ -289,7 +296,7 @@ accelerator_inline int acceleratorSIMTlane(int Nsimd) {
       cgh.parallel_for(					\
       cl::sycl::nd_range<3>(global,local), \
       [=] (cl::sycl::nd_item<3> item) /*mutable*/     \
-      [[intel::reqd_sub_group_size(8)]]	      \
+      [[intel::reqd_sub_group_size(16)]]	      \
       {						      \
       auto iter1    = item.get_global_id(0);	      \
       auto iter2    = item.get_global_id(1);	      \
@@ -298,19 +305,19 @@ accelerator_inline int acceleratorSIMTlane(int Nsimd) {
      });	   			              \
     });
 
-#define accelerator_barrier(dummy) theGridAccelerator->wait();
+#define accelerator_barrier(dummy) { theGridAccelerator->wait(); }
 
 inline void *acceleratorAllocShared(size_t bytes){ return malloc_shared(bytes,*theGridAccelerator);};
 inline void *acceleratorAllocDevice(size_t bytes){ return malloc_device(bytes,*theGridAccelerator);};
 inline void acceleratorFreeShared(void *ptr){free(ptr,*theGridAccelerator);};
 inline void acceleratorFreeDevice(void *ptr){free(ptr,*theGridAccelerator);};
-inline void acceleratorCopyDeviceToDeviceAsynch(void *from,void *to,size_t bytes)  {
-  theGridAccelerator->memcpy(to,from,bytes);
-}
-inline void acceleratorCopySynchronise(void) {  theGridAccelerator->wait(); std::cout<<"acceleratorCopySynchronise() wait "<<std::endl; }
-inline void acceleratorCopyToDevice(void *from,void *to,size_t bytes)  { theGridAccelerator->memcpy(to,from,bytes); theGridAccelerator->wait();}
-inline void acceleratorCopyFromDevice(void *from,void *to,size_t bytes){ theGridAccelerator->memcpy(to,from,bytes); theGridAccelerator->wait();}
-inline void acceleratorMemSet(void *base,int value,size_t bytes) { theGridAccelerator->memset(base,value,bytes); theGridAccelerator->wait();}
+
+inline void acceleratorCopySynchronise(void) {  theCopyAccelerator->wait(); }
+inline void acceleratorCopyDeviceToDeviceAsynch(void *from,void *to,size_t bytes)  {  theCopyAccelerator->memcpy(to,from,bytes);}
+inline void acceleratorCopyToDevice(void *from,void *to,size_t bytes)  { theCopyAccelerator->memcpy(to,from,bytes); theCopyAccelerator->wait();}
+inline void acceleratorCopyFromDevice(void *from,void *to,size_t bytes){ theCopyAccelerator->memcpy(to,from,bytes); theCopyAccelerator->wait();}
+inline void acceleratorMemSet(void *base,int value,size_t bytes) { theCopyAccelerator->memset(base,value,bytes); theCopyAccelerator->wait();}
+
 inline int  acceleratorIsCommunicable(void *ptr)
 {
 #if 0
@@ -339,6 +346,7 @@ NAMESPACE_BEGIN(Grid);
 #define accelerator_inline __host__ __device__ inline
 
 extern hipStream_t copyStream;
+extern hipStream_t computeStream;
 /*These routines define mapping from thread grid to loop & vector lane indexing */
 accelerator_inline int acceleratorSIMTlane(int Nsimd) {
 #ifdef GRID_SIMT
@@ -360,15 +368,14 @@ accelerator_inline int acceleratorSIMTlane(int Nsimd) {
     dim3 hip_blocks ((num1+nt-1)/nt,num2,1); \
     if(hip_threads.x * hip_threads.y * hip_threads.z <= 64){ \
       hipLaunchKernelGGL(LambdaApply64,hip_blocks,hip_threads,		\
-            0,0,						\
-            num1,num2,nsimd, lambda);				\
+   	                 0,computeStream,						\
+			 num1,num2,nsimd, lambda);			\
     } else { \
       hipLaunchKernelGGL(LambdaApply,hip_blocks,hip_threads,		\
-            0,0,						\
-            num1,num2,nsimd, lambda);				\
+			 0,computeStream,				\
+			 num1,num2,nsimd, lambda);			\
     } \
   }
-
 
 template<typename lambda>  __global__
 __launch_bounds__(64,1)
@@ -398,7 +405,7 @@ void LambdaApply(uint64_t numx, uint64_t numy, uint64_t numz, lambda Lambda)
 
 #define accelerator_barrier(dummy)				\
   {								\
-    hipDeviceSynchronize();					\
+    hipStreamSynchronize(computeStream);			\
     auto err = hipGetLastError();				\
     if ( err != hipSuccess ) {					\
       printf("After hipDeviceSynchronize() : HIP error %s \n", hipGetErrorString( err )); \
@@ -441,7 +448,7 @@ inline void acceleratorMemSet(void *base,int value,size_t bytes) { hipMemset(bas
 
 inline void acceleratorCopyDeviceToDeviceAsynch(void *from,void *to,size_t bytes) // Asynch
 {
-  hipMemcpyAsync(to,from,bytes, hipMemcpyDeviceToDevice,copyStream);
+  hipMemcpyDtoDAsync(to,from,bytes, copyStream);
 }
 inline void acceleratorCopySynchronise(void) { hipStreamSynchronize(copyStream); };
 
@@ -451,7 +458,8 @@ inline void acceleratorCopySynchronise(void) { hipStreamSynchronize(copyStream);
 // Common on all GPU targets
 //////////////////////////////////////////////
 #if defined(GRID_SYCL) || defined(GRID_CUDA) || defined(GRID_HIP)
-#define accelerator_forNB( iter1, num1, nsimd, ... ) accelerator_for2dNB( iter1, num1, iter2, 1, nsimd, {__VA_ARGS__} );
+// FIXME -- the non-blocking nature got broken March 30 2023 by PAB
+#define accelerator_forNB( iter1, num1, nsimd, ... ) accelerator_for2dNB( iter1, num1, iter2, 1, nsimd, {__VA_ARGS__} );  
 
 #define accelerator_for( iter, num, nsimd, ... )		\
   accelerator_forNB(iter, num, nsimd, { __VA_ARGS__ } );	\
@@ -460,6 +468,8 @@ inline void acceleratorCopySynchronise(void) { hipStreamSynchronize(copyStream);
 #define accelerator_for2d(iter1, num1, iter2, num2, nsimd, ... )	\
   accelerator_for2dNB(iter1, num1, iter2, num2, nsimd, { __VA_ARGS__ } ); \
   accelerator_barrier(dummy);
+
+#define GRID_ACCELERATED
 
 #endif
 
@@ -511,7 +521,16 @@ inline void *acceleratorAllocCpu(size_t bytes){return memalign(GRID_ALLOC_ALIGN,
 inline void acceleratorFreeCpu  (void *ptr){free(ptr);};
 #endif
 
+//////////////////////////////////////////////
+// Fencing needed ONLY for SYCL
+//////////////////////////////////////////////
 
+#ifdef GRID_SYCL
+inline void acceleratorFenceComputeStream(void){ theGridAccelerator->ext_oneapi_submit_barrier(); };
+#else
+// Ordering within a stream guaranteed on Nvidia & AMD
+inline void acceleratorFenceComputeStream(void){ };
+#endif
 
 ///////////////////////////////////////////////////
 // Synchronise across local threads for divergence resynch

@@ -23,6 +23,8 @@ public:
 
   typedef typename FImpl::SiteSpinor vobj;
 
+  typedef typename FImpl::ImplParams FImplParams;
+
   typedef typename vobj::scalar_type scalar_type;
   typedef typename vobj::vector_type vector_type;
 
@@ -34,12 +36,12 @@ public:
   typedef decltype(coalescedRead(vColourMatrix())) calcColourMatrix;
   
   typedef LatticeView<vobj> FermView;
-  typedef CartesianStencil<vobj,vobj,int> FermStencil;
-  typedef CartesianStencilView<vobj,vobj,int> FermStencilView;
+  typedef typename FImpl::StencilImpl FermStencil;
+  typedef typename FImpl::StencilView FermStencilView;
 
   typedef LatticeView<vColourMatrix> GaugeView;
-  typedef CartesianStencil<vColourMatrix,vColourMatrix,int> GaugeStencil;
-  typedef CartesianStencilView<vColourMatrix,vColourMatrix,int> GaugeStencilView;
+  typedef CartesianStencil<vColourMatrix,vColourMatrix,FImplParams> GaugeStencil;
+  typedef CartesianStencilView<vColourMatrix,vColourMatrix,FImplParams> GaugeStencilView;
 
   typedef typename ComplexField::vector_object cobj;
   typedef LatticeView<cobj> ComplexView;
@@ -242,7 +244,7 @@ public:
 
     // Setup lists of pointers to share with accelerators
     template <class Vtype>
-    void makeStencil(Vector<Vtype> &buffer, std::unique_ptr<CartesianStencil<Vtype,Vtype,int> > &stencil, 
+    void makeStencil(Vector<Vtype> &buffer, std::unique_ptr<CartesianStencil<Vtype,Vtype,FImplParams> > &stencil, 
                           const Lattice<Vtype>* field, int size)
     {
       GridBase *grid = field[0].Grid();
@@ -279,7 +281,7 @@ public:
 
       stencilView.reserve(size);
       for (int i=0;i<size;i++) {
-        stencil[i] = std::move(std::unique_ptr<GaugeStencil>(new GaugeStencil(_grid_R, 1, _checkerboard_R, {_shift_dirs[2*i]}, {-1}, 0)));
+        stencil[i] = std::move(std::unique_ptr<GaugeStencil>(new GaugeStencil(_grid_R, 1, _checkerboard_R, {_shift_dirs[2*i]}, {-1})));
 
         makeStencil(bufMu,stencil[i],&_Umu_R[i],1);
 
@@ -299,7 +301,8 @@ public:
     }
 
     void makeRightStencil(Vector<vobj> &buffer, std::unique_ptr<FermStencil> &stencil) {
-      stencil = std::move(std::unique_ptr<FermStencil>(new FermStencil(_grid_R, _shift_dirs.size(), _checkerboard_R, _shift_dirs, _shift_displacements, 0)));
+      stencil = std::move(std::unique_ptr<FermStencil>(new FermStencil(_grid_R, _shift_dirs.size(), _checkerboard_R, 
+                                                                        _shift_dirs, _shift_displacements)));
       makeStencil(buffer, stencil, getRight(), _size_R);
     }
 
