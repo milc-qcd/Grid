@@ -979,58 +979,65 @@ void A2AWorkerMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result)
     ss_p[ss] = rt*rtStride + block*blockStride + vec;
   });
 
-  for (int rt=0; rt < reducedOrthogDimSize; rt++) {
+  //ss_p = &slice_indices[rt*localSpatialVolume];
 
-    ss_p = &slice_indices[rt*localSpatialVolume];
+  accelerator_for2d(l_index,sizeL,r_index,sizeR,simdSize,{
 
-    accelerator_for2dNB_no_err(l_index,sizeL,r_index,sizeR,simdSize,{
+    int rt_old = 0;
+    calcScalar temp_site[MF_SUM_ARRAY_MAX], gamma_phase[MF_SUM_ARRAY_MAX], sum[MF_SUM_ARRAY_MAX];
 
-      calcScalar temp_site[MF_SUM_ARRAY_MAX], gamma_phase[MF_SUM_ARRAY_MAX], sum[MF_SUM_ARRAY_MAX];
+    for (int s=0;s < localVolume; s+=pointsPerBatch) {
+      int so = s%localSpatialVolume;
+      int rt = s/localSpatialVolume;
 
-      for (int p = 0; p < batchSize; p++) {
-        sum[p] = 0.0;
+      if (so == 0) {
+        for (int p = 0; p < batchSize; p++) {
+          sum[p] = 0.0;
+        }
+      }
+      acceleratorSynchronise();
+
+      // Read data
+      for (int i=0;i<batchSize;i++) {
+        const int ii = i/pointsPerBatch;
+        const int si = i%pointsPerBatch;
+        gamma_phase[i] = coalescedRead(viewG_p[indexG_p[ii]][oCoords_p[ss_p[so+si]]]);
       }
 
-      for (int so=0;so < localSpatialVolume; so+=pointsPerBatch) {
+      // Inner product
+      for (int i=0;i<pointsPerBatch;i++) {
+        temp_site[i] = innerProduct(coalescedRead(viewL_p[l_index][ss_p[so+i]]),coalescedRead(viewR_p[r_index][ss_p[so+i]]));
+      }
 
-        // Read data
-        for (int i=0;i<batchSize;i++) {
-          const int ii = i/pointsPerBatch;
-          const int si = i%pointsPerBatch;
-          gamma_phase[i] = coalescedRead(viewG_p[indexG_p[ii]][oCoords_p[ss_p[so+si]]]);
-        }
+      // splat
+      /*for (int i = pointsPerBatch; i < batchSize; i++)
+      {
+         temp_site[i] = temp_site[i%pointsPerBatch];
+      }
+      for (int i = 0; i < batchSize; i++)
+      {
+        gamma_phase[i] = gamma_phase[i/pointsPerBatch];
+      }*/
 
-        // Inner product
-        for (int i=0;i<pointsPerBatch;i++) {
-          temp_site[i] = innerProduct(coalescedRead(viewL_p[l_index][ss_p[so+i]]),coalescedRead(viewR_p[r_index][ss_p[so+i]]));
-        }
-
-        // splat
-        /*for (int i = pointsPerBatch; i < batchSize; i++)
-        {
-           temp_site[i] = temp_site[i%pointsPerBatch];
-        }
-        for (int i = 0; i < batchSize; i++)
-        {
-          gamma_phase[i] = gamma_phase[i/pointsPerBatch];
-        }*/
-
-        // mac
-        for (int i=0; i<batchSize;i++) {
-          int ii = i/pointsPerBatch;
-          int iii = i%pointsPerBatch;
-          sum[ii] += gamma_phase[i]*temp_site[iii];
-        }
+      // mac
+      for (int i=0; i<batchSize;i++) {
+        int ii = i/pointsPerBatch;
+        int iii = i%pointsPerBatch;
+        sum[ii] += gamma_phase[i]*temp_site[iii];
       }
 
       // Reduce points with same gamma and Write
-      int write_idx = nGamma*(l_index+sizeL*r_index+sizeL*sizeR*rt);
-      for (int i=0; i<gammasPerPoint;i++) {
-        coalescedWrite(result_p[write_idx+i],sum[i]);
+      if (rt_old != rt) {
+        int write_idx = nGamma*(l_index+sizeL*r_index+sizeL*sizeR*rt);
+        for (int i=0; i<gammasPerPoint;i++) {
+          coalescedWrite(result_p[write_idx+i],sum[i]);
+        }
+        rt_old = rt;
       }
-    });
-  }
-  accelerator_barrier();
+      acceleratorSynchronise();
+    }
+  });
+
   for(int p=0;p<viewLeft.size();p++)  viewLeft[p].ViewClose();
   for(int p=0;p<viewRight.size();p++) viewRight[p].ViewClose();
     viewLeft.resize(0);
