@@ -1,6 +1,12 @@
 #pragma once
 #include <Grid/Grid_Eigen_Tensor.h>
 
+#ifndef accelerator_for2dNB
+#define accelerator_for2dNB_no_err(iter1, num1, iter2, num2, nsimd, ... )  accelerator_for2d(iter1, num1, iter2, num2, nsimd, { __VA_ARGS__ } );
+#else
+#define accelerator_for2dNB_no_err(iter1, num1, iter2, num2, nsimd, ... )  accelerator_for2dNB(iter1, num1, iter2, num2, nsimd, { __VA_ARGS__ } );
+#endif
+
 #ifndef MF_SUM_ARRAY_MAX
 #define MF_SUM_ARRAY_MAX 16
 #endif
@@ -40,10 +46,58 @@ public:
   typedef typename ComplexField::vector_object cobj;
   typedef LatticeView<cobj> ComplexView;
 
+protected:
+  template<typename Vtype>
+  class A2AView {
+    Vector<LatticeView<Vtype> > _view;
+
+  public:
+    void buildView(const Lattice<Vtype> *field, int size) {
+      _view.reserve(size);
+
+      for(int p=0;p<size;p++) {
+        _view.push_back(field[p].View(AcceleratorRead));
+      }
+    }
+
+    int size() {return _view.size();}
+
+    LatticeView<Vtype> &operator[](size_t i) { return _view[i];}
+    
+    ~A2AView() {
+      for(int p=0;p<_view.size();p++)   _view[p].ViewClose();
+      _view.resize(0);
+    }
+  };
+
+public:
+  GridBase *_grid, *_cb_grid;
+  LatticeGaugeField *_U;
+  const std::vector<StagGamma::SpinTastePair> &_gammas;
+  const std::vector<ComplexField> &_mom;
+  std::vector<ComplexField> _stag_phase;
+  std::vector<LatticeColourMatrix> _Umu_E,_Umu_O;
+  A2AView<cobj> _view_gamma, _view_mom;
+  A2AView<vColourMatrix> _view_links_E, _view_links_O;
+  Vector<Integer> _o_coords_E, _o_coords_O, _gamma_indices_comm, _gamma_indices_local, _gauge_stencil_buf_offsets;
+  Vector<Coordinate> _i_coor_container;
+  std::vector<std::unique_ptr<GaugeStencil> > _stencil_gauge_E,_stencil_gauge_O;
+  Vector<GaugeStencilView> _view_stencil_gauge_E,_view_stencil_gauge_O;
+  Vector<vColourMatrix> _halo_buffer_gauge_E,_halo_buffer_gauge_O;
+  std::vector<int> _shift_dirs, _shift_displacements;
+  int _N_mom, _orthog_dir;
+
+  GridBase *_grid_L, *_grid_R; 
+  const FermionField *_left_E, *_left_O, *_right_E, *_right_O;
+  int _checker_L, _checkerboard_L, _size_L, _size_L_out;
+  int _checker_R, _checkerboard_R, _size_R, _size_R_out;
+
 public:
   A2AWorkerMILC() = delete;
   A2AWorkerMILC(GridBase *grid, const std::vector<StagGamma::SpinTastePair>& gammas, const std::vector<ComplexField> &mom, LatticeGaugeField* U = nullptr, GridBase *cbGrid = nullptr)
   : _grid(grid), _gammas(gammas), _mom(mom), _U(U), _cb_grid(cbGrid) {
+
+    _N_mom   = _mom.size();
 
     StagGamma spinTaste;
     if (_U != nullptr) {
@@ -82,6 +136,19 @@ public:
       assert(0);
     }
 
+    if (_gamma_indices_local.size() > 0) {
+      buildLocalPhases();
+    }
+
+    _view_mom.buildView(&_mom[0],_mom.size());
+
+    if (_gamma_indices_comm.size() > 0) {
+      double t0 = usecond();
+      buildGaugeLinks();
+      double t1 = usecond();
+      std::cout << GridLogPerformance << " MesonField one link timings: build link fields:" << (t1-t0)/1000 << "ms" << std::endl;   
+    }
+
     // Grab SIMD coordinates from indices
     _i_coor_container.resize(grid->Nsimd(), Coordinate(grid->_ndimension));
     for(int p = 0; p < grid->Nsimd(); p++) {
@@ -111,6 +178,14 @@ public:
     }
   }
 
+  ~A2AWorkerMILC() {
+    for(int p=0;p<_view_stencil_gauge_E.size();p++) {
+      _view_stencil_gauge_E[p].ViewClose(); 
+      _view_stencil_gauge_O[p].ViewClose();
+    }
+    _view_stencil_gauge_E.resize(0);
+    _view_stencil_gauge_O.resize(0);
+  }
   double getFlops() {
     // One complex multiply takes 6 floating point ops (4 mult, 2 add) 
     // --> complex inner product is 3 complex mult, 2 complex add = 3*6 + 2*2 = 22 double precision floating ops
@@ -124,7 +199,8 @@ public:
     double local_flops = 0.0;
 
     if (_gamma_indices_local.size() > 0) {
-      local_flops = 22.0+(6.0+6.0+2.0)*(_N_mom*_gamma_indices_local.size());
+      //local_flops = 22.0+(6.0+6.0+2.0)*(_N_mom*_gamma_indices_local.size());
+      local_flops = 22.0+(6.0+2.0)*(_gamma_indices_local.size());
     }
 
     // matrix*vector = 3 inner products
@@ -189,9 +265,37 @@ public:
     }
   }
 
-  void makeGammaView(const ComplexField *field) { makeView(_view_gamma,field,_gamma_indices_local.size()); }
+  A2AView<vColourMatrix> &getGaugeViewLeft() {
+    if (_checkerboard_L == Odd)
+      return _view_links_O;
+    else {
+      return _view_links_E;
+    }
+  }
 
-  void makeMomentumView(const ComplexField *field) { makeView(_view_mom,field,_N_mom); }
+  A2AView<vColourMatrix> &getGaugeViewRight() {
+    if (_checkerboard_R == Odd)
+      return _view_links_O;
+    else {
+      return _view_links_E;
+    }
+  }
+
+  Vector<GaugeStencilView> &getGaugeStencilView() {
+    if (_checkerboard_R == Odd)
+      return _view_stencil_gauge_O;
+    else {
+      return _view_stencil_gauge_E;
+    }
+  }
+
+  Vector<vColourMatrix> &getGaugeStencilHalo() {
+    if (_checkerboard_R == Odd)
+      return _halo_buffer_gauge_O;
+    else {
+      return _halo_buffer_gauge_E;
+    }
+  }
 
   void makeLeftView(Vector<FermView> &view) {//const FermionField *field, int checkerboard) { 
     if (_checkerboard_L == Odd)
@@ -207,68 +311,55 @@ public:
       makeView(view,_right_E,_size_R); 
   }
 
-  void makeGauge(std::vector<LatticeColourMatrix> &Umu, int checkerboard = -1)
+  void buildLocalPhases() {
+    int nGamma_local = _gamma_indices_local.size();
+
+    _stag_phase.resize(nGamma_local,_grid);
+
+    { // Set up staggered phases
+      StagGamma spinTaste;
+      int mu;
+      for (int i = 0; i < nGamma_local; i++) {
+        mu = _gamma_indices_local[i];
+        _stag_phase[i] = 1.0;
+        spinTaste.setSpinTaste(_gammas[mu]);
+        spinTaste.applyPhase(_stag_phase[i],_stag_phase[i]); // store spin-taste phase
+      }
+    }
+
+    _view_gamma.buildView(&_stag_phase[0],nGamma_local);
+  }
+
+  void buildGaugeLinks()
   {
+    int mu, nGamma_comm = _gamma_indices_comm.size();
+
+    _Umu_E.resize(nGamma_comm,_cb_grid);
+    _Umu_O.resize(nGamma_comm,_cb_grid);
+
     StagGamma spinTaste;
     LatticeColourMatrix Umu_temp(_U->Grid());
-    int mu, size = _gamma_indices_comm.size();
 
-    for (int i = 0; i < size; i++) {
+    for (int i = 0; i < nGamma_comm; i++) {
       mu = _gamma_indices_comm[i];
       spinTaste.setSpinTaste(_gammas[mu]);
 
-      if (checkerboard != -1 ) {
-        Umu_temp = PeekIndex<LorentzIndex>(*_U,_shift_dirs[2*i]); // Store full lattice links in shift direction
+      Umu_temp = PeekIndex<LorentzIndex>(*_U,_shift_dirs[2*i]); // Store full lattice links in shift direction
 
-        spinTaste.applyPhase(Umu_temp,Umu_temp); // store spin-taste phase
+      spinTaste.applyPhase(Umu_temp,Umu_temp); // store spin-taste phase
 
-        pickCheckerboard(checkerboard,Umu[i],Umu_temp);
-      } else {
-        Umu[i] = PeekIndex<LorentzIndex>(*_U,_shift_dirs[2*i]);
-        spinTaste.applyPhase(Umu[i],Umu[i]); // store spin-taste phase
-      }
-
+      pickCheckerboard(Even,_Umu_E[i],Umu_temp);
+      pickCheckerboard(Odd,_Umu_O[i],Umu_temp);
     }
-  }
+   
+    double t0=usecond();
+    makeGaugeStencil();
+    double t1=usecond();
 
-  void makeGaugeLeft()
-  {
-    _Umu_L.resize(_gamma_indices_comm.size(),_grid_L);
+    std::cout << GridLogPerformance << " MesonField one link timings: gauge comms:" << (t1-t0)/1000 << "ms" << std::endl;   
 
-    if (_checker_L) {
-      if (_checkerboard_L == Odd) {
-        makeGauge(_Umu_L,Odd);
-      } else {
-        makeGauge(_Umu_L,Even);
-      }
-    } else {
-      makeGauge(_Umu_L);
-    }
-  }
-
-  void makeGaugeRight()
-  {
-    _Umu_R.resize(_gamma_indices_comm.size(),_grid_R);
-
-    if (_checker_R) {
-      if (_checkerboard_R == Odd) {
-        makeGauge(_Umu_R,Odd);
-      } else {
-        makeGauge(_Umu_R,Even);
-      }
-    } else {
-      makeGauge(_Umu_R);
-    }
-  }
-
-  void makeGaugeViewLeft(Vector<GaugeView> &view)
-  {
-    makeView(view, &_Umu_L[0],_gamma_indices_comm.size());
-  }
-
-  void makeGaugeViewRight(Vector<GaugeView> &view)
-  {
-    makeView(view, &_Umu_R[0],_gamma_indices_comm.size());
+    _view_links_E.buildView(&_Umu_E[0],nGamma_comm);
+    _view_links_O.buildView(&_Umu_O[0],nGamma_comm);
   }
 
   // Setup lists of pointers to share with accelerators
@@ -300,32 +391,42 @@ public:
     }
   }
 
-  void makeGaugeStencil(Vector<vColourMatrix> &buffer, std::vector<std::unique_ptr<GaugeStencil> > &stencil, 
-                        Vector<GaugeStencilView> &stencilView) {
+  void makeGaugeStencil() {
 
-    Vector<vColourMatrix> bufMu;
+    Vector<vColourMatrix> bufMuE, bufMuO;
     int size = _shift_dirs.size()/2;
 
     _gauge_stencil_buf_offsets.resize(size);
 
-    stencilView.reserve(size);
+    _view_stencil_gauge_E.reserve(size);
+    _view_stencil_gauge_O.reserve(size);
+    _stencil_gauge_E.resize(size);
+    _stencil_gauge_O.resize(size);
+
     for (int i=0;i<size;i++) {
-      stencil[i] = std::move(std::unique_ptr<GaugeStencil>(new GaugeStencil(_grid_R, 1, _checkerboard_R, {_shift_dirs[2*i]}, {-1})));
+      _stencil_gauge_E[i] = std::move(std::unique_ptr<GaugeStencil>(new GaugeStencil(_cb_grid, 1, Even, {_shift_dirs[2*i]}, {-1})));
+      _stencil_gauge_O[i] = std::move(std::unique_ptr<GaugeStencil>(new GaugeStencil(_cb_grid, 1, Odd, {_shift_dirs[2*i]}, {-1})));
 
-      makeStencil(bufMu,stencil[i],&_Umu_R[i],1);
+      makeStencil(bufMuE,_stencil_gauge_E[i],&_Umu_E[i],1);
+      makeStencil(bufMuO,_stencil_gauge_O[i],&_Umu_O[i],1);
 
-      _gauge_stencil_buf_offsets[i] = buffer.size();
+      _gauge_stencil_buf_offsets[i] = _halo_buffer_gauge_E.size();
 
-      buffer.resize(buffer.size()+bufMu.size());
+      _halo_buffer_gauge_E.resize(_halo_buffer_gauge_E.size()+bufMuE.size());
+      _halo_buffer_gauge_O.resize(_halo_buffer_gauge_O.size()+bufMuO.size());
 
-      if (bufMu.size() > 0) {
-        vColourMatrix *buf_p = &buffer[_gauge_stencil_buf_offsets[i]], *bufMu_p = &bufMu[0];
-        accelerator_for(i,bufMu.size(),1,{
-          buf_p[i] = bufMu_p[i];
+      if (bufMuE.size() > 0) {
+        vColourMatrix *bufE_p = &_halo_buffer_gauge_E[_gauge_stencil_buf_offsets[i]], *bufMuE_p = &bufMuE[0];
+        vColourMatrix *bufO_p = &_halo_buffer_gauge_O[_gauge_stencil_buf_offsets[i]], *bufMuO_p = &bufMuO[0];
+
+        accelerator_for(i,bufMuE.size(),1,{
+          bufE_p[i] = bufMuE_p[i];
+          bufO_p[i] = bufMuO_p[i];
         });
       }
 
-      stencilView.push_back(stencil[i]->View(AcceleratorRead));
+      _view_stencil_gauge_E.push_back(_stencil_gauge_E[i]->View(AcceleratorRead));
+      _view_stencil_gauge_O.push_back(_stencil_gauge_O[i]->View(AcceleratorRead));
     }
   }
 
@@ -334,23 +435,6 @@ public:
                                                                       _shift_dirs, _shift_displacements)));
     makeStencil(buffer, stencil, getRight(), _size_R);
   }
-
-public:
-  GridBase *_grid, *_cb_grid;
-  LatticeGaugeField *_U;
-  const std::vector<ComplexField> &_mom;
-  const std::vector<StagGamma::SpinTastePair> &_gammas;
-  Vector<ComplexView> _view_gamma, _view_mom;
-  Vector<Integer> _o_coords_E, _o_coords_O, _gamma_indices_comm, _gamma_indices_local, _gauge_stencil_buf_offsets;
-  Vector<Coordinate> _i_coor_container;
-  std::vector<int> _shift_dirs, _shift_displacements;
-  int _N_mom, _orthog_dir;
-
-  GridBase *_grid_L, *_grid_R; 
-  std::vector<LatticeColourMatrix> _Umu_L,_Umu_R;
-  const FermionField *_left_E, *_left_O, *_right_E, *_right_O;
-  int _checker_L, _checkerboard_L, _size_L, _size_L_out;
-  int _checker_R, _checkerboard_R, _size_R, _size_R_out;
 
 public:
   template <typename TensorType> // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
@@ -367,6 +451,7 @@ public:
 
   void spatialContractComm(Vector<Scalar_v>& result);
   void spatialContractLocal(Vector<Scalar_v>& result);
+
 };
 
 template <class FImpl>
@@ -384,7 +469,6 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   _size_R = mat.dimension(4);
   _size_L_out = mat.dimension(3);
   _size_R_out = mat.dimension(4);
-  _N_mom   = _mom.size();
   _orthog_dir = orthog_dir;
 
   _grid_L = _grid;
@@ -411,24 +495,8 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   int nGamma       = _gammas.size();
   int nGamma_local = _gamma_indices_local.size();
 
-  std::vector<ComplexField> stagPhase(nGamma_local,_grid);
-
-  { // Set up staggered phases
-    StagGamma spinTaste;
-    int mu;
-    for (int i = 0; i < nGamma_local; i++) {
-      mu = _gamma_indices_local[i];
-      stagPhase[i] = 1.0;
-      spinTaste.setSpinTaste(_gammas[mu]);
-      spinTaste.applyPhase(stagPhase[i],stagPhase[i]); // store spin-taste phase
-    }
-  }
-
   Vector<Scalar_v> simd_sum_comm_E, simd_sum_comm_O;
   Vector<Scalar_v> simd_sum_local_E, simd_sum_local_O;
-
-  makeGammaView(&stagPhase[0]);
-  makeMomentumView(&_mom[0]);
 
   if (t_kernel) *t_kernel = -usecond();
 
@@ -508,11 +576,6 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
 
   accelerator_barrier();
 
-  for(int p=0;p<_view_gamma.size();p++)   _view_gamma[p].ViewClose();
-  for(int p=0;p<_view_mom.size();p++)     _view_mom[p].ViewClose();
-
-    _view_gamma.resize(0);
-    _view_mom.resize(0);
 }
 
 template <class FImpl>
@@ -682,36 +745,23 @@ void A2AWorkerMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result)
   const int nGamma = _gamma_indices_comm.size();
 
   std::unique_ptr<FermStencil>  stencilRight;
-  std::vector<std::unique_ptr<GaugeStencil> > stencilGauge(nGamma);
-
   Vector<FermView>  viewRight, viewLeft;
-  Vector<GaugeView> viewGaugeLeft,viewGaugeRight;
-  Vector<GaugeStencilView> viewStencilGauge;
-
   Vector<vobj> haloBufferRight;
-  Vector<vColourMatrix> haloBufferGauge;
-
-  double t0=usecond();
-  makeGaugeLeft();
-  makeGaugeRight();
+ 
   double t1=usecond();
-
   makeRightStencil(haloBufferRight, stencilRight);
   double t2=usecond();
-  makeGaugeStencil(haloBufferGauge,   stencilGauge, viewStencilGauge);
-  double t3=usecond();
-
   makeLeftView(viewLeft);
   makeRightView(viewRight);
-  double t4=usecond();
+  double t3=usecond();
 
-  makeGaugeViewLeft(viewGaugeLeft);
-  makeGaugeViewRight(viewGaugeRight);
-  double t5=usecond();
+  A2AView<vColourMatrix>   &viewGaugeLeft    = getGaugeViewLeft();
+  A2AView<vColourMatrix>   &viewGaugeRight   = getGaugeViewRight();
+  Vector<GaugeStencilView> &viewGaugeStencil = getGaugeStencilView();
+  Vector<vColourMatrix>    &haloBufferGauge  = getGaugeStencilHalo();
 
-  std::cout << GridLogPerformance << " MesonField one link timings: build link fields:" << (t1-t0)/1000 << "ms, right comms:" << (t2-t1)/1000 << "ms" << std::endl;   
-  std::cout << GridLogPerformance << " MesonField one link timings: gauge comms:" << (t3-t2)/1000 << "ms, build left+right views:" << (t4-t3)/1000 << "ms" << std::endl;   
-  std::cout << GridLogPerformance << " MesonField one link timings: build left+right gauage views:" << (t5-t4)/1000 << "ms" << std::endl;   
+  std::cout << GridLogPerformance << " MesonField one link timings: right comms:" << (t2-t1)/1000 << "ms" << std::endl;   
+  std::cout << GridLogPerformance << " MesonField one link timings: build left+right views:" << (t3-t2)/1000 << "ms" << std::endl;   
 
   int haloBuffRightSize = stencilRight->_unified_buffer_size;
 
@@ -752,7 +802,7 @@ void A2AWorkerMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result)
   FermView         *viewR_p  = & viewRight[0];   // ket vectors
   GaugeView        *viewGL_p = & viewGaugeLeft[0];   // Gauge links for bras
   GaugeView        *viewGR_p = & viewGaugeRight[0];   // Gauge links for kets
-  GaugeStencilView *stencilG_p = & viewStencilGauge[0]; // Gauge tencil for shifted links
+  GaugeStencilView *stencilG_p = & viewGaugeStencil[0]; // Gauge tencil for shifted links
 
   vobj          *bufRight_p = &haloBufferRight[0]; // buffer for shifted kets in halo region
   vColourMatrix *bufGauge_p = &haloBufferGauge[0]; // buffer for shifted links in halo region
@@ -851,14 +901,8 @@ void A2AWorkerMILC<FImpl>::spatialContractComm(Vector<Scalar_v>& result)
   }
   for(int p=0;p<viewLeft.size();p++)  viewLeft[p].ViewClose();
   for(int p=0;p<viewRight.size();p++) viewRight[p].ViewClose();
-  for(int p=0;p<viewGaugeRight.size();p++)   viewGaugeRight[p].ViewClose();
-  for(int p=0;p<viewGaugeLeft.size();p++)   viewGaugeLeft[p].ViewClose();
-  for(int p=0;p<viewStencilGauge.size();p++)   viewStencilGauge[p].ViewClose();
     viewLeft.resize(0);
     viewRight.resize(0);
-    viewGaugeRight.resize(0);
-    viewGaugeLeft.resize(0);
-    viewStencilGauge.resize(0);
 }
 
 template <class FImpl>
@@ -874,9 +918,6 @@ void A2AWorkerMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result)
   int sizeL = _size_L;
   int sizeR = _size_R;
   int orthogDir = _orthog_dir;
-  int checkerL  = _checker_L;
-  int checkerR  = _checker_R;
-  const int nMom  = _N_mom;
 
   const int simdSize             = grid->Nsimd();
   const int reducedOrthogDimSize = grid->_rdimensions[orthogDir];
@@ -888,7 +929,7 @@ void A2AWorkerMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result)
 
   const int nGamma = _gamma_indices_local.size();
 
-  const int MFrvol = reducedOrthogDimSize * sizeL * sizeR * nMom * nGamma;
+  const int MFrvol = reducedOrthogDimSize * sizeL * sizeR * nGamma;
 
   result.resize(MFrvol);
 
@@ -902,75 +943,94 @@ void A2AWorkerMILC<FImpl>::spatialContractLocal(Vector<Scalar_v>& result)
   FermView     *viewR_p    = &viewRight[0];
 
   ComplexView  *viewG_p    = & _view_gamma[0];
-  ComplexView  *viewM_p    = & _view_mom[0];
 
   Integer      *indexG_p  = & _gamma_indices_local[0]; 
-  Integer      *oCoords_p;
+  Integer      *oCoords_p = & (getLeftCoords())[0];
 
+  assert(nGamma <= MF_SUM_ARRAY_MAX);
 
-  // If needed, Grab appropriate mapping between checkerboarded lattice and full lattice
-  if(checkerL) {
-    oCoords_p = & (getLeftCoords())[0];
-  } else {
-    oCoords_p = & (getRightCoords())[0];
-  }
+  int pointsPerBatch = max(1,MF_SUM_ARRAY_MAX/nGamma); 
+  int gammasPerPoint = nGamma;
+  int batchSize = gammasPerPoint*pointsPerBatch;
 
-  accelerator_for2d(l_index,sizeL,r_index,sizeR,simdSize,{
+  //Vector<Integer> gamma_map(MF_SUM_ARRAY_MAX);
+  //Vector<Integer> point_map(MF_SUM_ARRAY_MAX);
 
-    int so, ss, base, sumIndex, ssL, ssR, fullss;
-    calcSpinor left, right;
-    calcScalar temp_site, gamma_phase, momentum_phase, sum[MF_SUM_ARRAY_MAX];
+  //Integer *mapG_p = &gamma_map[0];
+  //Integer *mapS_p = &point_map[0];
 
-    for (int rt=0;rt<reducedOrthogDimSize;rt++) {
+  //for(int i=0;i<batchSize;i++) { //Example: 2 points, 2 gammas per point, 2 momenta per point
+  //  mapS_p[i] = i%pointsPerBatch; //0123012301230123
+  //  mapG_p[i] = i/gammasPerPoint;    //0000111122223333
+  //};
 
-      so=rt*rtStride; // base offset for start of the local plane
-      base = nGamma*nMom*l_index+nGamma*nMom*sizeL*r_index+nGamma*nMom*sizeL*sizeR*rt;
+  int localSpatialVolume = nBlocks*vecsPerSlicePerBlock;
+  int localVolume = reducedOrthogDimSize*localSpatialVolume;
 
-      for (int p = 0; p < nGamma*nMom; p++) {
+  assert(localSpatialVolume % pointsPerBatch == 0);
+
+  Vector<Integer> slice_indices(localVolume);
+  Integer *ss_p = &slice_indices[0];
+
+  accelerator_for(ss,localVolume,1,{
+    int rt = ss/localSpatialVolume;
+    int block = (ss/vecsPerSlicePerBlock)%nBlocks;
+    int vec = ss%vecsPerSlicePerBlock;
+    ss_p[ss] = rt*rtStride + block*blockStride + vec;
+  });
+
+  for (int rt=0; rt < reducedOrthogDimSize; rt++) {
+
+    ss_p = &slice_indices[rt*localSpatialVolume];
+
+    accelerator_for2dNB_no_err(l_index,sizeL,r_index,sizeR,simdSize,{
+
+      calcScalar temp_site[MF_SUM_ARRAY_MAX], gamma_phase[MF_SUM_ARRAY_MAX], sum[MF_SUM_ARRAY_MAX];
+
+      for (int p = 0; p < batchSize; p++) {
         sum[p] = 0.0;
       }
 
-      // Loop through all points on the same time slice
-      for(int n=0;n<nBlocks;n++)
-      for(int b=0;b<vecsPerSlicePerBlock;b++){
+      for (int so=0;so < localSpatialVolume; so+=pointsPerBatch) {
 
-          ss = so+n*blockStride+b;
-          ssL = ssR = fullss = ss;
-
-          if (checkerL || checkerR) {
-            fullss = oCoords_p[ss];
-            ssL = fullss;
-            ssR = fullss;
-
-            if (checkerL)
-              ssL = ss;
-            if (checkerR)
-              ssR = ss;
-          }
-          acceleratorSynchronise();
-
-          left  = coalescedRead(viewL_p[l_index][ssL]);
-          right = coalescedRead(viewR_p[r_index][ssR]);
-      
-          temp_site  = innerProduct(left,right);
-
-          sumIndex = 0;
-          for (int mu = 0; mu < nGamma; mu++) {
-            gamma_phase = coalescedRead(viewG_p[indexG_p[mu]][fullss]);
-            for ( int m=0;m<nMom;m++) {
-              momentum_phase = coalescedRead(viewM_p[m][fullss]);
-              
-              sum[sumIndex] += gamma_phase*momentum_phase*temp_site;
-              sumIndex++;
-            }
-          }
+        // Read data
+        for (int i=0;i<batchSize;i++) {
+          const int ii = i/pointsPerBatch;
+          const int si = i%pointsPerBatch;
+          gamma_phase[i] = coalescedRead(viewG_p[indexG_p[ii]][oCoords_p[ss_p[so+si]]]);
         }
-      for (int p = 0; p < nGamma*nMom; p++) {
-        int idx = base+p;
-        coalescedWrite(result_p[idx],sum[p]);
+
+        // Inner product
+        for (int i=0;i<pointsPerBatch;i++) {
+          temp_site[i] = innerProduct(coalescedRead(viewL_p[l_index][ss_p[so+i]]),coalescedRead(viewR_p[r_index][ss_p[so+i]]));
+        }
+
+        // splat
+        /*for (int i = pointsPerBatch; i < batchSize; i++)
+        {
+           temp_site[i] = temp_site[i%pointsPerBatch];
+        }
+        for (int i = 0; i < batchSize; i++)
+        {
+          gamma_phase[i] = gamma_phase[i/pointsPerBatch];
+        }*/
+
+        // mac
+        for (int i=0; i<batchSize;i++) {
+          int ii = i/pointsPerBatch;
+          int iii = i%pointsPerBatch;
+          sum[ii] += gamma_phase[i]*temp_site[iii];
+        }
       }
-    }
-  });
+
+      // Reduce points with same gamma and Write
+      int write_idx = nGamma*(l_index+sizeL*r_index+sizeL*sizeR*rt);
+      for (int i=0; i<gammasPerPoint;i++) {
+        coalescedWrite(result_p[write_idx+i],sum[i]);
+      }
+    });
+  }
+  accelerator_barrier();
   for(int p=0;p<viewLeft.size();p++)  viewLeft[p].ViewClose();
   for(int p=0;p<viewRight.size();p++) viewRight[p].ViewClose();
     viewLeft.resize(0);
