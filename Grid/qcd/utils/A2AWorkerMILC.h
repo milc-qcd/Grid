@@ -7,12 +7,6 @@
 
 NAMESPACE_BEGIN(Grid);
 
-#ifndef accelerator_for2dNB
-#define accelerator_for2dNB_no_err(iter1, num1, iter2, num2, nsimd, ... )  accelerator_for2d(iter1, num1, iter2, num2, nsimd, { __VA_ARGS__ } );
-#else
-#define accelerator_for2dNB_no_err(iter1, num1, iter2, num2, nsimd, ... )  accelerator_for2dNB(iter1, num1, iter2, num2, nsimd, { __VA_ARGS__ } );
-#endif
-
 #if 0
 #ifndef GRID_SIMT
 #define accelerator_for2dNB_shm(iter1, num1, iter2, num2, nsimd, shm, ... )  \
@@ -36,6 +30,205 @@ accelerator_for2d(iter1, num1, iter2, num2, nsimd, { \
   }
 #endif
 #endif
+
+#define A2A_TASK_COMMON() \
+  const int sizeLOut = result.dimension(3); \
+  const int sizeROut = result.dimension(4); \
+  int sizeR = sizeROut; \
+  int sizeL = sizeLOut; \
+  \
+  const int nGamma = this->_gamma_indices.size(); \
+  \
+  const int simdSize             = this->_grid->Nsimd(); \
+  const int reducedOrthogDimSize = this->_grid->_rdimensions[orthogDir]; \
+  \
+  const int nBlocks      = this->_grid->_slice_nblock[orthogDir]; \
+  \
+  const int localSpatialVolume     = this->_grid->_ostride[orthogDir]; \
+  \
+  FermView     *viewL_p    = &this->_left[0]; \
+  FermView     *viewR_p    = &this->_right[0]; \
+  int localOrthogDimSize   = this->_grid->_ldimensions[orthogDir]; \
+  \
+  int Nt     = this->_grid->GlobalDimensions()[orthogDir]; \
+  \
+  Integer* indexG_p = & this->_gamma_indices[0]; \
+  \
+  int pd = this->_grid->_processors[orthogDir]; \
+  int pc = this->_grid->_processor_coor[orthogDir]; \
+  \
+  auto result_p = result.data(); \
+  \
+  int localStride = 2; \
+  int orthogSimdSize = this->_grid->_simd_layout[orthogDir]; \
+  Coordinate *icoor_p = &this->_i_coor_container[0];
+
+
+#define A2A_TASK_HALF_COMMON() \
+  A2A_TASK_COMMON(); \
+  sizeL=sizeL/2; \
+  sizeR=sizeR/2; \
+  int mult_L = 2; \
+  int mult_R = 2; \
+  bool even = this->_cb == Even; \
+  bool oddShifts = this->_odd_shifts; \
+  const int MFrvol = localStride*reducedOrthogDimSize *sizeL *sizeR * nGamma; \
+  \
+  Vector<cobj> shmem(MFrvol); \
+  cobj *shm_p = &shmem[0]; \
+  \
+  accelerator_for(r, MFrvol,1,{ \
+    shm_p[r] = Zero(); \
+  });  
+
+#define A2A_KERNEL_COMPUTE_ONELINK_TIMEDIR_NOMOM() \
+accelerator_for2d(ls_index,localStride*sizeL,r_index,sizeR,simdSize,{ \
+  \
+  int site_offset = ls_index % localStride; \
+  int l_index = ls_index/localStride; \
+  \
+  calcColourMatrix link_ahead, link_behind; \
+  calcSpinor left, shift_ahead, shift_behind; \
+  calcScalar sum[MF_SUM_ARRAY_MAX]; \
+  \
+  StencilEntry *SE; \
+  int ptype, ss; \
+  int shmem_base = localStride*nGamma*reducedOrthogDimSize*(l_index+sizeL*r_index)+site_offset; \
+  \
+  for (int rt=0;rt < reducedOrthogDimSize; rt++) { \
+    \
+    for (int mu=0;mu<nGamma;mu++) { \
+      sum[mu] = Zero(); \
+    } \
+    \
+    int shmem_idx = localStride*nGamma*rt+shmem_base; \
+    for (int so=0;so < localSpatialVolume; so+=localStride) { \
+      ss = rt*localSpatialVolume+so+site_offset; \
+    \
+      left   = coalescedRead(viewL_p[l_index][ss]); \
+      \
+      for (int mu = 0; mu < nGamma; mu++) { \
+        link_ahead = coalescedRead(viewGL_p[mu][ss]); \
+      \
+        SE=stencilR_p->GetEntry(ptype,2*mu,ss); \
+        if(SE->_is_local) {  \
+          shift_ahead = coalescedReadPermute(viewR_p[r_index][SE->_offset],ptype,SE->_permute); \
+        } else { \
+          shift_ahead = coalescedRead(bufRight_p[r_index*haloBuffRightSize+SE->_offset]); \
+        } \
+        acceleratorSynchronise(); \
+        \
+        SE=stencilR_p->GetEntry(ptype,2*mu+1,ss); \
+        if(SE->_is_local) { \
+          shift_behind = coalescedReadPermute(viewR_p[r_index][SE->_offset],ptype,SE->_permute); \
+        } else { \
+          shift_behind = coalescedRead(bufRight_p[r_index*haloBuffRightSize+SE->_offset]); \
+        } \
+        acceleratorSynchronise(); \
+        \
+        SE=stencilG_p[mu].GetEntry(ptype,0,ss); \
+        if(SE->_is_local) {  \
+          link_behind = adj(coalescedReadPermute(viewGR_p[mu][SE->_offset],ptype,SE->_permute)); \
+        } else { \
+          link_behind = adj(coalescedRead(bufGauge_p[offsetG_p[mu]+SE->_offset])); \
+        } \
+        acceleratorSynchronise(); \
+        \
+        sum[mu] += innerProduct(left,link_ahead*shift_ahead+link_behind*shift_behind); \
+      } \
+      for (int mu=0;mu<nGamma;mu++) { \
+        coalescedWrite(shm_p[shmem_idx+mu*localStride],sum[mu]); \
+      } \
+    } \
+  } \
+});
+
+#define A2A_KERNEL_COMPUTE_LOCAL_TIMEDIR_NOMOM() \
+  accelerator_for2d(ls_index,localStride*sizeL,r_index,sizeR,simdSize,{ \
+    \
+    int site_offset = ls_index % localStride; \
+    int l_index = ls_index/localStride; \
+    \
+    int ss, shmem_base = site_offset + localStride * nGamma * reducedOrthogDimSize*(l_index+sizeL*r_index); \
+    calcScalar gamma_phase, temp_site, sum[MF_SUM_ARRAY_MAX]; \
+    \
+    for (int rt=0;rt < reducedOrthogDimSize; rt++) { \
+      \
+      for (int mu=0;mu<nGamma;mu++) { \
+        sum[mu] = Zero(); \
+      } \
+        \
+      int shmem_idx = localStride*nGamma*rt+shmem_base; \
+      for (int so=0;so < localSpatialVolume; so+=localStride) { \
+        ss = rt*localSpatialVolume+so+site_offset; \
+        temp_site = innerProduct(coalescedRead(viewL_p[l_index][ss]),coalescedRead(viewR_p[r_index][ss])); \
+        \
+        for (int mu = 0; mu < nGamma; mu++) { \
+          gamma_phase = coalescedRead(viewG_p[mu][ss]); \
+          sum[mu] += gamma_phase*temp_site; \
+        } \
+      } \
+      for (int mu=0;mu<nGamma;mu++) { \
+        coalescedWrite(shm_p[shmem_idx+mu*localStride],sum[mu]); \
+      } \
+    } \
+  });
+
+#define A2A_KERNEL_IO_NOMOM() \
+  accelerator_for2d(li_index,sizeL*orthogSimdSize,r_index,sizeR,1,{ \
+    int simdOffset = li_index % orthogSimdSize; \
+    int l_index = li_index / orthogSimdSize; \
+    ExtractBuffer<Scalar_s> extracted(simdSize); \
+    cobj strideSum; \
+    Scalar_s temp; \
+    int shmem_idx = localStride*reducedOrthogDimSize*nGamma*(l_index+sizeL*r_index); \
+    for (int i=0;i<nGamma*reducedOrthogDimSize;i++) { \
+      \
+      int mu = i%nGamma; \
+      int rt = i/nGamma; \
+      \
+      strideSum = Zero(); \
+      for (int j=0;j<localStride;j++) { \
+        strideSum += shm_p[shmem_idx+i*localStride+j]; \
+      } \
+      extract(strideSum,extracted); \
+      \
+      temp = Scalar_s(0.0);    \
+      for(int idx=0;idx<simdSize;idx++){ \
+        if (icoor_p[idx][orthogDir] == simdOffset) { \
+          temp +=  extracted[idx]; \
+        } \
+        acceleratorSynchronise(); \
+      } \
+      \
+      int lt = rt+simdOffset*reducedOrthogDimSize; \
+      int t_out = lt + pc*localOrthogDimSize; \
+      \
+      int ij_dx = mult_R*( r_index + sizeR*mult_L*( l_index + sizeL*( t_out + Nt*indexG_p[mu] ) ) ); \
+        \
+      result_p[ij_dx]            += temp; \
+      \
+      if (even && oddShifts) {        \
+        result_p[ij_dx+1]          -= temp; \
+        result_p[ij_dx+sizeROut+1] -= temp; \
+        result_p[ij_dx+sizeROut]   += temp; \
+      } else if (even) {          \
+        result_p[ij_dx+1]          += temp; \
+        result_p[ij_dx+sizeROut+1] += temp; \
+        result_p[ij_dx+sizeROut]   += temp; \
+        \
+      } else if (oddShifts) { \
+        result_p[ij_dx+1]          += temp; \
+        result_p[ij_dx+sizeROut+1] -= temp; \
+        result_p[ij_dx+sizeROut]   -= temp; \
+      } else { \
+        result_p[ij_dx+1]          -= temp; \
+        result_p[ij_dx+sizeROut+1] += temp; \
+        result_p[ij_dx+sizeROut]   -= temp; \
+      } \
+      acceleratorSynchronise(); \
+    } \
+  });
 
 template <typename FImpl>
 class A2AWorkerMILC 
@@ -82,14 +275,14 @@ public:
     int size() {return _view.size();}
     void reserve(int size) { _view.reserve(size); }
 
-    void closeViews() {
+    virtual void closeViews() {
       for(int p=0;p<_view.size();p++)   _view[p].ViewClose();
-        _view.resize(0);
+      _view.resize(0);
     }
   };
 
   template<typename obj>
-  class A2AView: public A2AViewBase<LatticeView<obj>,obj> {
+  class A2AFieldView: public A2AViewBase<LatticeView<obj>,obj> {
   public:
     void addView(const Lattice<obj> &field) {
       this->_view.push_back(field.View(AcceleratorRead));
@@ -98,7 +291,7 @@ public:
 
   template<typename obj>
   class A2AStencilView: public A2AViewBase<CartesianStencilView<obj,obj,FImplParams>, obj>{
-  public:
+  protected:
     std::vector<std::unique_ptr<CartesianStencil<obj,obj,FImplParams> > > _stencils;
     Vector<obj> _buffer;
     Vector<Integer> _offset;
@@ -113,6 +306,7 @@ public:
     }
 
     void openViews(){
+      this->reserve(_stencils.size());
       for (auto &stencil: _stencils) {
         this->_view.push_back(stencil->View(AcceleratorRead));
       }
@@ -142,19 +336,51 @@ public:
         });
       }
     }
+    virtual void closeViews() {
+      for(int p=0;p<this->_view.size();p++)   this->_view[p].ViewClose();
+      this->_view.resize(0);
+      _buffer.resize(0);
+      _offset.resize(0);
+      _stencils.resize(0);
+    }
   };
 
-  class A2ATaskHalfHalfLocal {
-    A2AView<vobj> &_left, &_right;
-    A2AView<cobj> &_gamma;
+  class A2ATaskBase {
+  protected:
+    A2AFieldView<vobj> &_left, &_right;
     Vector<Integer> &_gamma_indices;
     GridBase *_grid;
-    int _cb;
+    Vector<Coordinate> _i_coor_container;
 
   public:
-    A2ATaskHalfHalfLocal(A2AView<vobj> &left, A2AView<vobj> &right, A2AView<cobj> &gamma,
-                          Vector<Integer> &gammaIndices, GridBase *grid, int cb = Even):
-    _left(left),_right(right),_gamma(gamma),_gamma_indices(gammaIndices),_grid(grid),_cb(cb) {}
+    A2ATaskBase(A2AFieldView<vobj> &left, A2AFieldView<vobj> &right, Vector<Integer> &gammaIndices, GridBase *grid):
+      _left(left),_right(right),_gamma_indices(gammaIndices),_grid(grid) {
+
+      _i_coor_container.resize(grid->Nsimd(), Coordinate(grid->_ndimension));
+      for(int p = 0; p < grid->Nsimd(); p++) {
+        grid->iCoorFromIindex(_i_coor_container[p],p);
+      }
+    }
+  };
+
+  class A2ATaskHalfHalf: public A2ATaskBase {
+  protected:
+    bool _odd_shifts;
+    int _cb;
+
+    public:
+      A2ATaskHalfHalf(A2AFieldView<vobj> &left, A2AFieldView<vobj> &right, Vector<Integer> &gammaIndices, GridBase *grid, int cb = Even, bool oddShifts = false):
+      A2ATaskBase(left,right,gammaIndices,grid), _cb(cb), _odd_shifts(oddShifts) {}
+
+  };
+
+  class A2ATaskHalfHalfLocalNoMom: public A2ATaskHalfHalf {
+  protected:
+    A2AFieldView<cobj> &_gamma;
+
+  public:
+    A2ATaskHalfHalfLocalNoMom(A2AFieldView<vobj> &left, A2AFieldView<vobj> &right, A2AFieldView<cobj> &gamma, Vector<Integer> &gammaIndices, GridBase *grid, int cb = Even):
+      A2ATaskHalfHalf(left,right,gammaIndices,grid,cb,false),_gamma(gamma)  {}
 
     double getFlops() {
       // One complex multiply takes 6 floating point ops (4 mult, 2 add) 
@@ -166,146 +392,36 @@ public:
       //    - multiply by gamma phase
       //    - multiply by momentum phase
       //    - sum
-      return (22.0+(6.0+2.0)*(_gamma_indices.size()));
+      return (22.0+(6.0+2.0)*(this->_gamma_indices.size()));
     }
 
     template <typename MatType>
     void execute(MatType &result, int orthogDir) {
 
-      assert(orthogDir == Tdir);
+      A2A_TASK_HALF_COMMON();
 
-      FermView &left = _left[0];
-      FermView &right = _right[0];
-      ComplexView &gamma = _gamma[0];
+      ComplexView  *viewG_p    = &this->_gamma[0];
 
-      const int sizeLOut = result.dimension(3);
-      const int sizeROut = result.dimension(4);
-      const int sizeR = sizeROut/2;
-      const int sizeL = sizeLOut/2;
+      assert(orthogDir == Tdir); // This kernel assumes lattice is coalesced over time slices
+      assert(nBlocks == 1);
 
-      const int nGamma = _gamma_indices.size();
+      A2A_KERNEL_COMPUTE_LOCAL_TIMEDIR_NOMOM();
 
-      const int simdSize             = _grid->Nsimd();
-      const int reducedOrthogDimSize = _grid->_rdimensions[orthogDir];
-
-      const int nBlocks      = _grid->_slice_nblock[orthogDir];
-      const int vecsPerSlicePerBlock = _grid->_slice_block[orthogDir];
-
-      assert(nBlocks == 1);     // This kernel assumes lattice is coalesced over time slices
-
-      const int localSpatialVolume     = _grid->_ostride[orthogDir];
-
-      // Pointers for accelerator indexing
-      FermView     *viewL_p    = &left;
-      FermView     *viewR_p    = &right;
-      ComplexView  *viewG_p    = &gamma;
-
-      int mult_L = 2;
-      int mult_R = 2;
-      int localOrthogDimSize   = _grid->_ldimensions[orthogDir];
-
-      int Nt     = _grid->GlobalDimensions()[orthogDir];
-
-      Integer* indexG_p = & _gamma_indices[0]; 
-
-      int pd = _grid->_processors[orthogDir];
-      int pc = _grid->_processor_coor[orthogDir];
-
-      auto result_p = result.data();
-      
-      bool even = _cb == Even;
-
-      int at = acceleratorThreads();
-
-      const int MFrvol = reducedOrthogDimSize *sizeL *sizeR * nGamma;
-
-      Vector<cobj> shmem(MFrvol); // FIXME: use shared memory...
-      cobj *shm_p = &shmem[0];
-
-      accelerator_for(r, MFrvol,1,{
-        shm_p[r] = Zero();
-      });  
-
-      accelerator_for2d(l_index,sizeL,r_index,sizeR,simdSize,{
-
-        int ss, shmem_base = nGamma * reducedOrthogDimSize*(l_index+sizeL*r_index);
-        calcScalar gamma_phase, temp_site, sum[MF_SUM_ARRAY_MAX];
-
-        for (int rt=0;rt < reducedOrthogDimSize; rt++) {
-
-          for (int mu=0;mu<nGamma;mu++) {
-            sum[mu] = Zero();
-          }
-
-          int shmem_idx = nGamma*rt+shmem_base;
-          for (int so=0;so < localSpatialVolume; so++) {
-            ss = rt*localSpatialVolume+so;
-            temp_site = innerProduct(coalescedRead(viewL_p[l_index][ss]),coalescedRead(viewR_p[r_index][ss]));
-
-            for (int mu = 0; mu < nGamma; mu++) {
-              gamma_phase = coalescedRead(viewG_p[mu][ss]);
-              sum[mu] += gamma_phase*temp_site;
-            }
-          }
-          for (int mu=0;mu<nGamma;mu++) {
-            coalescedWrite(shm_p[shmem_idx+mu],sum[mu]);
-          }
-        }
-      });
-
-      accelerator_for2d(l_index,sizeL,r_index,sizeR,1,{
-        ExtractBuffer<Scalar_s> extracted(simdSize);
-        Scalar_s temp;
-        int shmem_idx = reducedOrthogDimSize*nGamma*(l_index+sizeL*r_index);
-        for (int i=0;i<nGamma*reducedOrthogDimSize;i++) {
-          int mu = i%nGamma;
-          int rt = i/nGamma;
-          extract(shm_p[shmem_idx+i],extracted);
-
-          for(int idx=0;idx<simdSize;idx +=2){
-
-            // Calculate local time slice
-            int lt = rt+idx/2*reducedOrthogDimSize;
-            // Calculate global time slice
-            int t_out = lt + pc*localOrthogDimSize;
-
-            int ij_dx = mult_R*( r_index + sizeR*mult_L*( l_index + sizeL*( t_out + Nt*indexG_p[mu] ) ) );
-
-            temp = extracted[idx] + extracted[idx+1];
-
-            result_p[ij_dx]            += temp;
-            result_p[ij_dx+sizeROut+1] += temp;
-
-            if (even) {
-              result_p[ij_dx+sizeROut]   += temp;
-              result_p[ij_dx+1]          += temp;
-            } else {
-              result_p[ij_dx+sizeROut]   += -temp;
-              result_p[ij_dx+1]          += -temp;
-            }
-            acceleratorSynchronise();
-          }
-        }
-      });
-      accelerator_barrier();
+      A2A_KERNEL_IO_NOMOM();
     }
   };
 
-  class A2ATaskHalfHalfOneLink {
-    A2AView<vobj> &_left, &_right;
-    A2AView<vColourMatrix>   &_links_left,&_links_right;
+  class A2ATaskHalfHalfOneLinkNoMom: public A2ATaskHalfHalf {
+  protected:
+    A2AFieldView<vColourMatrix>   &_links_left,&_links_right;
     A2AStencilView<vobj> &_right_stencil;
     A2AStencilView<vColourMatrix> &_link_stencil;
-    Vector<Integer> &_gamma_indices;
-    GridBase *_grid;
-    int _cb;
 
   public:
-    A2ATaskHalfHalfOneLink(A2AView<vobj> &left, A2AView<vobj> &right, A2AStencilView<vobj> &rightStencil, A2AView<vColourMatrix> &linksLeft,
-                          A2AView<vColourMatrix> &linksRight, A2AStencilView<vColourMatrix> &linkStencil, 
+    A2ATaskHalfHalfOneLinkNoMom(A2AFieldView<vobj> &left, A2AFieldView<vobj> &right, A2AStencilView<vobj> &rightStencil, A2AFieldView<vColourMatrix> &linksLeft,
+                          A2AFieldView<vColourMatrix> &linksRight, A2AStencilView<vColourMatrix> &linkStencil, 
                           Vector<Integer> &gammaIndices, GridBase *grid, int cb = Even):
-    _left(left),_right(right),_links_left(linksLeft),_links_right(linksRight),_link_stencil(linkStencil),_right_stencil(rightStencil),
-    _gamma_indices(gammaIndices),_grid(grid),_cb(cb) {}
+      A2ATaskHalfHalf(left,right,gammaIndices,grid,cb,true),_links_left(linksLeft),_links_right(linksRight),_link_stencil(linkStencil),_right_stencil(rightStencil) {}
 
     double getFlops() {
       // matrix*vector = 3 inner products
@@ -316,172 +432,32 @@ public:
       //  - one inner product
       //  - two su(3) matrix*vector ops
       //  - one complex sum
-      return ((7*22.0+2.0)*_gamma_indices.size());
+      return ((7*22.0+2.0)*this->_gamma_indices.size());
     }
 
     template <typename MatType>
     void execute(MatType &result, int orthogDir) {
 
-      assert(orthogDir == Tdir);
+      A2A_TASK_HALF_COMMON();
 
-      FermView         &left  = _left[0];
-      FermView         &right = _right[0];
-
-      GaugeView        &linksLeft  = _links_left[0];
-      GaugeView        &linksRight = _links_right[0];
-
-      GaugeStencilView &linkStencil  = _link_stencil[0];
-      FermStencilView  &rightStencil = _right_stencil[0];
-
-      const int sizeLOut = result.dimension(3);
-      const int sizeROut = result.dimension(4);
-      const int sizeR = sizeROut/2;
-      const int sizeL = sizeLOut/2;
-
-      const int nGamma = _gamma_indices.size();
-
-      const int simdSize             = _grid->Nsimd();
-      const int reducedOrthogDimSize = _grid->_rdimensions[orthogDir];
-
-      const int nBlocks      = _grid->_slice_nblock[orthogDir];
-
-      assert(nBlocks == 1);     // This kernel assumes lattice is coalesced over time slices
-
-      const int localSpatialVolume = _grid->_ostride[orthogDir];
+      assert(orthogDir == Tdir); // This kernel assumes lattice is coalesced over time slices
+      assert(nBlocks == 1);
 
       // Pointers for accelerator indexing
-      FermView  *viewL_p    = &left;
-      FermView  *viewR_p    = &right;
-      GaugeView *viewGL_p   = &linksLeft;
-      GaugeView *viewGR_p   = &linksRight;
+      GaugeView *viewGL_p   = &this->_links_left[0];
+      GaugeView *viewGR_p   = &this->_links_right[0];
+      GaugeStencilView *stencilG_p = &this->_link_stencil[0]; // Gauge tencil for shifted links
+      FermStencilView  *stencilR_p = &this->_right_stencil[0]; // Gauge tencil for shifted links
 
-      GaugeStencilView *stencilG_p = & linkStencil; // Gauge tencil for shifted links
-      FermStencilView  *stencilR_p = & rightStencil; // Gauge tencil for shifted links
+      vobj          *bufRight_p = &this->_right_stencil.getBuffer(0); // buffer for shifted kets in halo region
+      vColourMatrix *bufGauge_p = &this->_link_stencil.getBuffer(0); // buffer for shifted links in halo region
 
-      vobj          *bufRight_p = &_right_stencil.getBuffer(0); // buffer for shifted kets in halo region
-      vColourMatrix *bufGauge_p = &_link_stencil.getBuffer(0); // buffer for shifted links in halo region
+      Integer *offsetG_p = &this->_link_stencil.getOffset(0); // buffer offsets for shifted links in halo region
+      int haloBuffRightSize = this->_right_stencil.getOffset(1);
 
-      Integer *offsetG_p = & _link_stencil.getOffset(0); // buffer offsets for shifted links in halo region
-      int haloBuffRightSize = _right_stencil.getOffset(1);
+      A2A_KERNEL_COMPUTE_ONELINK_TIMEDIR_NOMOM();
 
-      int mult_L = 2;
-      int mult_R = 2;
-      int localOrthogDimSize   = _grid->_ldimensions[orthogDir];
-
-      int Nt     = _grid->GlobalDimensions()[orthogDir];
-
-      Integer* indexG_p = & _gamma_indices[0]; 
-
-      int pd = _grid->_processors[orthogDir];
-      int pc = _grid->_processor_coor[orthogDir];
-
-      auto result_p = result.data();
-      
-      bool even = _cb == Even;
-
-      //int at = acceleratorThreads();
-
-      const int MFrvol = reducedOrthogDimSize *sizeL *sizeR * nGamma;
-
-      Vector<cobj> shmem(MFrvol); // FIXME: use shared memory...
-      cobj *shm_p = &shmem[0];
-
-      accelerator_for(r, MFrvol,1,{
-        shm_p[r] = Zero();
-      });  
-
-      accelerator_for2d(l_index,sizeL,r_index,sizeR,simdSize,{
-
-        calcColourMatrix link_ahead, link_behind;
-        calcSpinor left, shift_ahead, shift_behind;
-        calcScalar sum[MF_SUM_ARRAY_MAX];
-
-        StencilEntry *SE;
-        int ptype, ss;
-        int shmem_base = nGamma * reducedOrthogDimSize*(l_index+sizeL*r_index);
-
-        for (int rt=0;rt < reducedOrthogDimSize; rt++) {
-
-          for (int mu=0;mu<nGamma;mu++) {
-            sum[mu] = Zero();
-          }
-
-          int shmem_idx = nGamma*rt+shmem_base;
-          for (int so=0;so < localSpatialVolume; so++) {
-            ss = rt*localSpatialVolume+so;
-
-            left   = coalescedRead(viewL_p[l_index][ss]);
-
-            for (int mu = 0; mu < nGamma; mu++) {
-              link_ahead = coalescedRead(viewGL_p[mu][ss]);
-
-              SE=stencilR_p->GetEntry(ptype,2*mu,ss);
-              if(SE->_is_local) { 
-                shift_ahead = coalescedReadPermute(viewR_p[r_index][SE->_offset],ptype,SE->_permute);
-              } else {
-                shift_ahead = coalescedRead(bufRight_p[r_index*haloBuffRightSize+SE->_offset]);
-              }
-              acceleratorSynchronise();
-
-              SE=stencilR_p->GetEntry(ptype,2*mu+1,ss);
-              if(SE->_is_local) { 
-                shift_behind = coalescedReadPermute(viewR_p[r_index][SE->_offset],ptype,SE->_permute);
-              } else {
-                shift_behind = coalescedRead(bufRight_p[r_index*haloBuffRightSize+SE->_offset]);
-              }
-              acceleratorSynchronise();
-
-              SE=stencilG_p[mu].GetEntry(ptype,0,ss);
-              if(SE->_is_local) { 
-                link_behind = adj(coalescedReadPermute(viewGR_p[mu][SE->_offset],ptype,SE->_permute));
-              } else {
-                link_behind = adj(coalescedRead(bufGauge_p[offsetG_p[mu]+SE->_offset]));
-              }
-              acceleratorSynchronise();
-
-              sum[mu] += innerProduct(left,link_ahead*shift_ahead+link_behind*shift_behind);
-            }
-            for (int mu=0;mu<nGamma;mu++) {
-              coalescedWrite(shm_p[shmem_idx+mu],sum[mu]);
-            }
-          }
-        }
-      });
-
-      accelerator_for2d(l_index,sizeL,r_index,sizeR,1,{
-        ExtractBuffer<Scalar_s> extracted(simdSize);
-        Scalar_s temp;
-        int shmem_idx = reducedOrthogDimSize*nGamma*(l_index+sizeL*r_index);
-        for (int i=0;i<nGamma*reducedOrthogDimSize;i++) {
-          int mu = i%nGamma;
-          int rt = i/nGamma;
-          extract(shm_p[shmem_idx+i],extracted);
-
-          for(int idx=0;idx<simdSize;idx +=2){
-
-            // Calculate local time slice
-            int lt = rt+idx/2*reducedOrthogDimSize;
-            // Calculate global time slice
-            int t_out = lt + pc*localOrthogDimSize;
-
-            int ij_dx = mult_R*( r_index + sizeR*mult_L*( l_index + sizeL*( t_out + Nt*indexG_p[mu] ) ) );
-
-            temp = extracted[idx] + extracted[idx+1];
-
-            result_p[ij_dx]            += temp;
-            result_p[ij_dx+sizeROut+1] -= temp;
-
-            if (even) {
-              result_p[ij_dx+1]          -= temp;
-              result_p[ij_dx+sizeROut]   += temp;
-              } else {
-              result_p[ij_dx+1]          += temp;
-              result_p[ij_dx+sizeROut]   -= temp;
-            }
-            acceleratorSynchronise();
-          }
-        }
-      });
+      A2A_KERNEL_IO_NOMOM();
     }
   };
 
@@ -496,16 +472,24 @@ public:
   std::vector<LatticeColourMatrix> _Umu_E,_Umu_O;
 
   Vector<Integer> _gamma_indices_local,_gamma_indices_comm;
-
-  A2AView<cobj> _view_gamma_E,_view_gamma_O,   _view_mom;
-  A2AView<vColourMatrix>   _view_links_E, _view_links_O;
-  A2AStencilView<vColourMatrix> _view_stencil_gauge_E, _view_stencil_gauge_O;
   std::vector<int> _shift_dirs, _shift_displacements;
+  double _flops;
 
+  A2AFieldView<vobj> _view_right_E, _view_right_O, _view_left_E, _view_left_O;
+  A2AFieldView<cobj> _view_gamma_E,_view_gamma_O,   _view_mom;
+  A2AFieldView<vColourMatrix>   _view_links_E, _view_links_O;
+  A2AStencilView<vobj> _view_stencil_right_E, _view_stencil_right_O;
+  A2AStencilView<vColourMatrix> _view_stencil_gauge_E, _view_stencil_gauge_O;
+
+private:
+  FermionField *_r_addr_E, *_l_addr_E;
 public:
   A2AWorkerMILC() = delete;
   A2AWorkerMILC(GridBase *grid, const std::vector<StagGamma::SpinTastePair>& gammas, const std::vector<ComplexField> &mom, LatticeGaugeField* U = nullptr, GridBase *cbGrid = nullptr)
   : _grid(grid), _gammas(gammas), _mom(mom), _U(U), _cb_grid(cbGrid) {
+
+    _l_addr_E = nullptr;
+    _r_addr_E = nullptr;
 
     StagGamma spinTaste;
     if (_U != nullptr) {
@@ -543,6 +527,7 @@ public:
       buildLocalPhases();
     }
 
+    _view_mom.reserve(_mom.size());
     for (int i = 0; i < _mom.size(); ++i)
     {
       _view_mom.addView(_mom[i]);
@@ -557,6 +542,12 @@ public:
   }
 
   ~A2AWorkerMILC() {
+    _view_left_E.closeViews();
+    _view_left_O.closeViews();
+    _view_right_E.closeViews();
+    _view_right_O.closeViews();
+    _view_stencil_right_E.closeViews();
+    _view_stencil_right_O.closeViews();
     _view_links_E.closeViews();
     _view_links_O.closeViews();
     _view_stencil_gauge_E.closeViews();
@@ -569,7 +560,7 @@ public:
   double getFlops() {
     return _flops;
   }
-  void setFlops(flops) {_flops = flops; }
+  void setFlops(double flops) {_flops = flops; }
 
   void buildLocalPhases() {
     int nGamma_local = _gamma_indices_local.size();
@@ -581,6 +572,9 @@ public:
       StagGamma spinTaste;
       ComplexField temp(_grid);
       int mu;
+
+      _view_gamma_E.reserve(nGamma_local);
+      _view_gamma_O.reserve(nGamma_local);
       for (int i = 0; i < nGamma_local; i++) {
         mu = _gamma_indices_local[i];
 
@@ -640,6 +634,8 @@ public:
 
     std::cout << GridLogPerformance << " MesonField one link timings: gauge comms:" << (t1-t0)/1000 << "ms" << std::endl;   
 
+    _view_links_E.reserve(nGamma_comm);
+    _view_links_O.reserve(nGamma_comm);
     for (int i = 0; i < nGamma_comm; ++i)
     {
       _view_links_E.addView(_Umu_E[i]);
@@ -672,49 +668,70 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   int sizeL = mat.dimension(3)/2;
   int sizeR = mat.dimension(4)/2;
 
+  double t0=usecond();
 
-  A2AView<vobj> viewRightE, viewRightO,viewLeftE, viewLeftO;
-  A2AStencilView<vobj> viewStencilRightE, viewStencilRightO;
+  if (_l_addr_E != lhs_wi_E) {
+    _l_addr_E = const_cast<FermionField*>(lhs_wi_E);
+    _view_left_E.closeViews();
+    _view_left_O.closeViews();
 
-  if (_gamma_indices_comm.size() > 0) {
-    auto ptr = std::move(std::unique_ptr<FermStencil>(new FermStencil(_cb_grid, _shift_dirs.size(), Even,
-                                                              _shift_dirs, _shift_displacements)));
-    viewStencilRightE.addStencil(ptr);
+    _view_left_E.reserve(sizeL);
+    _view_left_O.reserve(sizeL);
+    for (int i = 0; i < sizeL; ++i)
+    {
+      _view_left_E.addView(lhs_wi_E[i]);
+      _view_left_O.addView(lhs_wi_O[i]);
+    }
 
-    ptr = std::move(std::unique_ptr<FermStencil>(new FermStencil(_cb_grid, _shift_dirs.size(), Odd,
-                                                              _shift_dirs, _shift_displacements)));
-    viewStencilRightO.addStencil(ptr);
+  }
+
+  if (_r_addr_E != rhs_vj_E) {
+    _r_addr_E = const_cast<FermionField*>(rhs_vj_E);
+    _view_right_E.closeViews();
+    _view_right_O.closeViews();
+    _view_stencil_right_E.closeViews();
+    _view_stencil_right_O.closeViews();
+
+    if (_gamma_indices_comm.size() > 0) {
+      auto ptr = std::move(std::unique_ptr<FermStencil>(new FermStencil(_cb_grid, _shift_dirs.size(), Even,
+                                                                _shift_dirs, _shift_displacements)));
+      _view_stencil_right_E.addStencil(ptr);
+
+      ptr = std::move(std::unique_ptr<FermStencil>(new FermStencil(_cb_grid, _shift_dirs.size(), Odd,
+                                                                _shift_dirs, _shift_displacements)));
+      _view_stencil_right_O.addStencil(ptr);
+      for (int i = 0; i < sizeR; ++i)
+      {
+        _view_stencil_right_E.append(rhs_vj_E[i]);
+        _view_stencil_right_O.append(rhs_vj_O[i]);
+      }
+      _view_stencil_right_E.openViews();
+      _view_stencil_right_O.openViews();
+    }
+
+    _view_right_E.reserve(sizeR);
+    _view_right_O.reserve(sizeR);
     for (int i = 0; i < sizeR; ++i)
     {
-      viewStencilRightE.append(rhs_vj_E[i]);
-      viewStencilRightO.append(rhs_vj_O[i]);
+      _view_right_E.addView(rhs_vj_E[i]);
+      _view_right_O.addView(rhs_vj_O[i]);
     }
-    viewStencilRightE.openViews();
-    viewStencilRightO.openViews();
   }
+  double t1=usecond();
+  std::cout << GridLogPerformance << " MesonField timings: left/right views+comms:" << (t1-t0)/1000 << "ms" << std::endl;   
 
-  for (int i = 0; i < sizeR; ++i)
-  {
-    viewRightE.addView(rhs_vj_E[i]);
-    viewRightO.addView(rhs_vj_O[i]);
-  }
-
-  for (int i = 0; i < sizeL; ++i)
-  {
-    viewLeftE.addView(lhs_wi_E[i]);
-    viewLeftO.addView(lhs_wi_O[i]);
-  }
 
   if (t_kernel) *t_kernel = -usecond();
 
+  setFlops(0.0);
   // Run any nonlocal gamma operators
   if (_gamma_indices_comm.size() > 0) {
     if (checkerL && checkerR) {
-      A2ATaskHalfHalfOneLink task_e(viewLeftE, viewRightO, viewStencilRightO, _view_links_E, _view_links_O,
+      A2ATaskHalfHalfOneLinkNoMom task_e(_view_left_E, _view_right_O, _view_stencil_right_O, _view_links_E, _view_links_O,
                                     _view_stencil_gauge_O, _gamma_indices_comm, _cb_grid, Even);
       task_e.execute(mat,orthog_dir);
 
-      A2ATaskHalfHalfOneLink task_o(viewLeftO, viewRightE, viewStencilRightE, _view_links_O, _view_links_E,
+      A2ATaskHalfHalfOneLinkNoMom task_o(_view_left_O, _view_right_E, _view_stencil_right_E, _view_links_O, _view_links_E,
                                     _view_stencil_gauge_E, _gamma_indices_comm, _cb_grid, Odd);
       task_o.execute(mat,orthog_dir);
 
@@ -732,12 +749,12 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   if (_gamma_indices_local.size() > 0) {
 
     if (checkerL && checkerR) {
-      A2ATaskHalfHalfLocal task_e(viewLeftE, viewRightE, _view_gamma_E, _gamma_indices_local, _cb_grid, Even);
+      A2ATaskHalfHalfLocalNoMom task_e(_view_left_E, _view_right_E, _view_gamma_E, _gamma_indices_local, _cb_grid, Even);
       task_e.execute(mat,orthog_dir);
 
-      A2ATaskHalfHalfLocal task_o(viewLeftO, viewRightO, _view_gamma_O, _gamma_indices_local, _cb_grid, Odd);
+      A2ATaskHalfHalfLocalNoMom task_o(_view_left_O, _view_right_O, _view_gamma_O, _gamma_indices_local, _cb_grid, Odd);
       task_o.execute(mat,orthog_dir);
-      
+
       setFlops(getFlops()+task_e.getFlops());
     } else if (checkerL) {
     assert(0);
@@ -747,13 +764,13 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
     assert(0);
     }
   }
-  viewStencilRightE.closeViews();
-  viewStencilRightO.closeViews();
-  viewRightE.closeViews();
-  viewRightO.closeViews();
-  viewLeftE.closeViews();
-  viewLeftO.closeViews();
   if (t_kernel) *t_kernel += usecond();
 }
 
 NAMESPACE_END(Grid);
+
+#undef A2A_TASK_COMMON
+#undef A2A_TASK_HALF_COMMON
+#undef A2A_KERNEL_COMPUTE_ONELINK_TIMEDIR_NOMOM
+#undef A2A_KERNEL_COMPUTE_LOCAL_TIMEDIR_NOMOM
+#undef A2A_KERNEL_IO_NOMOM
