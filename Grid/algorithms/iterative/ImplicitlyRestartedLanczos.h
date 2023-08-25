@@ -407,7 +407,8 @@ until convergence
     }
 
     std::cout<<GridLogError<<"\n NOT converged.\n";
-    abort();
+    Grid_finalize();
+    exit(1);
 	
   converged:
     {

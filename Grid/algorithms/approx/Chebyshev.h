@@ -232,6 +232,7 @@ public:
   // Implement the required interface
   void operator() (LinearOperatorBase<Field> &Linop, const Field &in, Field &out) {
 
+    double timeSetup = -usecond();
     GridBase *grid=in.Grid();
 
     int vol=grid->gSites();
@@ -249,15 +250,20 @@ public:
     // Tn=T1 = (xscale M + mscale)in
     RealD xscale = 2.0/(hi-lo);
     RealD mscale = -(hi+lo)/(hi-lo);
+    timeSetup += usecond();
+    double timeHermOp = -usecond();
     Linop.HermOp(T0,y);
+    timeHermOp += usecond();
+    double timeAxpby = -usecond();
     axpby(T1,xscale,mscale,y,in);
-
     // sum = .5 c[0] T0 + c[1] T1
     //    out = ()*T0 + Coeffs[1]*T1;
     axpby(out,0.5*Coeffs[0],Coeffs[1],T0,T1);
+    timeAxpby += usecond();
     for(int n=2;n<order;n++){
-
+      timeHermOp -=usecond();
       Linop.HermOp(*Tn,y);
+      timeHermOp += usecond();
 #if 0
       auto y_v = y.View();
       auto Tn_v = Tn->View();
@@ -272,19 +278,24 @@ public:
 	axpy(out,Coeffs[n],*Tnp,out);
       }
 #else
+      timeAxpby -= usecond();
       axpby(y,xscale,mscale,y,(*Tn));
       axpby(*Tnp,2.0,-1.0,y,(*Tnm));
       if ( Coeffs[n] != 0.0) {
 	axpy(out,Coeffs[n],*Tnp,out);
       }
+      timeAxpby += usecond();
 #endif
       // Cycle pointers to avoid copies
+      timeSetup -= usecond();
       Field *swizzle = Tnm;
       Tnm    =Tn;
       Tn     =Tnp;
       Tnp    =swizzle;
+      timeSetup += usecond();
 	  
     }
+    std::cout << "Cheby() time setup = " << timeSetup/1e6 << " HermOp = " << timeHermOp/1e6 << " axpby = " << timeAxpby/1e6 << " sec" << std::endl;
   }
 };
 

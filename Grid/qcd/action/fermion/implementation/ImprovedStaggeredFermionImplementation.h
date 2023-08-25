@@ -459,6 +459,8 @@ void ImprovedStaggeredFermion<Impl>::DhopInternal(StencilImpl &st, LebesgueOrder
     DhopInternalOverlappedComms(st,lo,U,UUU,in,out,dag);
   else
     DhopInternalSerialComms(st,lo,U,UUU,in,out,dag);
+
+  if((unsigned int)DhopCalls % 1000 == 0)Report();
 }
 template <class Impl>
 void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st, LebesgueOrder &lo,
@@ -479,7 +481,9 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st
 
   DhopCommTime -=usecond();
   std::vector<std::vector<CommsRequest_t> > requests;
+  DhopCommBeginTime -= usecond();
   st.CommunicateBegin(requests);
+  DhopCommBeginTime += usecond();
 
   DhopFaceTime-=usecond();
   st.CommsMergeSHM(compressor);
@@ -496,13 +500,15 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st
   }
   DhopComputeTime    += usecond();
 
+  DhopCommCompleteTime -= usecond();
   st.CommunicateComplete(requests);
+  DhopCommCompleteTime += usecond();
   DhopCommTime +=usecond();
 
   // First to enter, last to leave timing
   DhopFaceTime    -= usecond();
   st.CommsMerge(compressor);
-  DhopFaceTime    -= usecond();
+  DhopFaceTime    += usecond();
 
   DhopComputeTime2    -= usecond();
   {
@@ -511,6 +517,7 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st
     Kernels::DhopImproved(st,lo,U,UUU,in,out,dag,interior,exterior);
   }
   DhopComputeTime2    += usecond();
+  DhopTotalTime       += usecond();
 }
 
 
@@ -538,6 +545,8 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalSerialComms(StencilImpl &st, Le
   }
   DhopComputeTime += usecond();
   DhopTotalTime   += usecond();
+  DhopFaceTime     = 0.;
+  DhopComputeTime2 = 0.;
 };
 
   ////////////////////////////////////////////////////////////////
@@ -555,13 +564,27 @@ void ImprovedStaggeredFermion<Impl>::Report(void)
 
   std::cout << GridLogMessage << "ImprovedStaggeredFermion Number of DhopEO Calls   : " 
 	    << DhopCalls   << std::endl;
-  std::cout << GridLogMessage << "ImprovedStaggeredFermion TotalTime   /Calls       : " 
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion Total Time      /Calls      : " 
 	    << DhopTotalTime   / DhopCalls << " us" << std::endl;
-  std::cout << GridLogMessage << "ImprovedStaggeredFermion CommTime    /Calls       : " 
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion CommTime        /Calls      : " 
 	    << DhopCommTime    / DhopCalls << " us" << std::endl;
-  std::cout << GridLogMessage << "ImprovedStaggeredFermion ComputeTime/Calls        : " 
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion CommBeginTime   /Calls      : " 
+	    << DhopCommBeginTime    / DhopCalls << " us" << std::endl;
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion CommCompleteTime/Calls      : " 
+	    << DhopCommCompleteTime    / DhopCalls << " us" << std::endl;
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion ComputeTime     /Calls      : " 
 	    << DhopComputeTime / DhopCalls << " us" << std::endl;
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion ComputeTime2    /Calls      : " 
+	    << DhopComputeTime2 / DhopCalls << " us" << std::endl;
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion FaceTime        /Calls      : " 
+	    << DhopFaceTime / DhopCalls << " us" << std::endl;
 
+  // Minimum comm time
+  double DhopMinComputeTime = DhopComputeTime;
+  _grid->GlobalMin(DhopMinComputeTime);
+  std::cout << GridLogMessage << "ImprovedStaggeredFermion Min CommTime    /Calls      : " 
+	    << DhopMinComputeTime    / DhopCalls << " us" << std::endl;
+  
   // Average the compute time
   _grid->GlobalSum(DhopComputeTime);
   DhopComputeTime/=NP;
@@ -576,18 +599,25 @@ void ImprovedStaggeredFermion<Impl>::Report(void)
   std::cout << GridLogMessage << "Average mflops/s per call per rank (full): " << Fullmflops/NP << std::endl;
   std::cout << GridLogMessage << "Average mflops/s per call per node (full): " << Fullmflops/NN << std::endl;
 
+  std::cout << GridLogMessage << "#### Stencil calls report " << std::endl;
+
   std::cout << GridLogMessage << "ImprovedStaggeredFermion Stencil"    <<std::endl;  Stencil.Report();
+  std::cout << GridLogMessage << "#### StencilEven calls report " << std::endl;
   std::cout << GridLogMessage << "ImprovedStaggeredFermion StencilEven"<<std::endl;  StencilEven.Report();
+  std::cout << GridLogMessage << "#### StencilOdd calls report " << std::endl;
   std::cout << GridLogMessage << "ImprovedStaggeredFermion StencilOdd" <<std::endl;  StencilOdd.Report();
 }
 template<class Impl>
 void ImprovedStaggeredFermion<Impl>::ZeroCounters(void) 
 {
-  DhopCalls       = 0;
-  DhopTotalTime   = 0;
-  DhopCommTime    = 0;
-  DhopComputeTime = 0;
-  DhopFaceTime    = 0;
+  DhopCalls            = 0;
+  DhopTotalTime        = 0;
+  DhopCommTime         = 0;
+  DhopCommBeginTime    = 0;
+  DhopCommCompleteTime = 0;
+  DhopComputeTime      = 0;
+  DhopComputeTime2     = 0;
+  DhopFaceTime         = 0;
 
   Stencil.ZeroCounters();
   StencilEven.ZeroCounters();

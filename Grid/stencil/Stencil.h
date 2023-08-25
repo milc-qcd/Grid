@@ -738,6 +738,7 @@ public:
 	  Comms(point,dimension,shift,0x2);// both with block stride loop iteration
 	}
       }
+      ZeroCounters();
     }
 
     /////////////////////////////////////////////////////////////////////////////////
@@ -1199,9 +1200,52 @@ public:
     return 0;
   }
 
-  void ZeroCounters(void) { };
+  void ZeroCounters(void) {
+    commtime = 0;
+    mpi3synctime = 0;
+    mpi3synctime_g = 0;
+    shmmergetime = 0;
+    gathertime = 0;
+    gathermtime = 0;
+    halogtime = 0;
+    mergetime = 0;
+    decompresstime = 0;
+    comms_bytes = 0;
+    shm_bytes = 0;
+    splicetime = 0;
+    nosplicetime = 0;
+    calls = 0;
+  };
 
-  void Report(void) {   };
+  void Report(void) {
+    if(calls == 0)return;
+    std::cout << GridLogMessage << "Stencil Calls                        : "  << calls   << std::endl;
+    std::cout << GridLogMessage << "Stencil commtime        /Calls       : " 
+	      << commtime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil MPI3 sync time  /Calls       : " 
+	      << mpi3synctime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil MPI3 sync gather/Calls      : " 
+	      << mpi3synctime_g    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil SHM merge time  /Calls       : " 
+	      << shmmergetime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil gather time     /Calls       : " 
+	      << gathertime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil halo gather time/Calls       : " 
+	      << halogtime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil merge time      /Calls       : " 
+	      << (mergetime - shmmergetime - decompresstime) / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil decompress time /Calls       : " 
+	      << decompresstime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil splice time     /Calls       : " 
+	      << splicetime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil nosplice time/Calls          : " 
+	      << nosplicetime    / calls << " us" << std::endl;
+    std::cout << GridLogMessage << "Stencil comms bytes  /Calls          : " 
+	      << comms_bytes    / calls << " bytes" << std::endl;
+    std::cout << GridLogMessage << "Stencil SHM bytes    /Calls          : " 
+	      << shm_bytes    / calls << " bytes" << std::endl;
+    
+  };
 
 };
 NAMESPACE_END(Grid);

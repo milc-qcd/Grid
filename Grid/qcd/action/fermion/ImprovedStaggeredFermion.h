@@ -55,6 +55,8 @@ public:
   double DhopTotalTime;
   double DhopCalls;
   double DhopCommTime;
+  double DhopCommBeginTime;
+  double DhopCommCompleteTime;
   double DhopComputeTime;
   double DhopComputeTime2;
   double DhopFaceTime;

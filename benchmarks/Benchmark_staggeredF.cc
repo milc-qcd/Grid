@@ -93,6 +93,7 @@ int main (int argc, char ** argv)
   RealD c2=-1.0/24.0;
   RealD u0=1.0;
   ImprovedStaggeredFermionF Ds(Umu,Umu,Grid,RBGrid,mass,c1,c2,u0,params);
+  Ds.ZeroCounters();
   
   std::cout<<GridLogMessage << "Calling Ds"<<std::endl;
   int ncall=1000;
