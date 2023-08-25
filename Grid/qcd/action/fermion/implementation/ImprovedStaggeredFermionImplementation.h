@@ -386,7 +386,6 @@ void ImprovedStaggeredFermion<Impl>::DhopDerivEO(GaugeField &mat, const FermionF
 template <class Impl>
 void ImprovedStaggeredFermion<Impl>::Dhop(const FermionField &in, FermionField &out, int dag) 
 {
-  DhopCalls+=2;
   conformable(in.Grid(), _grid);  // verifies full grid
   conformable(in.Grid(), out.Grid());
 
@@ -398,7 +397,6 @@ void ImprovedStaggeredFermion<Impl>::Dhop(const FermionField &in, FermionField &
 template <class Impl>
 void ImprovedStaggeredFermion<Impl>::DhopOE(const FermionField &in, FermionField &out, int dag) 
 {
-  DhopCalls+=1;
   conformable(in.Grid(), _cbgrid);    // verifies half grid
   conformable(in.Grid(), out.Grid());  // drops the cb check
 
@@ -411,7 +409,6 @@ void ImprovedStaggeredFermion<Impl>::DhopOE(const FermionField &in, FermionField
 template <class Impl>
 void ImprovedStaggeredFermion<Impl>::DhopEO(const FermionField &in, FermionField &out, int dag) 
 {
-  DhopCalls+=1;
   conformable(in.Grid(), _cbgrid);    // verifies half grid
   conformable(in.Grid(), out.Grid());  // drops the cb check
 
@@ -472,33 +469,24 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st
   Compressor compressor; 
   int len =  U.Grid()->oSites();
 
-  DhopTotalTime   -= usecond();
-
-  DhopFaceTime    -= usecond();
   st.Prepare();
   st.HaloGather(in,compressor);
-  DhopFaceTime    += usecond();
 
-  DhopCommTime -=usecond();
   std::vector<std::vector<CommsRequest_t> > requests;
   DhopCommBeginTime -= usecond();
   st.CommunicateBegin(requests);
   DhopCommBeginTime += usecond();
 
-  DhopFaceTime-=usecond();
   st.CommsMergeSHM(compressor);
-  DhopFaceTime+= usecond();
 
   //////////////////////////////////////////////////////////////////////////////////////////////////////
   // Removed explicit thread comms
   //////////////////////////////////////////////////////////////////////////////////////////////////////
-  DhopComputeTime    -= usecond();
   {
     int interior=1;
     int exterior=0;
     Kernels::DhopImproved(st,lo,U,UUU,in,out,dag,interior,exterior);
   }
-  DhopComputeTime    += usecond();
 
   DhopCommCompleteTime -= usecond();
   st.CommunicateComplete(requests);
@@ -506,11 +494,9 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st
   DhopCommTime +=usecond();
 
   // First to enter, last to leave timing
-  DhopFaceTime    -= usecond();
   st.CommsMerge(compressor);
   DhopFaceTime    += usecond();
 
-  DhopComputeTime2    -= usecond();
   {
     int interior=0;
     int exterior=1;
@@ -530,14 +516,9 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalSerialComms(StencilImpl &st, Le
 {
   assert((dag == DaggerNo) || (dag == DaggerYes));
 
-  DhopTotalTime   -= usecond();
-
-  DhopCommTime    -= usecond();
   Compressor compressor;
   st.HaloExchange(in, compressor);
-  DhopCommTime    += usecond();
 
-  DhopComputeTime -= usecond();
   {
     int interior=1;
     int exterior=1;
@@ -623,7 +604,6 @@ void ImprovedStaggeredFermion<Impl>::ZeroCounters(void)
   StencilEven.ZeroCounters();
   StencilOdd.ZeroCounters();
 }
-
 
 //////////////////////////////////////////////////////// 
 // Conserved current - not yet implemented.
