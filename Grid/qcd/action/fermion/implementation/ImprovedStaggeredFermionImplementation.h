@@ -504,6 +504,7 @@ void ImprovedStaggeredFermion<Impl>::DhopInternalOverlappedComms(StencilImpl &st
   }
   DhopComputeTime2    += usecond();
   DhopTotalTime       += usecond();
+  DhopCalls++;  
 }
 
 
@@ -560,12 +561,6 @@ void ImprovedStaggeredFermion<Impl>::Report(void)
   std::cout << GridLogMessage << "ImprovedStaggeredFermion FaceTime        /Calls      : " 
 	    << DhopFaceTime / DhopCalls << " us" << std::endl;
 
-  // Minimum comm time
-  double DhopMinComputeTime = DhopComputeTime;
-  _grid->GlobalMin(DhopMinComputeTime);
-  std::cout << GridLogMessage << "ImprovedStaggeredFermion Min CommTime    /Calls      : " 
-	    << DhopMinComputeTime    / DhopCalls << " us" << std::endl;
-  
   // Average the compute time
   _grid->GlobalSum(DhopComputeTime);
   DhopComputeTime/=NP;
