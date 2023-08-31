@@ -298,6 +298,22 @@ public:
     void *recv_buf;
   };
 
+  // Timing
+  double commtime ;
+  double mpi3synctime ;
+  double mpi3synctime_g ;
+  double shmmergetime ;
+  double gathertime ;
+  double gathermtime ;
+  double halogtime ;
+  double mergetime ;
+  double decompresstime ;
+  double comms_bytes ;
+  double shm_bytes ;
+  double splicetime ;
+  double nosplicetime ;
+  unsigned int calls;
+
 protected:
   GridBase *                        _grid;
 public:
@@ -558,6 +574,7 @@ public:
     CopyReceiveBuffers.resize(0);
     CachedTransfers.resize(0);
     MpiReqs.resize(0);
+    calls++;
   }
   void AddCopy(void *from,void * to, Integer bytes)
   {
