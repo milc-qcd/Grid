@@ -53,7 +53,8 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
   typedef decltype(basis[0]) Field;
   typedef decltype(basis[0].View(AcceleratorRead)) View;
 
-  Vector<View> basis_v; basis_v.reserve(basis.size());
+  // Vector<View> basis_v; basis_v.reserve(basis.size());
+  std::vector<View> basis_v; basis_v.reserve(basis.size());
   typedef typename std::remove_reference<decltype(basis_v[0][0])>::type vobj;
   typedef typename std::remove_reference<decltype(Qt(0,0))>::type Coeff_t;
   GridBase* grid = basis[0].Grid();
@@ -82,7 +83,10 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
 	});
     }
 #else
-  View *basis_vp = &basis_v[0];
+  size_t vsize = basis.size()*sizeof(View);    
+  View *basis_vp_host = &basis_v[0];
+  View *basis_vp_device = (View *)acceleratorAllocDevice(vsize);
+  acceleratorCopyToDevice(basis_vp_host,basis_vp_device,vsize);
 
   int nrot = j1-j0;
   if (!nrot) // edge case not handled gracefully by Cuda
@@ -91,17 +95,23 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
   uint64_t oSites   =grid->oSites();
   uint64_t siteBlock=(grid->oSites()+nrot-1)/nrot; // Maximum 1 additional vector overhead
 
-  Vector <vobj> Bt(siteBlock * nrot); 
-  auto Bp=&Bt[0];
+  vsize = siteBlock*nrot*sizeof(vobj);
+  vobj *Bt_p_device = (vobj *)acceleratorAllocDevice(vsize);
 
   // GPU readable copy of matrix
-  Vector<Coeff_t> Qt_jv(Nm*Nm);
-  Coeff_t *Qt_p = & Qt_jv[0];
+  std::vector<Coeff_t> Qt_jv(Nm*Nm);
+  vsize = Qt_jv.size()*sizeof(Coeff_t);
+  Coeff_t *Qt_p_host = &Qt_jv[0];
+  Coeff_t *Qt_p_device = (Coeff_t *)acceleratorAllocDevice(vsize);
+
   thread_for(i,Nm*Nm,{
       int j = i/Nm;
       int k = i%Nm;
-      Qt_p[i]=Qt(j,k);
+      Qt_p_host[i]=Qt(j,k);
   });
+
+  acceleratorCopyToDevice(Qt_p_host,Qt_p_device,vsize);
+  Qt_jv.resize(0);
 
   // Block the loop to keep storage footprint down
   for(uint64_t s=0;s<oSites;s+=siteBlock){
@@ -111,9 +121,9 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
 
     // zero out the accumulators
     accelerator_for(ss,siteBlock*nrot,vobj::Nsimd(),{
-	decltype(coalescedRead(Bp[ss])) z;
+	decltype(coalescedRead(Bt_p_device[ss])) z;
 	z=Zero();
-	coalescedWrite(Bp[ss],z);
+	coalescedWrite(Bt_p_device[ss],z);
       });
 
     accelerator_for(sj,ssites*nrot,vobj::Nsimd(),{
@@ -124,8 +134,8 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
 	int sss=ss+s;
 
 	for(int k=k0; k<k1; ++k){
-	  auto tmp = coalescedRead(Bp[ss*nrot+j]);
-	  coalescedWrite(Bp[ss*nrot+j],tmp+ Qt_p[jj*Nm+k] * coalescedRead(basis_vp[k][sss]));
+	  auto tmp = coalescedRead(Bt_p_device[ss*nrot+j]);
+	  coalescedWrite(Bt_p_device[ss*nrot+j],tmp+ Qt_p_device[jj*Nm+k] * coalescedRead(basis_vp_device[k][sss]));
 	}
       });
 
@@ -134,9 +144,16 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
 	int jj  =j0+j;
 	int ss =sj/nrot;
 	int sss=ss+s;
-	coalescedWrite(basis_vp[jj][sss],coalescedRead(Bp[ss*nrot+j]));
+	coalescedWrite(basis_vp_device[jj][sss],coalescedRead(Bt_p_device[ss*nrot+j]));
       });
   }
+  vsize = basis.size()*sizeof(View);
+  acceleratorCopyFromDevice(basis_vp_device,basis_vp_host,vsize);
+
+  // Free accel memory
+  acceleratorFreeDevice(basis_vp_device);
+  acceleratorFreeDevice(Bt_p_device);
+  acceleratorFreeDevice(Qt_p_device);
 #endif
 
   for(int k=0;k<basis.size();k++) basis_v[k].ViewClose();
