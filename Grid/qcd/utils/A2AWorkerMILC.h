@@ -153,7 +153,7 @@ accelerator_for2d(ls_index,localStride*sizeL,r_index,sizeR,simdSize,{ \
     int l_index = li_index / orthogSimdSize; \
     ExtractBuffer<Scalar_s> extracted(simdSize); \
     cobj strideSum; \
-    Scalar_s temp; \
+    scalar_type temp; \
     int shmem_idx = localStride*reducedOrthogDimSize*nGamma*(l_index+sizeL*r_index); \
     for (int i=0;i<nGamma*reducedOrthogDimSize;i++) { \
       \
@@ -166,7 +166,7 @@ accelerator_for2d(ls_index,localStride*sizeL,r_index,sizeR,simdSize,{ \
       } \
       extract(strideSum,extracted); \
       \
-      temp = Scalar_s(0.0);    \
+      temp = scalar_type(0.0);    \
       for(int idx=0;idx<simdSize;idx++){ \
         if (icoor_p[idx][orthogDir] == simdOffset) { \
           temp +=  extracted[idx]; \
@@ -201,7 +201,8 @@ accelerator_for2d(ls_index,localStride*sizeL,r_index,sizeR,simdSize,{ \
       } \
       acceleratorSynchronise(); \
     } \
-  });
+  }); \
+  acceleratorFreeDevice(shm_p);
 
 template <typename FImpl>
 class A2AWorkerMILC 
@@ -262,7 +263,9 @@ public:
     }
 
     virtual void closeViews() {
-      for(int p=0;p<_view.size();p++)   _view[p].ViewClose();
+      for(int p=0;p<_view.size();p++)   _view[p].ViewClose(); 
+
+      _view.erase(_view.begin(),_view.end());
 
       if (_view_device_size > 0) {
         acceleratorFreeDevice(_view_device);
@@ -361,6 +364,7 @@ public:
     virtual void closeViews() {
       for(int p=0;p<this->_view.size();p++)   this->_view[p].ViewClose();
 
+      this->_view.erase(this->_view.begin(),this->_view.end());
       _offset.resize(0);
       _stencils.resize(0);
 
@@ -445,7 +449,7 @@ public:
       return (22.0+(6.0+2.0)*(this->_gamma_indices.size()));
     }
 
-    void execute(Scalar_s *result_p, int orthogDir) {
+    void execute(scalar_type *result_p, int orthogDir) {
 
       A2A_TASK_HALF_COMMON;
 
@@ -484,7 +488,7 @@ public:
       return ((7*22.0+2.0)*this->_gamma_indices.size());
     }
 
-    void execute(Scalar_s *result_p, int orthogDir) {
+    void execute(scalar_type *result_p, int orthogDir) {
 
       A2A_TASK_HALF_COMMON;
 
@@ -709,11 +713,10 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   if (checkerL) sizeL /= 2;
   if (checkerR) sizeR /= 2;
 
-  size_t matSize = mat.size()*sizeof(Scalar_s);
-  Scalar_s *matDevice = (Scalar_s *)acceleratorAllocDevice(matSize);
+  scalar_type *matDevice = mat.data();
 
   accelerator_for(i, mat.size(), 1, {
-    matDevice[i] = Zero();
+    matDevice[i] = scalar_type(0.0);
   })
 
   double t0=usecond();
@@ -800,8 +803,6 @@ void A2AWorkerMILC<FImpl>::StagMesonFieldNoGlobalSum(TensorType &mat,
   }
   if (t_kernel) *t_kernel += usecond();
 
-  acceleratorCopyFromDevice(matDevice,mat.data(),matSize);
-  acceleratorFreeDevice(matDevice);
 }
 
 NAMESPACE_END(Grid);
