@@ -152,6 +152,7 @@ public:
 #ifdef RNG_FAST_DISCARD
   static void Skip(RngEngine &eng,uint64_t site)
   {
+#if 0
     /////////////////////////////////////////////////////////////////////////////////////
     // Skip by 2^40 elements between successive lattice sites
     // This goes by 10^12.
@@ -162,9 +163,9 @@ public:
     // tens of seconds per trajectory so this is clean in all reasonable cases,
     // and margin of safety is orders of magnitude.
     // We could hack Sitmo to skip in the higher order words of state if necessary
-      //
-      // Replace with 2^30 ; avoid problem on large volumes
-      //
+    //
+    // Replace with 2^30 ; avoid problem on large volumes
+    //
     /////////////////////////////////////////////////////////////////////////////////////
     //      uint64_t skip = site+1;  //   Old init Skipped then drew.  Checked compat with faster init
     const int shift = 30;
@@ -179,6 +180,9 @@ public:
     assert((skip >> shift)==site); // check for overflow
 
     eng.discard(skip);
+#else
+    eng.discardhi(site);
+#endif
     //      std::cout << " Engine  " <<site << " state " <<eng<<std::endl;
   } 
 #endif
@@ -407,7 +411,7 @@ public:
       std::cout << GridLogMessage << "Seed SHA256: " << GridChecksum::sha256_string(seeds) << std::endl;
       SeedFixedIntegers(seeds);
     }
-  void SeedFixedIntegers(const std::vector<int> &seeds){
+  void SeedFixedIntegers(const std::vector<int> &seeds, int britney=0){
 
     // Everyone generates the same seed_seq based on input seeds
     CartesianCommunicator::BroadcastWorld(0,(void *)&seeds[0],sizeof(int)*seeds.size());
@@ -424,7 +428,6 @@ public:
     // MT implementation does not implement fast discard even though
     // in principle this is possible
     ////////////////////////////////////////////////
-#if 1
     thread_for( lidx, _grid->lSites(), {
 
 	int gidx;
@@ -445,29 +448,12 @@ public:
 	
 	int l_idx=generator_idx(o_idx,i_idx);
 	_generators[l_idx] = master_engine;
-	Skip(_generators[l_idx],gidx); // Skip to next RNG sequence
-    });
-#else
-    // Everybody loops over global volume.
-    thread_for( gidx, _grid->_gsites, {
-
-	// Where is it?
-	int rank;
-	int o_idx;
-	int i_idx;
-
-	Coordinate gcoor;
-	_grid->GlobalIndexToGlobalCoor(gidx,gcoor);
-	_grid->GlobalCoorToRankIndex(rank,o_idx,i_idx,gcoor);
-	
-	// If this is one of mine we take it
-	if( rank == _grid->ThisRank() ){
-	  int l_idx=generator_idx(o_idx,i_idx);
-	  _generators[l_idx] = master_engine;
+	if ( britney ) { 
+	  Skip(_generators[l_idx],l_idx); // Skip to next RNG sequence
+	} else { 	
 	  Skip(_generators[l_idx],gidx); // Skip to next RNG sequence
 	}
     });
-#endif
 #else 
     ////////////////////////////////////////////////////////////////
     // Machine and thread decomposition dependent seeding is efficient
