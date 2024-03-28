@@ -53,8 +53,11 @@ void basisRotate(VField &basis,Matrix& Qt,int j0, int j1, int k0,int k1,int Nm)
   typedef decltype(basis[0]) Field;
   typedef decltype(basis[0].View(AcceleratorRead)) View;
 
-  // Vector<View> basis_v; basis_v.reserve(basis.size());
+#if ( !(defined(GRID_HIP) || defined(GRID_SYCL)) )
+  Vector<View> basis_v; basis_v.reserve(basis.size());
+#else
   std::vector<View> basis_v; basis_v.reserve(basis.size());
+#endif
   typedef typename std::remove_reference<decltype(basis_v[0][0])>::type vobj;
   typedef typename std::remove_reference<decltype(Qt(0,0))>::type Coeff_t;
   GridBase* grid = basis[0].Grid();
