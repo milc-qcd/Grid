@@ -70,20 +70,6 @@ void GridParseLayout(char **argv,int argc,
 void printHash(void);
 
 
-enum GridNormLoggingMode_t {
-  GridNormLoggingModeNone,
-  GridNormLoggingModePrint,
-  GridNormLoggingModeRecord,
-  GridNormLoggingModeVerify
-};
-extern int GridNormLoggingMode;
-extern int32_t GridNormLoggingCounter;
-extern std::vector<double> GridNormLogVector;
-void SetGridNormLoggingModePrint(void);
-void SetGridNormLoggingModeRecord(void);
-void SetGridNormLoggingModeVerify(void);
-void SetGridNormLoggingMode(GridNormLoggingMode_t mode);
-void GridNormLog(double value);
 
 NAMESPACE_END(Grid);
 

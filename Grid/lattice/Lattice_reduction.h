@@ -285,10 +285,25 @@ inline ComplexD rankInnerProduct(const Lattice<vobj> &left,const Lattice<vobj> &
 template<class vobj>
 inline ComplexD innerProduct(const Lattice<vobj> &left,const Lattice<vobj> &right) {
   GridBase *grid = left.Grid();
+
+#ifdef GRID_SYCL
+  uint64_t csum=0;
+  if ( FlightRecorder::LoggingMode != FlightRecorder::LoggingModeNone)
+  {
+    // Hack
+    // Fast integer xor checksum. Can also be used in comms now.
+    autoView(l_v,left,AcceleratorRead);
+    Integer words = left.Grid()->oSites()*sizeof(vobj)/sizeof(uint64_t);
+    uint64_t *base= (uint64_t *)&l_v[0];
+    csum=svm_xor(base,words);
+  }
+  FlightRecorder::CsumLog(csum);
+#endif
   ComplexD nrm = rankInnerProduct(left,right);
-  //  GridNormLog(real(nrm)); // Could log before and after global sum to distinguish local and MPI
+  RealD local = real(nrm);
+  FlightRecorder::NormLog(real(nrm)); 
   grid->GlobalSum(nrm);
-  //  GridNormLog(real(nrm)); 
+  FlightRecorder::ReductionLog(local,real(nrm)); 
   return nrm;
 }
 
