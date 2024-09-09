@@ -94,6 +94,10 @@ Thumbs.db
 build*/*
 Documentation/_build
 
+# install directory #
+#####################
+install*/*
+
 # IDE related files #
 #####################
 *.xcodeproj/*
