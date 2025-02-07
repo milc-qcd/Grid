@@ -127,7 +127,35 @@ public:
   void GlobalSumVector(ComplexD *c,int N);
   void GlobalXOR(uint32_t &);
   void GlobalXOR(uint64_t &);
-  
+
+  template<class obj> void GlobalSumP2P(obj &o)
+  {
+    std::vector<obj> column;
+    obj accum = o;
+    int source,dest;
+    for(int d=0;d<_ndimension;d++){
+      column.resize(_processors[d]);
+      column[0] = accum;
+      std::vector<MpiCommsRequest_t> list;
+      for(int p=1;p<_processors[d];p++){
+	ShiftedRanks(d,p,source,dest);
+	SendToRecvFromBegin(list,
+			    &column[0],
+			    dest,
+			    &column[p],
+			    source,
+			    sizeof(obj),d*100+p);
+
+      }
+      CommsComplete(list);
+      for(int p=1;p<_processors[d];p++){
+	accum = accum + column[p];
+      }
+    }
+    Broadcast(0,accum);
+    o=accum;
+  }
+
   template<class obj> void GlobalSum(obj &o){
     typedef typename obj::scalar_type scalar_type;
     int words = sizeof(obj)/sizeof(scalar_type);
@@ -138,8 +166,8 @@ public:
   ////////////////////////////////////////////////////////////
   // Face exchange, buffer swap in translational invariant way
   ////////////////////////////////////////////////////////////
-  void CommsComplete(std::vector<CommsRequest_t> &list);
-  void SendToRecvFromBegin(std::vector<CommsRequest_t> &list,
+  void CommsComplete(std::vector<MpiCommsRequest_t> &list);
+  void SendToRecvFromBegin(std::vector<MpiCommsRequest_t> &list,
 			   void *xmit,
 			   int dest,
 			   void *recv,
@@ -158,6 +186,12 @@ public:
 			       int recv_from_rank,int do_recv,
 			       int bytes,int dir);
 
+  double StencilSendToRecvFromPrepare(std::vector<CommsRequest_t> &list,
+				      void *xmit,
+				      int xmit_to_rank,int do_xmit,
+				      void *recv,
+				      int recv_from_rank,int do_recv,
+				      int xbytes,int rbytes,int dir);
   double StencilSendToRecvFromBegin(std::vector<CommsRequest_t> &list,
 				    void *xmit,
 				    int xmit_to_rank,int do_xmit,

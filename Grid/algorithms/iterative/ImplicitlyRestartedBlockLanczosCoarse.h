@@ -143,7 +143,7 @@ public:
       ip = innerProduct(evec[j],w); 
       if(if_print) 
       if( norm(ip)/norm2(w) > 1e-14)
-      Glog<<"orthogonalize before: "<<j<<" of "<<k<<" "<< ip <<std::endl;
+	Glog<<"orthogonalize before: "<<j<<" of "<<k<<" "<< ip <<std::endl;
       w = w - ip * evec[j];
       if(if_print) {
         ip = innerProduct(evec[j],w); 
@@ -281,14 +281,14 @@ public:
       _sort.push(eval2,Nm);
       //      Glog << "#Ritz value before shift: "<< std::endl;
       for(int i=0; i<Nm; ++i){
-	//        std::cout.precision(13);
-	//        std::cout << "[" << std::setw(4)<< std::setiosflags(std::ios_base::right) <<i<<"] ";
-	//        std::cout << "Rval = "<<std::setw(20)<< std::setiosflags(std::ios_base::left)<< eval2[i] << std::endl;
+	//	std::cout.precision(13);
+	//	std::cout << "[" << std::setw(4)<< std::setiosflags(std::ios_base::right) <<i<<"] ";
+	//	std::cout << "Rval = "<<std::setw(20)<< std::setiosflags(std::ios_base::left)<< eval2[i] << std::endl;
       }
       
       //----------------------------------------------------------------------
       if ( Nm>Nk ) {
-        Glog <<" #Apply shifted QR transformations "<<std::endl;
+	//        Glog <<" #Apply shifted QR transformations "<<std::endl;
         //int k2 = Nk+Nu;
         int k2 = Nk;
       
@@ -297,7 +297,8 @@ public:
         
         unpackHermitBlockTriDiagMatToEigen(lmd,lme,Nu,Nblock_m,Nm,Nm,BTDM);
 
-        for(int ip=Nk; ip<Nm; ++ip){ 
+        for(int ip=Nk; ip<Nm; ++ip){
+	  Glog << " ip "<<ip<<" / "<<Nm<<std::endl;
           shiftedQRDecompEigen(BTDM,Nu,Nm,eval2[ip],Q);
         }
         
@@ -325,11 +326,11 @@ public:
         Qt = Eigen::MatrixXcd::Identity(Nm,Nm);
         diagonalize(eval2,lmd2,lme2,Nu,Nk,Nm,Qt,grid);
         _sort.push(eval2,Nk);
-	//        Glog << "#Ritz value after shift: "<< std::endl;
+	//	Glog << "#Ritz value after shift: "<< std::endl;
         for(int i=0; i<Nk; ++i){
-	  //          std::cout.precision(13);
-	  //          std::cout << "[" << std::setw(4)<< std::setiosflags(std::ios_base::right) <<i<<"] ";
-	  //          std::cout << "Rval = "<<std::setw(20)<< std::setiosflags(std::ios_base::left)<< eval2[i] << std::endl;
+	  //	  std::cout.precision(13);
+	  //	  std::cout << "[" << std::setw(4)<< std::setiosflags(std::ios_base::right) <<i<<"] ";
+	  //	  std::cout << "Rval = "<<std::setw(20)<< std::setiosflags(std::ios_base::left)<< eval2[i] << std::endl;
         }
       }
       //----------------------------------------------------------------------
@@ -467,10 +468,10 @@ public:
   
     // set initial vector
     for (int i=0; i<Nu; ++i) {
-      //      Glog << "norm2(src[" << i << "])= "<< norm2(src[i]) << std::endl;
+      Glog << "norm2(src[" << i << "])= "<< norm2(src[i]) << std::endl;
       evec[i] = src[i];
       orthogonalize(evec[i],evec,i);
-      //      Glog << "norm2(evec[" << i << "])= "<< norm2(evec[i]) << std::endl;
+      Glog << "norm2(evec[" << i << "])= "<< norm2(evec[i]) << std::endl;
     }
 //    exit(-43);
     
@@ -506,11 +507,11 @@ public:
       Qt = Eigen::MatrixXcd::Identity(Nr,Nr);
       diagonalize(eval2,lmd2,lme2,Nu,Nr,Nr,Qt,grid);
       _sort.push(eval2,Nr);
-      //      Glog << "#Ritz value: "<< std::endl;
+      Glog << "#Ritz value: "<< std::endl;
       for(int i=0; i<Nr; ++i){
-	//        std::cout.precision(13);
-	//        std::cout << "[" << std::setw(4)<< std::setiosflags(std::ios_base::right) <<i<<"] ";
-	//        std::cout << "Rval = "<<std::setw(20)<< std::setiosflags(std::ios_base::left)<< eval2[i] << std::endl;
+	std::cout.precision(13);
+	std::cout << "[" << std::setw(4)<< std::setiosflags(std::ios_base::right) <<i<<"] ";
+	std::cout << "Rval = "<<std::setw(20)<< std::setiosflags(std::ios_base::left)<< eval2[i] << std::endl;
       }
       
       // Convergence test
@@ -570,6 +571,7 @@ public:
       Glog << fname + " NOT converged ; Summary :\n";
     } else {
       Glog << fname + " CONVERGED ; Summary :\n";
+      Nstop = Nconv_guess; // Just take them all
       // Sort convered eigenpairs.
       std::vector<Field>  Btmp(Nstop,grid); // waste of space replicating
 
@@ -779,7 +781,7 @@ private:
     
     for ( int u=0; u<Nu; ++u ) {
       for (int k=0; k<Nk; ++k ) {
-//        Glog << "lmd "<<u<<" "<<k<<" "<<lmd[u][k] -conjugate(lmd[u][k])<<std::endl;
+	//	Glog << "lmd "<<u<<" "<<k<<" "<<lmd[u][k] -conjugate(lmd[u][k])<<std::endl;
         BlockTriDiag(k,u+(k/Nu)*Nu) = lmd[u][k];
       }
     }
@@ -933,7 +935,7 @@ if (1){
          int Nu, int Nb, int Nk, int Nm,
          Eigen::MatrixXcd& M)
   {
-    //Glog << "unpackHermitBlockTriDiagMatToEigen() begin" << '\n'; 
+    //    Glog << "unpackHermitBlockTriDiagMatToEigen() begin" << '\n'; 
     assert( Nk%Nu == 0 && Nm%Nu == 0 );
     assert( Nk <= Nm );
     M = Eigen::MatrixXcd::Zero(Nk,Nk);
@@ -951,7 +953,7 @@ if (1){
         M(u+(k/Nu)*Nu,k-Nu) = lme[u][k-Nu];
       }
     }
-    //Glog << "unpackHermitBlockTriDiagMatToEigen() end" << endl; 
+    //    Glog << "unpackHermitBlockTriDiagMatToEigen() end" << std::endl; 
   }
  
 
@@ -961,7 +963,7 @@ if (1){
          int Nu, int Nb, int Nk, int Nm,
          Eigen::MatrixXcd& M)
   {
-    //Glog << "packHermitBlockTriDiagMatfromEigen() begin" << '\n'; 
+    //    Glog << "packHermitBlockTriDiagMatfromEigen() begin" << '\n'; 
     assert( Nk%Nu == 0 && Nm%Nu == 0 );
     assert( Nk <= Nm );
     
@@ -977,7 +979,7 @@ if (1){
         lme[u][k-Nu] = M(u+(k/Nu)*Nu,k-Nu);
       }
     }
-    //Glog << "packHermitBlockTriDiagMatfromEigen() end" << endl; 
+    //    Glog << "packHermitBlockTriDiagMatfromEigen() end" <<std::endl; 
   }
 
 
@@ -986,7 +988,7 @@ if (1){
 		            RealD Dsh,
 		            Eigen::MatrixXcd& Qprod)
   {
-    //Glog << "shiftedQRDecompEigen() begin" << '\n'; 
+    //    Glog << "shiftedQRDecompEigen() begin" << '\n'; 
     Eigen::MatrixXcd Q = Eigen::MatrixXcd::Zero(Nm,Nm);
     Eigen::MatrixXcd R = Eigen::MatrixXcd::Zero(Nm,Nm);
     Eigen::MatrixXcd Mtmp = Eigen::MatrixXcd::Zero(Nm,Nm);
@@ -1002,6 +1004,7 @@ if (1){
                         // lower triangular part used to represent series
                         // of Q sequence.
 
+    //    Glog << "shiftedQRDecompEigen() Housholder & QR" << '\n'; 
     // equivalent operation of Qprod *= Q
     //M = Eigen::MatrixXcd::Zero(Nm,Nm);
     
@@ -1022,6 +1025,7 @@ if (1){
     
     Mtmp = Eigen::MatrixXcd::Zero(Nm,Nm);
 
+    //    Glog << "shiftedQRDecompEigen() Mtmp create" << '\n'; 
     for (int i=0; i<Nm; ++i) {
       for (int j=0; j<Nm-(Nu+1); ++j) {
         for (int k=0; k<Nu+1+j; ++k) {
@@ -1029,6 +1033,7 @@ if (1){
         }
       }
     }
+    //    Glog << "shiftedQRDecompEigen() Mtmp loop1" << '\n'; 
     for (int i=0; i<Nm; ++i) {
       for (int j=Nm-(Nu+1); j<Nm; ++j) {
         for (int k=0; k<Nm; ++k) {
@@ -1036,6 +1041,7 @@ if (1){
         }
       }
     }
+    //    Glog << "shiftedQRDecompEigen() Mtmp loop2" << '\n'; 
     
     //static int ntimes = 2;
     //for (int j=0; j<Nm-(ntimes*Nu); ++j) {
@@ -1061,11 +1067,13 @@ if (1){
         Mtmp(j,i) = conj(Mtmp(i,j));
       }
     }
+    //    Glog << "shiftedQRDecompEigen() Mtmp loop3" << '\n'; 
 
     for (int i=0; i<Nm; ++i) {
       Mtmp(i,i) = real(Mtmp(i,i)) + Dsh;
     }
     
+    //    Glog << "shiftedQRDecompEigen() Mtmp loop4" << '\n'; 
     M = Mtmp;
 
     //M = Q.adjoint()*(M*Q);
@@ -1077,7 +1085,7 @@ if (1){
     //  }
     //}
     
-    //Glog << "shiftedQRDecompEigen() end" << endl; 
+    //    Glog << "shiftedQRDecompEigen() end" <<std::endl; 
   }
 
   void exampleQRDecompEigen(void)

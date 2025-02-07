@@ -2,8 +2,8 @@
 spack load c-lime
 module load emacs 
 module load PrgEnv-gnu
-module load rocm
-module load cray-mpich/8.1.23
+module load rocm/6.0.0
+module load cray-mpich
 module load gmp
 module load cray-fftw
 module load craype-accel-amd-gfx90a
