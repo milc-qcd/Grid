@@ -38,6 +38,7 @@ namespace Grid{
             int, meas_interval,
 	    double, maxTau, // for the adaptive algorithm
 	    int, meas_interval_density,
+	    std::string, flow_type,
 	    std::string, path); 
        
 
@@ -66,6 +67,7 @@ namespace Grid{
   };
 }
 
+
 template <class T> void writeFile(T& in, std::string const fname){  
 #ifdef HAVE_LIME
   // Ref: https://github.com/paboyle/Grid/blob/feature/scidac-wp1/tests/debug/Test_general_coarse_hdcg_phys48.cc#L111
@@ -73,7 +75,7 @@ template <class T> void writeFile(T& in, std::string const fname){
   Grid::emptyUserRecord record;
   Grid::ScidacWriter WR(in.Grid()->IsBoss());
   WR.open(fname);
-  WR.writeScidacFieldRecord(in,record,0);
+  WR.writeScidacFieldRecord(in,record,0); // Lexico
   WR.close();
 #endif
   // What is the appropriate way to throw error?
@@ -107,8 +109,18 @@ int main(int argc, char **argv) {
 
   for (int conf = CPar.StartConfiguration; conf <= CPar.EndConfiguration; conf+= CPar.Skip){
 
+#if 0    
   CPNersc.CheckpointRestore(conf, Umu, sRNG, pRNG);
+#else
+  // Don't require Grid format RNGs
+  FieldMetaData header;
+  std::string file, filesmr;
+  file    = CPar.conf_path + "/" + CPar.conf_prefix      + "." + std::to_string(conf);
+  filesmr = CPar.conf_path + "/" + CPar.conf_smr_prefix  + "." + std::to_string(conf);
 
+  NerscIO::readConfiguration(Umu,header,file);
+#endif
+  
   std::cout << std::setprecision(15);
   std::cout << GridLogMessage << "Initial plaquette: "<< WilsonLoops<PeriodicGimplR>::avgPlaquette(Umu) << std::endl;
   
@@ -116,12 +128,21 @@ int main(int argc, char **argv) {
   std::string file_post = CPar.conf_prefix + "." + std::to_string(conf);
 
   WilsonFlow<PeriodicGimplR> WF(WFPar.step_size,WFPar.steps,WFPar.meas_interval);
+  WilsonGaugeAction<PeriodicGimplR>   WGA(3.0);
+  IwasakiGaugeAction<PeriodicGimplR>  IWGA(3.0);
+  SymanzikGaugeAction<PeriodicGimplR> SZGA(3.0);
+  DBW2GaugeAction<PeriodicGimplR>     DBGA(3.0);
+  if (     WFPar.flow_type == std::string("Wilson"))   WF.setGaugeAction(&WGA);
+  else if (WFPar.flow_type == std::string("Iwasaki" )) WF.setGaugeAction(&IWGA);
+  else if (WFPar.flow_type == std::string("Symanzik")) WF.setGaugeAction(&SZGA);
+  else if (WFPar.flow_type == std::string("DBW2"))     WF.setGaugeAction(&DBGA);
+    
   WF.addMeasurement(WFPar.meas_interval_density, [&file_pre,&file_post,&conf](int step, RealD t, const typename PeriodicGimplR::GaugeField &U){
     
     typedef typename PeriodicGimplR::GaugeLinkField GaugeMat;
     typedef typename PeriodicGimplR::ComplexField ComplexField;
     
-    assert(Nd == 4);
+    GRID_ASSERT(Nd == 4);
 
     // NOTE:
     // Ideally, turn the folloing into methods of the appropriate class
@@ -165,33 +186,48 @@ int main(int argc, char **argv) {
     //double coeff = 2.0 / (1.0 * Nd * (Nd - 1)) / 3.0;
     //Plq = coeff * Plq;
 
-    int tau = std::round(t);
-    std::string efile = file_pre + "E_dnsty_" + std::to_string(tau) + "_" + file_post;
-    writeFile(R,efile);
-    std::string tfile = file_pre + "Top_dnsty_" + std::to_string(tau) + "_" + file_post;
-    writeFile(qfield,tfile);
 
+    RealD WFlow_TC5Li   = WilsonLoops<PeriodicGimplR>::TopologicalCharge5Li(U);
+
+    int tau = std::round(t);
+
+    std::string efile = file_pre + "E_dnsty_" + std::to_string(tau) + "_" + file_post;
+    //    writeFile(R,efile);
+
+    std::string tfile = file_pre + "Top_dnsty_" + std::to_string(tau) + "_" + file_post;
+    //    writeFile(qfield,tfile);
+
+    std::string ufile = file_pre + "U_" + std::to_string(tau) + "_" + file_post;
+    {
+      //      PeriodicGimplR::GaugeField Ucopy = U;
+      //      NerscIO::writeConfiguration(Ucopy,ufile);
+    }
+    
     RealD E = real(sum(R))/ RealD(U.Grid()->gSites());
     RealD T = real( sum(qfield) );
     Coordinate scoor; for (int mu=0; mu < Nd; mu++) scoor[mu] = 0;
     RealD E0 = real(peekSite(R,scoor));
     RealD T0 = real(peekSite(qfield,scoor));
     std::cout << GridLogMessage << "[WilsonFlow] Saved energy density (clover) & topo. charge density: "  << conf << " " << step << "  " << tau << "  "
-	      << "(E_avg,T_sum) " << E << " " << T << " (E, T at origin) " << E0 << " " << T0 << std::endl;
+	      << "(E_avg,T_sum) " << E << " " << T << " (E, T at origin) " << E0 << " " << T0 << " Q5Li "<< WFlow_TC5Li << std::endl;
     
   });
   
   int t=WFPar.maxTau;
   WF.smear(Uflow, Umu);
-
+  //  NerscIO::writeConfiguration(Uflow,filesmr);
+  
+  
   RealD WFlow_plaq = WilsonLoops<PeriodicGimplR>::avgPlaquette(Uflow);
   RealD WFlow_TC   = WilsonLoops<PeriodicGimplR>::TopologicalCharge(Uflow);
+  RealD WFlow_TC5Li   = WilsonLoops<PeriodicGimplR>::TopologicalCharge5Li(Uflow);
   RealD WFlow_T0   = WF.energyDensityPlaquette(t,Uflow); // t
   RealD WFlow_EC   = WF.energyDensityCloverleaf(t,Uflow);
-  std::cout << GridLogMessage << "Plaquette          "<< conf << "   " << WFlow_plaq << std::endl;
-  std::cout << GridLogMessage << "T0                 "<< conf << "   " << WFlow_T0 << std::endl;
-  std::cout << GridLogMessage << "TC0                 "<< conf << "   " << WFlow_EC << std::endl;
-  std::cout << GridLogMessage << "TopologicalCharge  "<< conf << "   " << WFlow_TC   << std::endl;
+  std::cout << GridLogMessage << "Plaquette            "<< conf << "   " << WFlow_plaq << std::endl;
+  std::cout << GridLogMessage << "T0                   "<< conf << "   " << WFlow_T0 << std::endl;
+  std::cout << GridLogMessage << "TC0                  "<< conf << "   " << WFlow_EC << std::endl;
+  std::cout << GridLogMessage << "TopologicalCharge    "<< conf << "   " << WFlow_TC   << std::endl;
+  std::cout << GridLogMessage << "TopologicalCharge5Li "<< conf << "   " << WFlow_TC5Li<< std::endl;
 
   std::cout<< GridLogMessage << " Admissibility check:\n";
   const double sp_adm = 0.067;                // admissible threshold

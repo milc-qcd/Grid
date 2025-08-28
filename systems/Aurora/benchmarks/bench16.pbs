@@ -32,15 +32,9 @@ export MPICH_OFI_NIC_POLICY=GPU
 # Local vol 16.16.16.32
 #
 
-VOL 128.64.128.96
-MPI 4.4.4.3
-NPROC 192
-mpiexec -np 192 -ppn 12 -envall ./gpu_tile.sh ./Benchmark_dwf_fp32 --mpi 4.4.4.3 --grid 128.64.128.96 --shm-mpi 0 --shm 2048 --device-mem 32000 --accelerator-threads 32 --comms-overlap
-
-
-LX=32
+LX=16
 LY=16
-LZ=32
+LZ=16
 LT=32
 
 NX=2

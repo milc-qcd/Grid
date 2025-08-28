@@ -34,6 +34,8 @@ NAMESPACE_BEGIN(Grid);
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 Grid_MPI_Comm       CartesianCommunicator::communicator_world;
 
+void GridAbort(void) { abort(); }
+
 void CartesianCommunicator::Init(int *argc, char *** arv)
 {
   GlobalSharedMemory::Init(communicator_world);
@@ -54,14 +56,14 @@ CartesianCommunicator::CartesianCommunicator(const Coordinate &processors)
 {
   _shm_processors = Coordinate(processors.size(),1);
   _processors = processors;
-  _ndimension = processors.size();  assert(_ndimension>=1);
+  _ndimension = processors.size();  GRID_ASSERT(_ndimension>=1);
   _processor_coor.resize(_ndimension);
   
   // Require 1^N processor grid for fake
   _Nprocessors=1;
   _processor = 0;
   for(int d=0;d<_ndimension;d++) {
-    assert(_processors[d]==1);
+    GRID_ASSERT(_processors[d]==1);
     _processor_coor[d] = 0;
   }
   SetCommunicator(communicator_world);
@@ -87,19 +89,19 @@ void CartesianCommunicator::SendToRecvFrom(void *xmit,
 					   int dest,
 					   void *recv,
 					   int from,
-					   int bytes)
+					   uint64_t bytes)
 {
-  assert(0);
+  GRID_ASSERT(0);
 }
-void CartesianCommunicator::CommsComplete(std::vector<CommsRequest_t> &list){ assert(0);}
+void CartesianCommunicator::CommsComplete(std::vector<CommsRequest_t> &list){ GRID_ASSERT(list.size()==0);}
 void CartesianCommunicator::SendToRecvFromBegin(std::vector<CommsRequest_t> &list,
 						void *xmit,
 						int dest,
 						void *recv,
 						int from,
-						int bytes,int dir)
+						uint64_t bytes,int dir)
 {
-  assert(0);
+  GRID_ASSERT(0);
 }
 
 void CartesianCommunicator::AllToAll(int dim,void  *in,void *out,uint64_t words,uint64_t bytes)
@@ -113,8 +115,8 @@ void CartesianCommunicator::AllToAll(void  *in,void *out,uint64_t words,uint64_t
 
 int  CartesianCommunicator::RankWorld(void){return 0;}
 void CartesianCommunicator::Barrier(void){}
-void CartesianCommunicator::Broadcast(int root,void* data, int bytes) {}
-void CartesianCommunicator::BroadcastWorld(int root,void* data, int bytes) { }
+void CartesianCommunicator::Broadcast(int root,void* data, uint64_t bytes) {}
+void CartesianCommunicator::BroadcastWorld(int root,void* data, uint64_t bytes) { }
 void CartesianCommunicator::BarrierWorld(void) { }
 int  CartesianCommunicator::RankFromProcessorCoor(Coordinate &coor) {  return 0;}
 void CartesianCommunicator::ProcessorCoorFromRank(int rank, Coordinate &coor){  coor = _processor_coor; }
@@ -124,29 +126,33 @@ void CartesianCommunicator::ShiftedRanks(int dim,int shift,int &source,int &dest
   dest=0;
 }
 
+int CartesianCommunicator::IsOffNode(int rank) { return false; }
+
 double CartesianCommunicator::StencilSendToRecvFrom( void *xmit,
 						     int xmit_to_rank,int dox,
 						     void *recv,
 						     int recv_from_rank,int dor,
-						     int bytes, int dir)
+						     uint64_t bytes, int dir)
 {
   return 2.0*bytes;
 }
+void CartesianCommunicator::StencilSendToRecvFromPollIRecv(std::vector<CommsRequest_t> &list) {};
+void CartesianCommunicator::StencilSendToRecvFromPollDtoH(std::vector<CommsRequest_t> &list) {};
 double CartesianCommunicator::StencilSendToRecvFromPrepare(std::vector<CommsRequest_t> &list,
 							   void *xmit,
 							   int xmit_to_rank,int dox,
 							   void *recv,
 							   int recv_from_rank,int dor,
-							   int xbytes,int rbytes, int dir)
+							   uint64_t xbytes,uint64_t rbytes, int dir)
 {
-  return xbytes+rbytes;
+  return 0.0;
 }
 double CartesianCommunicator::StencilSendToRecvFromBegin(std::vector<CommsRequest_t> &list,
-							 void *xmit,
+							 void *xmit, void *xmit_comp,
 							 int xmit_to_rank,int dox,
-							 void *recv,
+							 void *recv, void *recv_comp,
 							 int recv_from_rank,int dor,
-							 int xbytes,int rbytes, int dir)
+							 uint64_t xbytes,uint64_t rbytes, int dir)
 {
   return xbytes+rbytes;
 }

@@ -38,6 +38,7 @@ typedef typename FermionAction::FermionField FermionField;
 
 int main (int argc, char** argv)
 {
+#ifdef ENABLE_GPARITY  
   Grid_init(&argc, &argv);
 
   Coordinate latt_size   = GridDefaultLatt();
@@ -169,8 +170,9 @@ int main (int argc, char** argv)
   printf("real(dS_predict) = %1.15e\n", dSpred.real());
   printf("imag(dS_predict) = %1.15e\n\n", dSpred.imag());
 
-  assert( fabs(real(Sprime-S-dSpred)) < 1.0 ) ;
+  GRID_ASSERT( fabs(real(Sprime-S-dSpred)) < 1.0 ) ;
 
   std::cout << GridLogMessage << "Done" << std::endl;
   Grid_finalize();
+#endif
 }

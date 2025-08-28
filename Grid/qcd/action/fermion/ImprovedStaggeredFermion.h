@@ -135,7 +135,7 @@ public:
 			   const ImplParams &p = ImplParams());
 
   // DoubleStore impl dependent
-  void ImportGauge      (const GaugeField &_Uthin ) { assert(0); }
+  void ImportGauge      (const GaugeField &_Uthin ) { GRID_ASSERT(0); }
   void ImportGauge(const GaugeField &_Uthin, const GaugeField &_Ufat);
   void ImportGauge(const GaugeField &_Uthin, const GaugeField &_Ufat, const GaugeField &_Ulong );
   void ImportGaugeSimple(const GaugeField &_UUU    ,const GaugeField &_U);
@@ -165,6 +165,12 @@ public:
   StencilImpl Stencil;
   StencilImpl StencilEven;
   StencilImpl StencilOdd;
+  void SloppyComms(int sloppy)
+  {
+    Stencil.SetSloppyComms(sloppy);
+    StencilEven.SetSloppyComms(sloppy);
+    StencilOdd.SetSloppyComms(sloppy);
+  }
 
   // Copy of the gauge field , with even and odd subsets
   DoubledGaugeField Umu;

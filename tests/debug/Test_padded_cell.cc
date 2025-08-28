@@ -33,6 +33,7 @@ using namespace std;
 using namespace Grid;
 
 // This is to optimize the SIMD
+/*
 template<class vobj> void gpermute(vobj & inout,int perm){
   vobj tmp=inout;
   if (perm & 0x1 ) { permute(inout,tmp,0); tmp=inout;}
@@ -40,7 +41,7 @@ template<class vobj> void gpermute(vobj & inout,int perm){
   if (perm & 0x4 ) { permute(inout,tmp,2); tmp=inout;}
   if (perm & 0x8 ) { permute(inout,tmp,3); tmp=inout;}
 }
-
+*/
 
 int main (int argc, char ** argv)
 {
@@ -105,7 +106,7 @@ int main (int argc, char ** argv)
     peekLocalSite(g,Ug_v,gcoor);
     peekLocalSite(l,Ul_v,lcoor);
     g=g-l;
-    assert(norm2(g)==0);
+    GRID_ASSERT(norm2(g)==0);
     diff = diff + norm2(g);
     n = n + norm2(l);
   }}}}
@@ -197,6 +198,6 @@ int main (int argc, char ** argv)
   std::cout << GridLogMessage << " Average plaquette via padded cell "<<result<<std::endl;
   std::cout << GridLogMessage << " Diff "<<result-plaq<<std::endl;
   
-  assert(fabs(result-plaq)<1.0e-8);
+  GRID_ASSERT(fabs(result-plaq)<1.0e-8);
   Grid_finalize();
 }

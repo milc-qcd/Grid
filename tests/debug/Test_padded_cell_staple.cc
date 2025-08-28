@@ -153,7 +153,7 @@ public:
     t=usecond();
     {
       autoView( gStaple_v , gStaple, AcceleratorWrite);
-      auto gStencil_v = gStencil.View();
+      auto gStencil_v = gStencil.View(AcceleratorRead);
       autoView( Ug_mu_v , Ug_mu, AcceleratorRead);
       autoView( Ug_nu_v , Ug_nu, AcceleratorRead);
   
@@ -389,7 +389,7 @@ public:
     GeneralLocalStencil gStencil(ggrid,shifts);
     {
       autoView( gStaple_v , gStaple, AcceleratorWrite);
-      auto gStencil_v = gStencil.View();
+      auto gStencil_v = gStencil.View(AcceleratorRead);
 
       typedef LatticeView<typename GaugeMat::vector_object> GaugeViewType;
       size_t vsize = Nd*sizeof(GaugeViewType);
@@ -490,7 +490,7 @@ public:
 
 	    }
 	  }
-	  assert(s==nshift);
+	  GRID_ASSERT(s==nshift);
 	  coalescedWrite(gStaple_v[ss],stencil_ss);
 	}
 	);
@@ -572,7 +572,7 @@ int main (int argc, char ** argv)
     GaugeMat diff = staple_orig - staple_padded;
     double n = norm2(diff);
     std::cout << GridLogMessage << mu << " " << n << std::endl;
-    assert(n<1e-10);
+    GRID_ASSERT(n<1e-10);
   }
   std::cout << GridLogMessage << "RectStaple timings orig: " << torig/1000/count << "ms,  padded: " << tpadded/1000/count << "ms" << std::endl;
   

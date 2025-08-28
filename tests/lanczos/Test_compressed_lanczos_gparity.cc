@@ -35,6 +35,8 @@ Author: Peter Boyle <paboyle@ph.ed.ac.uk>
 #include <Grid/algorithms/iterative/ImplicitlyRestartedLanczos.h>
 #include <Grid/algorithms/iterative/LocalCoherenceLanczos.h>
 
+#ifdef ENABLE_GPARITY
+
 using namespace std;
 using namespace Grid;
 
@@ -98,7 +100,7 @@ public:
 
   void checkpointFine(std::string evecs_file,std::string evals_file)
   {
-    assert(this->subspace.size()==nbasis);
+    GRID_ASSERT(this->subspace.size()==nbasis);
     emptyUserRecord record;
     Grid::ScidacWriter WR(this->_FineGrid->IsBoss());
     WR.open(evecs_file);
@@ -120,7 +122,7 @@ public:
     XmlReader RDx(evals_file);
     read(RDx,"evals",this->evals_fine);
 
-    if(this->evals_fine.size() < nbasis) assert(0 && "Not enough fine evals to complete basis");
+    if(this->evals_fine.size() < nbasis) GRID_ASSERT(0 && "Not enough fine evals to complete basis");
     if(this->evals_fine.size() > nbasis){ //allow the use of precomputed evecs with a larger #evecs
       std::cout << GridLogMessage << "Truncating " << this->evals_fine.size() << " evals to basis size " << nbasis << std::endl;
       this->evals_fine.resize(nbasis);
@@ -162,7 +164,7 @@ public:
     XmlReader RDx(evals_file);
     read(RDx,"evals",this->evals_coarse);
 
-    assert(this->evals_coarse.size()==nvec);
+    GRID_ASSERT(this->evals_coarse.size()==nvec);
     emptyUserRecord record;
     std::cout << GridLogIRL<< "checkpointCoarseRestore:  Reading evecs from "<<evecs_file<<std::endl;
     Grid::ScidacReader RD ;
@@ -250,7 +252,7 @@ void runTest(const Options &opt){
   GridRedBlackCartesian * FrbGrid   = SpaceTimeGrid::makeFiveDimRedBlackGrid(opt.Ls,UGrid);
 
   //Setup G-parity BCs
-  assert(Nd == 4);
+  GRID_ASSERT(Nd == 4);
   std::vector<int> dirs4(4);
   for(int i=0;i<3;i++) dirs4[i] = opt.GparityDirs[i];
   dirs4[3] = 0; //periodic gauge BC in time
@@ -271,14 +273,14 @@ void runTest(const Options &opt){
   auto fineLatt     = GridDefaultLatt();
   Coordinate coarseLatt(4);
   for (int d=0;d<4;d++){
-    coarseLatt[d] = fineLatt[d]/opt.blockSize[d];    assert(coarseLatt[d]*opt.blockSize[d]==fineLatt[d]);
+    coarseLatt[d] = fineLatt[d]/opt.blockSize[d];    GRID_ASSERT(coarseLatt[d]*opt.blockSize[d]==fineLatt[d]);
   }
 
   std::cout << GridLogMessage<< " 5d coarse lattice is ";
   for (int i=0;i<4;i++){
     std::cout << coarseLatt[i]<<"x";
   } 
-  int cLs = opt.Ls/opt.blockSize[4]; assert(cLs*opt.blockSize[4]==opt.Ls);
+  int cLs = opt.Ls/opt.blockSize[4]; GRID_ASSERT(cLs*opt.blockSize[4]==opt.Ls);
   std::cout << cLs<<std::endl;
   
   GridCartesian         * CoarseGrid4    = SpaceTimeGrid::makeFourDimGrid(coarseLatt, GridDefaultSimd(Nd,vComplex::Nsimd()),GridDefaultMpi());
@@ -302,9 +304,9 @@ void runTest(const Options &opt){
 
   std::cout << GridLogMessage << "Keep " << fine.N_true_get   << " fine   vectors" << std::endl;
   std::cout << GridLogMessage << "Keep " << coarse.N_true_get << " coarse vectors" << std::endl;
-  assert(coarse.N_true_get >= fine.N_true_get);
+  GRID_ASSERT(coarse.N_true_get >= fine.N_true_get);
 
-  assert(nbasis<=fine.N_true_get);
+  GRID_ASSERT(nbasis<=fine.N_true_get);
   LocalCoherenceLanczosScidac<SiteSpinor,vTComplex,nbasis> _LocalCoherenceLanczos(FrbGrid,CoarseGrid5,SchurOp,Odd);
   std::cout << GridLogMessage << "Constructed LocalCoherenceLanczos" << std::endl;
  
@@ -378,7 +380,8 @@ void runTest(const Options &opt){
 
 
 //Note:  because we rely upon physical properties we must use a "real" gauge configuration
-int main (int argc, char ** argv) {
+int main (int argc, char ** argv)
+{
   Grid_init(&argc,&argv);
   GridLogIRL.TimingMode(1);
 
@@ -408,7 +411,7 @@ int main (int argc, char ** argv) {
   }
   opt.config = argv[1];
   GridCmdOptionIntVector(argv[2], opt.GparityDirs);
-  assert(opt.GparityDirs.size() == 3);
+  GRID_ASSERT(opt.GparityDirs.size() == 3);
 
   for(int i=3;i<argc;i++){
     std::string sarg = argv[i];
@@ -420,7 +423,7 @@ int main (int argc, char ** argv) {
       std::cout << GridLogMessage << "Set quark mass to " << opt.mass << std::endl;
     }else if(sarg == "--block"){
       GridCmdOptionIntVector(argv[i+1], opt.blockSize);
-      assert(opt.blockSize.size() == 5);
+      GRID_ASSERT(opt.blockSize.size() == 5);
       std::cout << GridLogMessage << "Set block size to ";
       for(int q=0;q<5;q++) std::cout << opt.blockSize[q] << " ";
       std::cout << std::endl;      
@@ -477,9 +480,13 @@ int main (int argc, char ** argv) {
     runTest<350>(opt); break;
   default:
     std::cout << GridLogMessage << "Unsupported basis size " << basis_size << std::endl;
-    assert(0);
+    GRID_ASSERT(0);
   }
   
   Grid_finalize();
 }
+#else
+int main(int argc, char **argv){};
+
+#endif
 

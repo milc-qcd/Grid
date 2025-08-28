@@ -82,10 +82,10 @@ template<class vobj> inline void ScatterSlice(const deviceVector<vobj> &buf,
 
   int rNsimd = 1; for(int d=0;d<Nd;d++) rNsimd*=rsimd[d];
   int rNsimda= Nsimd/simd[dim]; // should be equal
-  assert(rNsimda==rNsimd);
+  GRID_ASSERT(rNsimda==rNsimd);
   int face_ovol=block*nblock;
 
-  //  assert(buf.size()==face_ovol*rNsimd);
+  //  GRID_ASSERT(buf.size()==face_ovol*rNsimd);
 
   /*This will work GPU ONLY unless rNsimd is put in the lexico index*/
   //Let's make it work on GPU and then make a special accelerator_for that
@@ -172,7 +172,7 @@ template<class vobj> inline void GatherSlice(deviceVector<vobj> &buf,
   
   int face_ovol=block*nblock;
 
-  //  assert(buf.size()==face_ovol*rNsimd);
+  //  GRID_ASSERT(buf.size()==face_ovol*rNsimd);
 
   /*This will work GPU ONLY unless rNsimd is put in the lexico index*/
   //Let's make it work on GPU and then make a special accelerator_for that
@@ -247,7 +247,7 @@ public:
     Coordinate local     =unpadded_grid->LocalDimensions();
     Coordinate procs     =unpadded_grid->ProcessorGrid();
     for(int d=0;d<dims;d++){
-      if ( procs[d] > 1 ) assert(local[d]>=depth);
+      if ( procs[d] > 1 ) GRID_ASSERT(local[d]>=depth);
     }
   }
   void DeleteGrids(void)
@@ -448,9 +448,9 @@ public:
     int nld   = to.Grid()->_ldimensions[dimension];
     const int Nsimd = vobj::Nsimd();
 
-    assert(depth<=lds[dimension]); // A must be on neighbouring node
-    assert(depth>0);   // A caller bug if zero
-    assert(ld+2*depth==nld);
+    GRID_ASSERT(depth<=lds[dimension]); // A must be on neighbouring node
+    GRID_ASSERT(depth>0);   // A caller bug if zero
+    GRID_ASSERT(ld+2*depth==nld);
     ////////////////////////////////////////////////////////////////////////////
     // Face size and byte calculations
     ////////////////////////////////////////////////////////////////////////////
@@ -460,12 +460,18 @@ public:
     }
     buffer_size = buffer_size  / Nsimd;
     int rNsimd = Nsimd / simd[dimension];
-    assert( buffer_size == from.Grid()->_slice_nblock[dimension]*from.Grid()->_slice_block[dimension] / simd[dimension]);
+    GRID_ASSERT( buffer_size == from.Grid()->_slice_nblock[dimension]*from.Grid()->_slice_block[dimension] / simd[dimension]);
 
     static deviceVector<vobj> send_buf; 
     static deviceVector<vobj> recv_buf;
     send_buf.resize(buffer_size*2*depth);    
     recv_buf.resize(buffer_size*2*depth);
+#ifndef ACCELERATOR_AWARE_MPI
+    static hostVector<vobj> hsend_buf; 
+    static hostVector<vobj> hrecv_buf;
+    hsend_buf.resize(buffer_size*2*depth);    
+    hrecv_buf.resize(buffer_size*2*depth);
+#endif    
 
     std::vector<MpiCommsRequest_t> fwd_req;   
     std::vector<MpiCommsRequest_t> bwd_req;   
@@ -495,9 +501,16 @@ public:
       t_gather+=usecond()-t;
 
       t=usecond();
+#ifdef ACCELERATOR_AWARE_MPI
       grid->SendToRecvFromBegin(fwd_req,
 				(void *)&send_buf[d*buffer_size], xmit_to_rank,
 				(void *)&recv_buf[d*buffer_size], recv_from_rank, bytes, tag);
+#else
+      acceleratorCopyFromDevice(&send_buf[d*buffer_size],&hsend_buf[d*buffer_size],bytes);
+      grid->SendToRecvFromBegin(fwd_req,
+				(void *)&hsend_buf[d*buffer_size], xmit_to_rank,
+				(void *)&hrecv_buf[d*buffer_size], recv_from_rank, bytes, tag);
+#endif
       t_comms+=usecond()-t;
      }
     for ( int d=0;d < depth ; d ++ ) {
@@ -508,9 +521,16 @@ public:
       t_gather+= usecond() - t;
 
       t=usecond();
+#ifdef ACCELERATOR_AWARE_MPI
       grid->SendToRecvFromBegin(bwd_req,
 				(void *)&send_buf[(d+depth)*buffer_size], recv_from_rank,
 				(void *)&recv_buf[(d+depth)*buffer_size], xmit_to_rank, bytes,tag);
+#else
+      acceleratorCopyFromDevice(&send_buf[(d+depth)*buffer_size],&hsend_buf[(d+depth)*buffer_size],bytes);
+      grid->SendToRecvFromBegin(bwd_req,
+				(void *)&hsend_buf[(d+depth)*buffer_size], recv_from_rank,
+				(void *)&hrecv_buf[(d+depth)*buffer_size], xmit_to_rank, bytes,tag);
+#endif      
       t_comms+=usecond()-t;
     }
 
@@ -533,8 +553,13 @@ public:
 
     t=usecond();
     grid->CommsComplete(fwd_req);
+#ifndef ACCELERATOR_AWARE_MPI
+    for ( int d=0;d < depth ; d ++ ) {
+      acceleratorCopyToDevice(&hrecv_buf[d*buffer_size],&recv_buf[d*buffer_size],bytes);
+    }
+#endif
     t_comms+= usecond() - t;
-
+    
     t=usecond();
     for ( int d=0;d < depth ; d ++ ) {
       ScatterSlice(recv_buf,to,nld-depth+d,dimension,plane*buffer_size); plane++;
@@ -543,6 +568,11 @@ public:
 
     t=usecond();
     grid->CommsComplete(bwd_req);
+#ifndef ACCELERATOR_AWARE_MPI
+    for ( int d=0;d < depth ; d ++ ) {
+      acceleratorCopyToDevice(&hrecv_buf[(d+depth)*buffer_size],&recv_buf[(d+depth)*buffer_size],bytes);
+    }
+#endif
     t_comms+= usecond() - t;
     
     t=usecond();
