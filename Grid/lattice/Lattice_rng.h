@@ -152,7 +152,7 @@ public:
 #ifdef RNG_FAST_DISCARD
   static void Skip(RngEngine &eng,uint64_t site)
   {
-#if 0
+#ifdef GRIDFM_OLD_RNG
     /////////////////////////////////////////////////////////////////////////////////////
     // Skip by 2^40 elements between successive lattice sites
     // This goes by 10^12.

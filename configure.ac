@@ -285,6 +285,17 @@ case ${ac_LOG_VIEWS} in
     *);;
 esac
 
+############### Old RNG
+AC_ARG_ENABLE([old-rng],
+    [AS_HELP_STRING([--enable-old-rng=yes|no],[use old random number generator])],
+    [ac_OLD_RNG=${enable_old_rng}], [ac_OLD_RNG=no])
+
+case ${ac_OLD_RNG} in
+    yes)
+      AC_DEFINE([GRIDFM_OLD_RNG],[1],[use old random number generator]);;
+    *);;
+esac
+
 ############### SYCL/CUDA/HIP/none
 AC_ARG_ENABLE([accelerator],
     [AS_HELP_STRING([--enable-accelerator=cuda|sycl|hip|none],[enable none,cuda,sycl,hip acceleration])],

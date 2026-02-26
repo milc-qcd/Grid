@@ -27,14 +27,14 @@ Author: Peter Boyle <paboyle@ph.ed.ac.uk>
 /*  END LEGAL */
 #include <Grid/GridCore.h>
 
+void GridAbort(void) { abort(); }
+
 NAMESPACE_BEGIN(Grid);
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 // Info that is setup once and indept of cartesian layout
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 Grid_MPI_Comm       CartesianCommunicator::communicator_world;
-
-void GridAbort(void) { abort(); }
 
 void CartesianCommunicator::Init(int *argc, char *** arv)
 {

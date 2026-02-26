@@ -882,8 +882,10 @@ public:
 	}
       }
     }
-    acceleratorCopyToDevice(&surface_list_host[0],&surface_list[0],surface_list_size*sizeof(int));
-    //    std::cout << GridLogMessage<<"BuildSurfaceList size is "<<surface_list_size<<std::endl;
+    if (surface_list_size>0){
+      acceleratorCopyToDevice(&surface_list_host[0],&surface_list[0],surface_list_size*sizeof(int));
+      //    std::cout << GridLogMessage<<"BuildSurfaceList size is "<<surface_list_size<<std::endl;
+    }
   }
   /// Introduce a block structure and switch off comms on boundaries
   void DirichletBlock(const Coordinate &dirichlet_block)
