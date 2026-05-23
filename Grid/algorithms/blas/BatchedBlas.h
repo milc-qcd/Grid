@@ -28,6 +28,7 @@ Author: Peter Boyle <pboyle@bnl.gov>
 #pragma once
 
 #ifdef GRID_HIP
+#include <hip/hip_version.h>
 #include <hipblas/hipblas.h>
 #endif
 #ifdef GRID_CUDA
@@ -255,17 +256,30 @@ public:
     if ( OpB == GridBLAS_OP_N ) hOpB = HIPBLAS_OP_N;
     if ( OpB == GridBLAS_OP_T ) hOpB = HIPBLAS_OP_T;
     if ( OpB == GridBLAS_OP_C ) hOpB = HIPBLAS_OP_C;
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
     auto err = hipblasZgemmBatched(gridblasHandle,
 				   hOpA,
 				   hOpB,
 				   m,n,k,
-				   (hipblasDoubleComplex *) &alpha_p[0],
-				   (hipblasDoubleComplex **)&Amk[0], lda,
-				   (hipblasDoubleComplex **)&Bkn[0], ldb,
-				   (hipblasDoubleComplex *) &beta_p[0],
-				   (hipblasDoubleComplex **)&Cmn[0], ldc,
+				   (hipDoubleComplex *) &alpha_p[0],
+				   (hipDoubleComplex **)&Amk[0], lda,
+				   (hipDoubleComplex **)&Bkn[0], ldb,
+				   (hipDoubleComplex *) &beta_p[0],
+				   (hipDoubleComplex **)&Cmn[0], ldc,
 				   batchCount);
-    //	 std::cout << " hipblas return code " <<(int)err<<std::endl;
+#else
+    auto err = hipblasZgemmBatched(gridblasHandle,
+                                   hOpA,
+                                   hOpB,
+                                   m,n,k,
+                                   (hipblasDoubleComplex *) &alpha_p[0],
+                                   (hipblasDoubleComplex **)&Amk[0], lda,
+                                   (hipblasDoubleComplex **)&Bkn[0], ldb,
+                                   (hipblasDoubleComplex *) &beta_p[0],
+                                   (hipblasDoubleComplex **)&Cmn[0], ldc,
+                                   batchCount);
+#endif
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -503,17 +517,31 @@ public:
     if ( OpB == GridBLAS_OP_N ) hOpB = HIPBLAS_OP_N;
     if ( OpB == GridBLAS_OP_T ) hOpB = HIPBLAS_OP_T;
     if ( OpB == GridBLAS_OP_C ) hOpB = HIPBLAS_OP_C;
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
     auto err = hipblasCgemmBatched(gridblasHandle,
 				   hOpA,
 				   hOpB,
 				   m,n,k,
-				   (hipblasComplex *) &alpha_p[0],
-				   (hipblasComplex **)&Amk[0], lda,
-				   (hipblasComplex **)&Bkn[0], ldb,
-				   (hipblasComplex *) &beta_p[0],
-				   (hipblasComplex **)&Cmn[0], ldc,
+				   (hipComplex *) &alpha_p[0],
+				   (hipComplex **)&Amk[0], lda,
+				   (hipComplex **)&Bkn[0], ldb,
+				   (hipComplex *) &beta_p[0],
+				   (hipComplex **)&Cmn[0], ldc,
 				   batchCount);
+#else
+    auto err = hipblasCgemmBatched(gridblasHandle,
+                                   hOpA,
+                                   hOpB,
+                                   m,n,k,
+                                   (hipblasComplex *) &alpha_p[0],
+                                   (hipblasComplex **)&Amk[0], lda,
+                                   (hipblasComplex **)&Bkn[0], ldb,
+                                   (hipblasComplex *) &beta_p[0],
+                                   (hipblasComplex **)&Cmn[0], ldc,
+                                   batchCount);
 
+#endif
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -550,6 +578,7 @@ public:
 				(void **)&Cmn[0], CUDA_C_32F, ldc,
 				batchCount, compute_precision, CUBLAS_GEMM_DEFAULT);
     }
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==CUBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_SYCL
@@ -720,6 +749,7 @@ public:
 				   (float *) &beta_p[0],
 				   (float **)&Cmn[0], ldc,
 				   batchCount);
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -880,6 +910,7 @@ public:
 				   (double *) &beta_p[0],
 				   (double **)&Cmn[0], ldc,
 				   batchCount);
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -1094,11 +1125,20 @@ public:
     GRID_ASSERT(info.size()==batchCount);
 
 #ifdef GRID_HIP
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
     auto err = hipblasZgetrfBatched(gridblasHandle,(int)n,
-				    (hipblasDoubleComplex **)&Ann[0], (int)n,
+				    (hipDoubleComplex **)&Ann[0], (int)n,
 				    (int*) &ipiv[0],
 				    (int*) &info[0],
 				    (int)batchCount);
+#else
+    auto err = hipblasZgetrfBatched(gridblasHandle,(int)n,
+                                    (hipblasDoubleComplex **)&Ann[0], (int)n,
+                                    (int*) &ipiv[0],
+                                    (int*) &info[0],
+                                    (int)batchCount);
+#endif
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -1124,11 +1164,21 @@ public:
     GRID_ASSERT(info.size()==batchCount);
 
 #ifdef GRID_HIP
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
     auto err = hipblasCgetrfBatched(gridblasHandle,(int)n,
-				    (hipblasComplex **)&Ann[0], (int)n,
+				    (hipComplex **)&Ann[0], (int)n,
 				    (int*) &ipiv[0],
 				    (int*) &info[0],
 				    (int)batchCount);
+#else
+    auto err = hipblasCgetrfBatched(gridblasHandle,(int)n,
+                                    (hipblasComplex **)&Ann[0], (int)n,
+                                    (int*) &ipiv[0],
+                                    (int*) &info[0],
+                                    (int)batchCount);
+#endif
+
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -1201,12 +1251,23 @@ public:
     GRID_ASSERT(Cnn.size()==batchCount);
 
 #ifdef GRID_HIP
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
     auto err = hipblasZgetriBatched(gridblasHandle,(int)n,
-				    (hipblasDoubleComplex **)&Ann[0], (int)n,
+				    (hipDoubleComplex **)&Ann[0], (int)n,
 				    (int*) &ipiv[0],
-				    (hipblasDoubleComplex **)&Cnn[0], (int)n,
+				    (hipDoubleComplex **)&Cnn[0], (int)n,
 				    (int*) &info[0],
 				    (int)batchCount);
+#else
+    auto err = hipblasZgetriBatched(gridblasHandle,(int)n,
+                                    (hipblasDoubleComplex **)&Ann[0], (int)n,
+                                    (int*) &ipiv[0],
+                                    (hipblasDoubleComplex **)&Cnn[0], (int)n,
+                                    (int*) &info[0],
+                                    (int)batchCount);
+
+#endif
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
@@ -1235,12 +1296,22 @@ public:
     GRID_ASSERT(Cnn.size()==batchCount);
 
 #ifdef GRID_HIP
+#if defined(HIP_VERSION_MAJOR) && (HIP_VERSION_MAJOR >=7)
     auto err = hipblasCgetriBatched(gridblasHandle,(int)n,
-				    (hipblasComplex **)&Ann[0], (int)n,
+				    (hipComplex **)&Ann[0], (int)n,
 				    (int*) &ipiv[0],
-				    (hipblasComplex **)&Cnn[0], (int)n,
+				    (hipComplex **)&Cnn[0], (int)n,
 				    (int*) &info[0],
 				    (int)batchCount);
+#else
+    auto err = hipblasCgetriBatched(gridblasHandle,(int)n,
+                                    (hipblasComplex **)&Ann[0], (int)n,
+                                    (int*) &ipiv[0],
+                                    (hipblasComplex **)&Cnn[0], (int)n,
+                                    (int*) &info[0],
+                                    (int)batchCount);
+#endif
+    //    std::cout << " hipblas return code " <<(int)err<<" "<<__LINE__<<std::endl;
     GRID_ASSERT(err==HIPBLAS_STATUS_SUCCESS);
 #endif
 #ifdef GRID_CUDA
