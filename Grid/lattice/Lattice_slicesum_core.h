@@ -58,6 +58,8 @@ inline void sliceSumReduction_cub_small(const vobj *Data,
   
 #if defined(__CUDACC__) && (__CUDACC_VER_MAJOR__ >= 13)
   #define GRID_CUB_SUM_OP ::cuda::std::plus<>{}
+#elif defined(GRID_HIP)
+  #define GRID_CUB_SUM_OP ::hipcub::Sum()
 #else
   #define GRID_CUB_SUM_OP ::cub::Sum()
 #endif
