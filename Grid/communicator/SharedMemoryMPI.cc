@@ -155,6 +155,60 @@ public:
 #endif
 
 
+static void GridHostnameFallbackSplit(Grid_MPI_Comm comm,int rank,int size,Grid_MPI_Comm *shm_comm)
+{
+  const int namelen = _POSIX_HOST_NAME_MAX;
+  char name[namelen];
+  memset(name,0,namelen);
+  gethostname(name,namelen-1);
+
+  std::vector<char> all_names(size*namelen);
+  int ierr = MPI_Allgather(name,namelen,MPI_CHAR,
+                           &all_names[0],namelen,MPI_CHAR,
+                           comm);
+  GRID_ASSERT(ierr==0);
+
+  int color = rank;
+  for(int r=0;r<size;r++){
+    if(strncmp(name,&all_names[r*namelen],namelen)==0){
+      color = r;
+      break;
+    }
+  }
+
+  ierr = MPI_Comm_split(comm,color,rank,shm_comm);
+  GRID_ASSERT(ierr==0);
+}
+
+static int GridSharedMemorySplit(Grid_MPI_Comm comm,int rank,Grid_MPI_Comm *shm_comm)
+{
+  int fallback_status = 0;
+#ifndef GRID_MPI3_SHM_NONE
+  int ierr = MPI_Comm_split_type(comm,MPI_COMM_TYPE_SHARED,0,MPI_INFO_NULL,shm_comm);
+  GRID_ASSERT(ierr==0);
+
+  int size;
+  int shm_size;
+  MPI_Comm_size(comm,&size);
+  MPI_Comm_size(*shm_comm,&shm_size);
+
+  if ( GlobalSharedMemory::ShmHostnameFallback && (shm_size==1) && (size>1) ) {
+#if defined(GRID_MPI3_SHM_NVLINK) && (defined(GRID_CUDA) || defined(GRID_HIP) || defined(GRID_SYCL))
+      MPI_Comm_free(shm_comm);
+      GridHostnameFallbackSplit(comm,rank,size,shm_comm);
+      fallback_status = 1;
+#else
+      fallback_status = 2;
+#endif
+  }
+#else
+  int ierr = MPI_Comm_split(comm,rank,0,shm_comm);
+  GRID_ASSERT(ierr==0);
+#endif
+  return fallback_status;
+}
+
+
 /*Construct from an MPI communicator*/
 void GlobalSharedMemory::Init(Grid_MPI_Comm comm)
 {
@@ -167,11 +221,7 @@ void GlobalSharedMemory::Init(Grid_MPI_Comm comm)
   /////////////////////////////////////////////////////////////////////
   // Split into groups that can share memory
   /////////////////////////////////////////////////////////////////////
-#ifndef GRID_MPI3_SHM_NONE
-  MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,&WorldShmComm);
-#else
-  MPI_Comm_split(comm, WorldRank, 0, &WorldShmComm);
-#endif
+  int shm_split_status = GridSharedMemorySplit(comm,WorldRank,&WorldShmComm);
 
   MPI_Comm_rank(WorldShmComm     ,&WorldShmRank);
   MPI_Comm_size(WorldShmComm     ,&WorldShmSize);
@@ -179,6 +229,25 @@ void GlobalSharedMemory::Init(Grid_MPI_Comm comm)
   if ( WorldRank == 0) {
     std::cout << Mheader " World communicator of size " <<WorldSize << std::endl;  
     std::cout << Mheader " Node  communicator of size " <<WorldShmSize << std::endl;
+    if ( ShmHostnameFallback ) {
+      if ( shm_split_status == 1 ) {
+        std::cout << Mheader
+                  << " --shm-hostname-fallback enabled: MPI_COMM_TYPE_SHARED returned a singleton for the world communicator; singleton SHM communicators will be rebuilt by hostname"
+                  << std::endl;
+      } else if ( shm_split_status == 2 ) {
+        std::cout << Mheader
+                  << " --shm-hostname-fallback ignored: requires --enable-shm=nvlink and accelerator-aware MPI"
+                  << std::endl;
+      } else {
+        std::cout << Mheader
+                  << " --shm-hostname-fallback enabled: MPI_COMM_TYPE_SHARED did not require hostname replacement"
+                  << std::endl;
+      }
+    } else {
+      std::cout << Mheader
+                << " --shm-hostname-fallback disabled: using MPI_COMM_TYPE_SHARED shared-memory communicators as reported by MPI"
+                << std::endl;
+    }
   }
   // WorldShmComm, WorldShmSize, WorldShmRank
 
@@ -903,11 +972,7 @@ void SharedMemory::SetCommunicator(Grid_MPI_Comm comm)
   /////////////////////////////////////////////////////////////////////
   // Split into groups that can share memory
   /////////////////////////////////////////////////////////////////////
-#ifndef GRID_MPI3_SHM_NONE
-  MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL,&ShmComm);
-#else
-  MPI_Comm_split(comm, rank, 0, &ShmComm);
-#endif
+  GridSharedMemorySplit(comm,rank,&ShmComm);
   MPI_Comm_rank(ShmComm     ,&ShmRank);
   MPI_Comm_size(ShmComm     ,&ShmSize);
   ShmCommBufs.resize(ShmSize);
@@ -1023,4 +1088,3 @@ SharedMemory::~SharedMemory()
 };
 
 NAMESPACE_END(Grid); 
-

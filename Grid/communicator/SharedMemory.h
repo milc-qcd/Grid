@@ -100,6 +100,12 @@ public:
   ///////////////////////////////////////
   static int HPEhypercube;
 
+  ///////////////////////////////////////
+  // LQ2/NVLink workaround: when enabled, singleton MPI shared-memory
+  // communicators may be replaced by exact-hostname groups in NVLink builds.
+  ///////////////////////////////////////
+  static int ShmHostnameFallback;
+
   static int      ShmSetup(void)      { return _ShmSetup; }
   static int      ShmAlloc(void)      { return _ShmAlloc; }
   static uint64_t ShmAllocBytes(void) { return _ShmAllocBytes; }
