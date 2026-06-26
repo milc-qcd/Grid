@@ -425,7 +425,7 @@ public:
   template<class vobj>
   void Face_exchange(const Lattice<vobj> &from,
 		     Lattice<vobj> &to,
-		     int dimension,int depth) const
+		     int dimension, int depth, bool refresh = false) const
   {
     typedef typename vobj::vector_type vector_type;
     typedef typename vobj::scalar_type scalar_type;
@@ -448,9 +448,15 @@ public:
     int nld   = to.Grid()->_ldimensions[dimension];
     const int Nsimd = vobj::Nsimd();
 
-    GRID_ASSERT(depth<=lds[dimension]); // A must be on neighbouring node
     GRID_ASSERT(depth>0);   // A caller bug if zero
-    GRID_ASSERT(ld+2*depth==nld);
+    if (!refresh) {
+      GRID_ASSERT(depth<=lds[dimension]); // A must be on neighbouring node
+      GRID_ASSERT(ld+2*depth==nld);
+    } else {
+      GRID_ASSERT(depth<=(ld-2*depth));
+      Coordinate processors = this->unpadded_grid->_processors;
+      if (processors[dimension] == 1) { return; } // no exchange
+    }
     ////////////////////////////////////////////////////////////////////////////
     // Face size and byte calculations
     ////////////////////////////////////////////////////////////////////////////
@@ -493,11 +499,13 @@ public:
     RealD t;
     RealD t_tot=-usecond();
     int plane=0;
+    int lo_base = refresh ? depth       : 0;
+    int hi_base = refresh ? ld-2*depth  : ld-depth;
     for ( int d=0;d < depth ; d ++ ) {
       int tag = d*1024 + dimension*2+0;
 
       t=usecond();
-      GatherSlice(send_buf,from,d,dimension,plane*buffer_size); plane++;
+      GatherSlice(send_buf,from,lo_base+d,dimension,plane*buffer_size); plane++;
       t_gather+=usecond()-t;
 
       t=usecond();
@@ -517,7 +525,7 @@ public:
       int tag = d*1024 + dimension*2+1;
 
       t=usecond();
-      GatherSlice(send_buf,from,ld-depth+d,dimension,plane*buffer_size); plane++;
+      GatherSlice(send_buf,from,hi_base+d,dimension,plane*buffer_size); plane++;
       t_gather+= usecond() - t;
 
       t=usecond();
@@ -535,16 +543,18 @@ public:
     }
 
     ////////////////////////////////////////////////////////////////////////////
-    // Copy interior -- overlap this with comms
+    // Copy interior -- overlap this with comms (skipped for in-place refresh)
     ////////////////////////////////////////////////////////////////////////////
-    int Nd = new_grid->Nd();
-    Coordinate LL(Nd,0);
-    Coordinate sz = grid->_ldimensions;
-    Coordinate toLL(Nd,0);
-    toLL[dimension]=depth;
-    t=usecond();
-    localCopyRegion(from,to,LL,toLL,sz);
-    t_copy= usecond() - t;
+    if (!refresh) {
+      int Nd = new_grid->Nd();
+      Coordinate LL(Nd,0);
+      Coordinate sz = grid->_ldimensions;
+      Coordinate toLL(Nd,0);
+      toLL[dimension]=depth;
+      t=usecond();
+      localCopyRegion(from,to,LL,toLL,sz);
+      t_copy= usecond() - t;
+    }
     
     ////////////////////////////////////////////////////////////////////////////
     // Scatter all faces
