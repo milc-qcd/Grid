@@ -125,3 +125,5 @@ Grid/qcd/spin/gamma-gen/*.h
 Grid/qcd/spin/gamma-gen/*.cc
 Grid/util/Version.h
 tests/a2a
+.pi*
+.rpiv
