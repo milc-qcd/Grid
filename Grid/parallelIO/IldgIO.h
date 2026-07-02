@@ -620,8 +620,10 @@ class IldgWriter : public ScidacWriter {
     uint64_t PayloadSize = LFN.size();
     int err;
     createLimeRecordHeader(ILDG_DATA_LFN, 0 , 0, PayloadSize);
-    err=limeWriteRecordData(const_cast<char*>(LFN.c_str()), &PayloadSize,LimeW); GRID_ASSERT(err>=0);
-    err=limeWriterCloseRecord(LimeW); GRID_ASSERT(err>=0);
+    if ( boss_node ) {
+      err=limeWriteRecordData(const_cast<char*>(LFN.c_str()), &PayloadSize,LimeW); GRID_ASSERT(err>=0);
+      err=limeWriterCloseRecord(LimeW); GRID_ASSERT(err>=0);
+    }
   }
 
   ////////////////////////////////////////////////////////////////
