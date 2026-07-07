@@ -119,8 +119,9 @@ namespace Grid
   void TextReader::readDefault(const std::string &s, U &output)
   {
     std::string buf;
-    
+
     readDefault(s, buf);
+    std::cout << GridLogDebug << "TextReader: tag '" << s << "' = '" << buf << "'" << std::endl;
     fromString(output, buf);
   }
   

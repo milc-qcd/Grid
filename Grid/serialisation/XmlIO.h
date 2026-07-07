@@ -171,8 +171,9 @@ namespace Grid
   void XmlReader::readDefault(const std::string &s, U &output)
   {
     std::string buf;
-    
+
     readDefault(s, buf);
+    std::cout << GridLogDebug << "XmlReader: tag '" << s << "' = '" << buf << "'" << std::endl;
     fromString(output, buf);
   }
   
