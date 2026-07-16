@@ -86,13 +86,30 @@ for f in $TESTS; do
 done
 cd ..
 
-# GridMilc Make.inc
+# GridMilc Make.inc (exclude tests/ from the static archive sources)
 cd $home/GridMilc
-HFILES=`find . -type f -name '*.h'`
-CCFILES=`find . -type f -name '*.cc'`
+HFILES=`find . -type f -name '*.h' -not -path './tests/*'`
+CCFILES=`find . -type f -name '*.cc' -not -path './tests/*'`
 echo HFILES=$HFILES > Make.inc
 echo >> Make.inc
 echo CCFILES=$CCFILES >> Make.inc
+cd ..
+
+# GridMilc/tests Make.inc (EXTRA_PROGRAMS test binaries; link libGrid.a)
+cd $home/GridMilc/tests
+TESTS=`ls T*.cc 2>/dev/null`
+TESTLIST=`echo ${TESTS} | sed s/.cc//g `
+echo "tests-local: ${TESTLIST} " > Make.inc
+echo EXTRA_PROGRAMS = ${TESTLIST} >> Make.inc
+echo >> Make.inc
+for f in $TESTS; do
+    BNAME=`basename $f .cc`
+    echo ${BNAME}_SOURCES=$f >> Make.inc
+    echo ${BNAME}_LDADD='$(top_builddir)/Grid/libGrid.a' >> Make.inc
+    echo >> Make.inc
+done
+echo CLEANFILES = ${TESTLIST} >> Make.inc
+echo >> Make.inc
 cd ..
 
 # examples Make.inc

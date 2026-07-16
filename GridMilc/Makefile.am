@@ -11,6 +11,8 @@
 # subdir Makefile, letting GridMilc find Grid's headers in-tree (alongside
 # Grid's own AC_CONFIG_HEADERS default-include handling for Grid/Config.h).
 #
+SUBDIRS = . tests
+
 lib_LIBRARIES = libGridMilc.a
 
 include Make.inc

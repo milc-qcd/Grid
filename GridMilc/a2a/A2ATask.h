@@ -519,7 +519,7 @@ public:
 
       spinTaste.setSpinTaste(_gammas[mu]);
 
-      spinTaste.applyPhase(_phase[mu], temp); // store spin-taste phase
+      spinTaste.applyCoeffsAndPhase(_phase[mu], temp); // store spin-taste phase
     }
     _phase_view->openViews(_phase.data(), nGamma);
   }
@@ -776,8 +776,8 @@ public:
 
       _link_shifted[i] = Cshift(_link[i], _shift_dirs[2 * i], -1);
 
-      spinTaste.applyPhase(_link[i], _link[i]); // store spin-taste phase
-      spinTaste.applyPhase(_link_shifted[i],
+      spinTaste.applyCoeffsAndPhase(_link[i], _link[i]); // store spin-taste phase
+      spinTaste.applyCoeffsAndPhase(_link_shifted[i],
                            _link_shifted[i]); // store spin-taste phase
     }
     _link_view = std::make_shared<A2AFieldView<vColourMatrix>>();
