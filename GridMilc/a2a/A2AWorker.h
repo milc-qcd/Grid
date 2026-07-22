@@ -145,6 +145,55 @@ public:
   }
 };
 
+template <typename FImpl>
+class A2AWorkerSpinTaste : public A2AWorkerBase<FImpl> {
+public:
+  typedef typename FImpl::ComplexField ComplexField;
+  typedef typename FImpl::FermionField FermionField;
+  typedef typename FImpl::SiteSpinor vobj;
+  typedef typename vobj::scalar_type scalar_type;
+
+public:
+  A2AWorkerSpinTaste() = delete;
+  A2AWorkerSpinTaste(GridBase *grid, const std::vector<ComplexField> &mom,
+                     const std::vector<StagGamma::SpinTastePair> &gammas,
+                     LatticeGaugeField *U, int orthogDir)
+      : A2AWorkerBase<FImpl>(grid) {
+    if (mom.size()) {
+      assert(0); // momentum projection not implemented (same as Onelink)
+    }
+
+    // Uniform-popcount validation + _odd_shifts. _odd_shifts is the LIVE
+    // Even/Odd right-vector routing flag (used in StagMesonField), so the
+    // uniformity check must live HERE (where the live consumer is), not rely
+    // on the task ctor firing first. A2ATaskSpinTaste ctor also checks, but
+    // duplicating here makes the worker self-validating.
+    if (!gammas.empty()) {
+      StagGamma spinTaste;
+      spinTaste.setSpinTaste(gammas[0]);
+      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      this->_odd_shifts = (pc % 2 == 1);
+      for (int i = 1; i < (int)gammas.size(); i++) {
+        spinTaste.setSpinTaste(gammas[i]);
+        int pci = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+        if (pci != pc) {
+          std::cerr
+              << "A2AWorkerSpinTaste requires uniform popcount; gamma 0 has "
+                 "popcount "
+              << pc << " but gamma " << i << " has popcount " << pci
+              << std::endl;
+          GridAbort();
+        }
+      }
+    }
+
+    this->_task_e =
+        new A2ATaskSpinTaste<FImpl>(grid, orthogDir, gammas, U, Even);
+    this->_task_o =
+        new A2ATaskSpinTaste<FImpl>(grid, orthogDir, gammas, U, Odd);
+  }
+};
+
 template <class FImpl>
 template <typename TensorType>
 void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,

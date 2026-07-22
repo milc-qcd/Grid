@@ -727,6 +727,18 @@ public:
 
       spinTaste.setSpinTaste(_gammas[i]);
 
+      // Harden: A2ATaskOnelink is correct ONLY for popcount==1 (a single
+      // covariant hop). The original code silently truncated popcount>=2
+      // gammas to their first active direction (the break below), producing
+      // wrong results with no error. Route popcount>=2 to A2ATaskSpinTaste.
+      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      if (pc != 1) {
+        std::cerr << "A2ATaskOnelink requires popcount(spin^taste)==1, got "
+                  << pc << " for gamma " << StagGamma::GetName(_gammas[i])
+                  << "; use A2ATaskSpinTaste for popcount>=2" << std::endl;
+        GridAbort();
+      }
+
       int shift = (spinTaste._spin ^ spinTaste._taste);
       // Assume 1-link for now -- break loop when you find a shift direction
       for (int j = 0; j < StagGamma::gmu.size(); j++) {
@@ -1135,6 +1147,301 @@ public:
             int shmem_idx = rt + shmem_base + mu * gammaStride;
             coalescedWrite(shm_p[shmem_idx], sum[mu]);
           }
+        }
+      }
+    });
+  }
+};
+template <typename FImpl> class A2ATaskSpinTaste : public A2ATaskBase<FImpl> {
+public:
+  A2A_TYPEDEFS;
+
+protected:
+  std::vector<StagGamma::SpinTastePair> _gammas;
+  LatticeGaugeField *_U;
+  std::vector<FermionField> _transformed;
+  std::shared_ptr<A2AFieldView<vobj>> _transformed_view;
+
+public:
+  A2ATaskSpinTaste(GridBase *grid, int orthogDir,
+                   const std::vector<StagGamma::SpinTastePair> &gammas,
+                   LatticeGaugeField *U, int cb = Even)
+      : A2ATaskBase<FImpl>(grid, orthogDir, cb), _gammas(gammas), _U(U) {
+
+    // Validate uniform popcount. A2ATaskSpinTaste is a GENERAL primitive:
+    // applyGamma + local inner product is correct for every popcount 0-4
+    // (cross-checked against Local at pc0 and Onelink at pc1 in Test_a2a).
+    // MesonField routes pc0->Local and pc1->Onelink only as a performance
+    // optimization, NOT a correctness limit, so we do NOT abort on pc<2.
+    // The uniformity check IS required: _odd_shifts is a single per-task
+    // value derived from the (common) popcount parity, so mixed popcounts
+    // would misroute Even/Odd right vectors. NOTE: _odd_shifts is bound into
+    // COMMON_VARS (oddShifts) but is UNUSED by the SpinTaste kernels — the
+    // E/O right-vector routing is governed by the WORKER's _odd_shifts
+    // (A2AWorkerSpinTaste). It is retained here for COMMON_VARS parity and
+    // because its value is correct if a future kernel reads it.
+    if (!_gammas.empty()) {
+      StagGamma spinTaste;
+      spinTaste.setSpinTaste(_gammas[0]);
+      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      this->_odd_shifts = (pc % 2 == 1);
+      for (int i = 1; i < (int)_gammas.size(); i++) {
+        spinTaste.setSpinTaste(_gammas[i]);
+        int pci = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+        if (pci != pc) {
+          std::cerr
+              << "A2ATaskSpinTaste requires uniform popcount; gamma 0 has "
+                 "popcount "
+              << pc << " but gamma " << i << " has popcount " << pci
+              << std::endl;
+          GridAbort();
+        }
+      }
+    }
+  }
+
+  // _transformed_view is a shared_ptr; its destructor calls closeViews().
+  // No explicit destructor body needed (matches A2ATaskLocal pattern).
+
+  std::shared_ptr<A2AFieldView<vobj>> getTransformedView() {
+    return _transformed_view;
+  }
+
+  // Construction-time nGamma is authoritative for SpinTaste: the transformed
+  // view always holds exactly _gammas.size()*sizeRight entries (one block per
+  // gamma), opened in setRight. Unlike Local/Onelink (which derive nGamma
+  // from their phase/link view size), SpinTaste's view is gamma-indexed in a
+  // fixed 1:1 correspondence with _gammas, so _gammas.size() cannot diverge.
+  virtual int getNgamma() { return _gammas.size(); }
+
+  virtual double getFlops() {
+    // One inner product per (gamma, left vector, right vector, site).
+    // No per-gamma phase multiply (phase is baked into the transformed
+    // vectors by applyGamma). innerProduct = 22 double-precision ops.
+    return (22.0 * this->getNgamma());
+  }
+
+  // Pre-transform right vectors via applyGamma, storing the result in
+  // _transformed_view. The raw right vectors are kept in _right_view for
+  // COMMON_VARS geometry queries (sizeR etc.).
+  virtual void setRight(const FermionField *right, int size) {
+
+    bool checkerR = right[0].Grid()->_isCheckerBoarded;
+
+    // Contract-type logic (replicated from A2ATaskBase::setRight / Onelink)
+    if (this->_contract_type == ContractType::undef) {
+      this->_contract_type =
+          checkerR ? ContractType::RightHalf : ContractType::Full;
+    } else {
+      if (checkerR)
+        this->_contract_type =
+            this->_contract_type | ContractType::RightHalf;
+      else
+        this->_contract_type =
+            this->_contract_type & ContractType::LeftHalf;
+    }
+
+    switch (this->_contract_type) {
+    case ContractType::RightHalf:
+    case ContractType::BothHalf:
+    case ContractType::Full:
+      this->_grid = right[0].Grid();
+    default:
+      break;
+    }
+
+    if (checkerR)
+      this->generateCoorMap();
+
+    // Raw right view for COMMON_VARS (sizeR, viewR_p — unused in kernel)
+    this->_right_view = std::make_shared<A2AFieldView<vobj>>();
+    this->_right_view->openViews(right, size);
+
+    // Pre-transform: psi_{j,gamma}(x) = applyGamma(gamma, v_j)(x).
+    // applyGamma output is on right[j].Grid() (same GridBase* for Even/Odd
+    // CB) with Checkerboard() flipped for odd popcount.  When _odd_shifts
+    // is set, StagMesonField routes rhs_vj_O to the Even task; applyGamma
+    // flips it back to Even-CB, matching the left vectors.  For even
+    // popcount (_odd_shifts=false) the input is rhs_vj_E and the CB is
+    // preserved.
+    int nGamma = _gammas.size();
+    // Clear transformed vectors retained from a previous setRight call. The
+    // worker calls setRight once per j-block in production; without this,
+    // _transformed would accumulate nGamma*size dead FermionFields per call —
+    // a memory leak (applyGamma overwrites the live [0,nGamma*size) range so
+    // results are correct, but the tail grows unbounded). clear() frees the
+    // old elements while retaining capacity for reuse.
+    _transformed.clear();
+    _transformed.reserve(nGamma * size);
+    for (int i = 0; i < nGamma * size; i++)
+      _transformed.emplace_back(right[0].Grid());
+
+    // _U is required for popcount>=1 (covariant shift). Fail early with a
+    // clear message rather than dereferencing a null pointer in setGaugeField
+    // (applyGamma asserts U!=nullptr, but only when shift!=0 — too late).
+    if (_U == nullptr) {
+      std::cerr << "A2ATaskSpinTaste::setRight: null gauge field (_U)"
+                << std::endl;
+      GridAbort();
+    }
+    StagGamma spinTaste;
+    spinTaste.setGaugeField(*_U);
+    for (int mu = 0; mu < nGamma; mu++) {
+      spinTaste.setSpinTaste(_gammas[mu]);
+      for (int j = 0; j < size; j++) {
+        spinTaste.applyGamma(_transformed[mu * size + j], right[j]);
+      }
+    }
+
+    _transformed_view = std::make_shared<A2AFieldView<vobj>>();
+    _transformed_view->openViews(_transformed.data(), nGamma * size);
+  }
+
+  // Share transformed view from another task (Full right + CB left case).
+  virtual void setRight(A2ATaskBase<FImpl> &other) {
+    assert(!(other.getType() & ContractType::RightHalf));
+    this->_right_view = other.getRightView();
+    _transformed_view =
+        dynamic_cast<A2ATaskSpinTaste<FImpl> &>(other).getTransformedView();
+    this->_contract_type = other.getType();
+  }
+
+  // ---- Local inner-product kernels (no phase; phase is baked in) ----
+  // NOTE: temp_site depends on gamma because viewT_p[r_gamma] changes per
+  // gamma (the transformed right vector is gamma-specific). This is NOT the
+  // same as A2ATaskLocal where the right vector is shared and only the phase
+  // varies — here the inner product MUST be recomputed per gamma.
+
+  virtual void vectorSumHalf(cobj *shm_p, int mu_offset, int N) {
+
+    COMMON_VARS;
+
+    FermView *viewT_p = this->_transformed_view->getView();
+
+    assert(orthogDir == Tdir);
+    assert(nBlocks == 1);
+
+    int gammaStride = sizeR * sizeL * reducedOrthogDimSize;
+    int nGamma = N;
+
+    accelerator_for2d(l_index, sizeL, r_index, sizeR, simdSize, {
+      int ss, shmem_base = reducedOrthogDimSize * (l_index + sizeL * r_index);
+      calcScalar temp_site, sum[MF_SUM_ARRAY_MAX];
+
+      for (int rt = 0; rt < reducedOrthogDimSize; rt++) {
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          sum[mu] = Zero();
+        }
+
+        for (int so = 0; so < localSpatialVolume; so++) {
+          ss = rt * localSpatialVolume + so;
+
+          for (int mu = 0; mu < nGamma; mu++) {
+            int r_gamma = (mu_offset + mu) * sizeR + r_index;
+            temp_site = innerProduct(
+                coalescedRead(viewL_p[l_index][ss]),
+                coalescedRead(viewT_p[r_gamma][ss]));
+            sum[mu] += temp_site;
+          }
+        }
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          int shmem_idx = rt + shmem_base + mu * gammaStride;
+          coalescedWrite(shm_p[shmem_idx], sum[mu]);
+        }
+      }
+    });
+  }
+
+  virtual void vectorSumFull(cobj *shm_p, int mu_offset, int N) {
+
+    COMMON_VARS;
+
+    FermView *viewT_p = this->_transformed_view->getView();
+
+    assert(orthogDir == Tdir);
+    assert(nBlocks == 1);
+
+    int gammaStride = sizeR * sizeL * reducedOrthogDimSize;
+    int nGamma = N;
+
+    accelerator_for2d(l_index, sizeL, r_index, sizeR, simdSize, {
+      int ss, shmem_base = reducedOrthogDimSize * (l_index + sizeL * r_index);
+      calcScalar temp_site, sum[MF_SUM_ARRAY_MAX];
+
+      for (int rt = 0; rt < reducedOrthogDimSize; rt++) {
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          sum[mu] = Zero();
+        }
+
+        for (int so = 0; so < localSpatialVolume; so++) {
+          ss = rt * localSpatialVolume + so;
+
+          for (int mu = 0; mu < nGamma; mu++) {
+            int r_gamma = (mu_offset + mu) * sizeR + r_index;
+            temp_site = innerProduct(
+                coalescedRead(viewL_p[l_index][ss]),
+                coalescedRead(viewT_p[r_gamma][ss]));
+            sum[mu] += temp_site;
+          }
+        }
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          int shmem_idx = rt + shmem_base + mu * gammaStride;
+          coalescedWrite(shm_p[shmem_idx], sum[mu]);
+        }
+      }
+    });
+  }
+
+  virtual void vectorSumMixed(cobj *shm_p, int mu_offset, int N) {
+
+    COMMON_VARS;
+
+    FermView *viewT_p = this->_transformed_view->getView();
+
+    assert(orthogDir == Tdir);
+    assert(nBlocks == 1);
+
+    int gammaStride = sizeR * sizeL * reducedOrthogDimSize;
+    int nGamma = N;
+
+    bool checkerL = this->_contract_type == ContractType::LeftHalf;
+
+    accelerator_for2d(l_index, sizeL, r_index, sizeR, simdSize, {
+      int ss, shmem_base = reducedOrthogDimSize * (l_index + sizeL * r_index);
+      calcScalar temp_site, sum[MF_SUM_ARRAY_MAX];
+
+      for (int rt = 0; rt < reducedOrthogDimSize; rt++) {
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          sum[mu] = Zero();
+        }
+
+        for (int so = 0; so < localSpatialVolume; so++) {
+          ss = rt * localSpatialVolume + so;
+
+          for (int mu = 0; mu < nGamma; mu++) {
+            int r_gamma = (mu_offset + mu) * sizeR + r_index;
+            if (checkerL) {
+              temp_site = innerProduct(
+                  coalescedRead(viewL_p[l_index][ss]),
+                  coalescedRead(viewT_p[r_gamma][ocoor_p[ss]]));
+            } else {
+              temp_site = innerProduct(
+                  coalescedRead(viewL_p[l_index][ocoor_p[ss]]),
+                  coalescedRead(viewT_p[r_gamma][ss]));
+            }
+            acceleratorSynchronise();
+            sum[mu] += temp_site;
+          }
+        }
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          int shmem_idx = rt + shmem_base + mu * gammaStride;
+          coalescedWrite(shm_p[shmem_idx], sum[mu]);
         }
       }
     });

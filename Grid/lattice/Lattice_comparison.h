@@ -50,6 +50,7 @@ template<class vfunctor,class lobj,class robj>
 inline Lattice<vPredicate> LLComparison(vfunctor op,const Lattice<lobj> &lhs,const Lattice<robj> &rhs)
 {
   Lattice<vPredicate> ret(rhs.Grid());
+  ret.Checkerboard() = rhs.Checkerboard();
   autoView( lhs_v, lhs, CpuRead);
   autoView( rhs_v, rhs, CpuRead);
   autoView( ret_v, ret, CpuWrite);
@@ -65,6 +66,7 @@ template<class vfunctor,class lobj,class robj>
 inline Lattice<vPredicate> LSComparison(vfunctor op,const Lattice<lobj> &lhs,const robj &rhs)
 {
   Lattice<vPredicate> ret(lhs.Grid());
+  ret.Checkerboard() = lhs.Checkerboard();
   autoView( lhs_v, lhs, CpuRead);
   autoView( ret_v, ret, CpuWrite);
   thread_for( ss, lhs_v.size(), {
@@ -79,6 +81,7 @@ template<class vfunctor,class lobj,class robj>
 inline Lattice<vPredicate> SLComparison(vfunctor op,const lobj &lhs,const Lattice<robj> &rhs)
 {
   Lattice<vPredicate> ret(rhs.Grid());
+  ret.Checkerboard() = rhs.Checkerboard();
   autoView( rhs_v, rhs, CpuRead);
   autoView( ret_v, ret, CpuWrite);
   thread_for( ss, rhs_v.size(), {

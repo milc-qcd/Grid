@@ -182,6 +182,21 @@ public:
       StagGamma::StagAlgebra::GZ,
       StagGamma::StagAlgebra::GT,
   }};
+  // Number of active covariant-shift directions for a spin-taste pair: the
+  // popcount of (spin ^ taste), scanned in gmu[] (X,Y,Z,T) order. Mirrors the
+  // local computation in calculatePhase. Used by A2A task popcount
+  // validation/gating (A2ATaskOnelink hardening, A2ATaskSpinTaste uniformity).
+  static int popcountShift(StagAlgebra spin, StagAlgebra taste) {
+    int shift = spin ^ taste;
+    int n = 0;
+    for (const auto &dir : gmu) {
+      if (static_cast<int>(dir) & shift) {
+        n++;
+      }
+    }
+    return n;
+  }
+
   friend inline StagGamma operator*(const StagGamma &g1, const StagGamma &g2);
 
 public:
@@ -396,11 +411,7 @@ inline void StagGamma::calculateNegation() {
   //     basis and appears only because Grid defers the phase.
   //     n=2 -> -1, n=3 -> -1, n=4 -> +1  (n=0,1 -> +1, so this sign is inert
   //     for local and one-link operators).
-  int n = 0;
-  int shift = _spin ^ _taste;
-  for (const auto &dir : gmu) {
-    if (static_cast<int>(dir) & shift) n++;
-  }
+  int n = popcountShift(_spin, _taste);
   int cross = n * (n - 1) / 2;
   if (cross & 1) toggleNegation();
 }
@@ -414,13 +425,7 @@ inline void StagGamma::calculatePhase() {
   // Scale down by (1/2) for each direction in the symmetric shift
   // (_spin ^ _taste): one symmetric hop per set bit. popcount 0->1.0,
   // 1->0.5, 2->0.25, 3->0.125, 4->0.0625.
-  int shift = _spin ^ _taste;
-  int nShift = 0;
-  for (const auto &dir : gmu) {
-    if (static_cast<int>(dir) & shift) {
-      nShift++;
-    }
-  }
+  int nShift = popcountShift(_spin, _taste);
   _scaling = 1.0;
   for (int i = 0; i < nShift; i++) {
     _scaling *= 0.5; // (1/2) per symmetric hop direction
@@ -459,16 +464,36 @@ void StagGamma::applyCoeffsAndPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) 
   Lattice<iScalar<vInteger>> coor(grid), stag_dirs(grid);
   iScalar<vInteger> one = 1;
 
+  // Propagate rhs's checkerboard to the internal temporaries so the where()
+  // expression below is CB-conformant on red-black grids. Fresh lattices
+  // default to checkerboard=Even, which mismatches an Odd rhs and trips the
+  // expression-template CB-conformance assert (Lattice_ET.h). The assignments
+  // below (stag_dirs = Zero()/one and the += coor loop) reset the checkerboard,
+  // so we (re)apply cb immediately before every expression that uses these
+  // temporaries. No-op on full grids (cb stays Even, the where() CB check does
+  // not fire). Required for the A2A CB-grid pre-transform path (Strategy C):
+  // applyGamma is called on both Even and Odd right vectors.
+  int cb = Even;
+  if (grid->_isCheckerBoarded) {
+    cb = rhs.Checkerboard();
+  }
+
   if (_negated) {
     stag_dirs = one;
   } else {
     stag_dirs = Zero();
+  }
+  if (grid->_isCheckerBoarded) {
+    stag_dirs.Checkerboard() = cb;
   }
 
   for (int dir = 0; dir < gmu.size(); dir++) {
     if (gmu[dir] & _oscillateDirs) { // gmu[dir] maps Grid XYZT convention to
                                      // binary flags
       LatticeCoordinate(coor, dir);
+      if (grid->_isCheckerBoarded) {
+        coor.Checkerboard() = cb;
+      }
       stag_dirs += coor;
     }
   }
@@ -478,6 +503,9 @@ void StagGamma::applyCoeffsAndPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) 
   // times the _scaling amplitude (1/2)^n / n!. Applied to a symmetric-shift
   // chain (here) or a raw forward+backward link sum (A2ATaskOnelink), it yields
   // the correctly normalized operator -- the 1/2 averaging the F+B sum.
+  if (grid->_isCheckerBoarded) {
+    stag_dirs.Checkerboard() = cb; // += coor above may have reset it
+  }
   temp = where(mod(stag_dirs, 2) == 0, _scaling * rhs, -_scaling * rhs);
 
   lhs = std::move(temp);
