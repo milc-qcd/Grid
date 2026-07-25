@@ -1,0 +1,206 @@
+/******************************************************************************/
+/* StencilGather5d.h -- 5D padded gather + 4D->5D field promotion.             */
+/* Uses simd_layout={1,1,1,1,Nsimd} so spatial dims have simd=1 -- no lane    */
+/* scattering. The gather is a simple per-site offset into the padded grid.   */
+/* Part of GridMilc (https://github.com/paboyle/Grid).                       */
+/******************************************************************************/
+#pragma once
+// GridCore (not GridQCDcore): this header is generic over vobj -- it names no
+// QCD types, so all QCD instantiation (LatticeFermion, vColourMatrix, ...) is
+// the caller's job (A2ATask.h, the test). Matches A2AView.h's include style.
+// PaddedCell is pulled transitively via GridCore.h -> Lattice.h.
+#include <Grid/GridCore.h>
+#include <GridMilc/a2a/A2AView.h>
+
+NAMESPACE_BEGIN(Grid);
+
+///////////////////////////////////////////////////////////////////////////////
+// createGrid5d: creates a 5D GridCartesian from a 4D one.
+// Dim 4 = Nsimd (RHS vector batching), simd_layout = {1,1,1,1,Nsimd}.
+// Spatial procs inherited from 4D; procs[4] = 1 (no MPI split in vector dim).
+///////////////////////////////////////////////////////////////////////////////
+inline GridCartesian *createGrid5d(GridCartesian *grid4d) {
+  Coordinate gdim4d = grid4d->_fdimensions;
+  Coordinate procs4d = grid4d->_processors;
+  int Nsimd = grid4d->Nsimd();
+
+  Coordinate gdim5d(std::vector<int>(
+      {gdim4d[0], gdim4d[1], gdim4d[2], gdim4d[3], Nsimd}));
+  Coordinate simd5d(std::vector<int>({1, 1, 1, 1, Nsimd}));
+  Coordinate procs5d(std::vector<int>(
+      {procs4d[0], procs4d[1], procs4d[2], procs4d[3], 1}));
+
+  return new GridCartesian(gdim5d, simd5d, procs5d);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// buildPaddedOffset5d: per-(endpoint, original oSite) padded-grid oSite.
+// Because every spatial dim has simd=1, the offset is a genuine per-site
+// scalar (no lane term). For procs[d]>1 dims, the interior sits at
+// ocoor+depth; for single-rank dims the periodic wrap is folded in directly.
+// Returns host std::vector<int> indexed as offset[ep * osites + ss]; callers
+// stage a device copy only if needed (the task constructor uploads once).
+///////////////////////////////////////////////////////////////////////////////
+inline std::vector<int>
+buildPaddedOffset5d(GridCartesian *grid5d, GridCartesian *paddedGrid5d,
+                    int depth, const std::vector<Coordinate> &endpoints) {
+  static constexpr int Nd = 4;
+  int osites = grid5d->oSites();
+  int nEp = (int)endpoints.size();
+
+  Coordinate ldim = grid5d->_ldimensions;
+  Coordinate procs = grid5d->_processors;
+
+  std::vector<int> hostOffset(nEp * osites);
+
+  for (int ep = 0; ep < nEp; ep++) {
+    const Coordinate &shift = endpoints[ep];
+    for (int ss = 0; ss < osites; ss++) {
+      Coordinate ocoor(grid5d->Nd());
+      grid5d->oCoorFromOindex(ocoor, ss);
+
+      Coordinate paddedOcoor(grid5d->Nd());
+      for (int d = 0; d < Nd; d++) {
+        int shifted = ocoor[d] + shift[d];
+        if (procs[d] > 1) {
+          paddedOcoor[d] = shifted + depth; // interior offset by depth
+        } else {
+          int L = ldim[d];
+          paddedOcoor[d] = ((shifted % L) + L) % L; // periodic wrap
+        }
+      }
+      paddedOcoor[Nd] = 0; // dim 4 (vector) is never shifted
+      hostOffset[ep * osites + ss] = paddedGrid5d->oIndexReduced(paddedOcoor);
+    }
+  }
+
+  return hostOffset;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// gatherViaOffset5d: TEST ONLY -- gathers a shifted field from the 5D padded
+// grid using the per-site offset. Validates the offset against Cshift.
+// Each dim-5 lane (RHS vector) is shifted by the same spatial offset.
+///////////////////////////////////////////////////////////////////////////////
+template <typename vobj>
+inline void gatherViaOffset5d(Lattice<vobj> &result,
+                              const Lattice<vobj> &padded5d,
+                              const deviceVector<int> &offset, int ep,
+                              int osites) {
+  autoView(result_v, result, AcceleratorWrite);
+  autoView(padded_v, padded5d, AcceleratorRead);
+  auto offset_p = offset.data();
+  int Nsimd = result.Grid()->Nsimd();
+
+  accelerator_for(ss, osites, Nsimd, {
+    int paddedSS = offset_p[ep * osites + ss];
+    coalescedWrite(result_v[ss], coalescedRead(padded_v[paddedSS]));
+  });
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// src4dIndex: maps a 5D spatial oSite (physical local coord phys[0..3]) to the
+// (oSite, lane) of the originating 4D SIMD field, using the 4D grid's
+// interleaved decomposition (phys[d] = ocoor[d] + rdim[d]*icoor[d]).
+// Shared by packRhs5d and promoteField5d.
+///////////////////////////////////////////////////////////////////////////////
+accelerator_inline void src4dIndex(int &srcOSite, int &srcLane,
+                       const Coordinate &phys, const Coordinate &rdim,
+                       const Coordinate &ostride, const Coordinate &istride) {
+  static constexpr int Nd = 4;
+  srcOSite = 0;
+  srcLane = 0;
+  for (int d = 0; d < Nd; d++) {
+    srcOSite += ostride[d] * (phys[d] % rdim[d]);
+    srcLane += istride[d] * (phys[d] / rdim[d]);
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// packRhs5d: pack nVec 4D Lattice<vobj> RHS vectors into ONE 5D Lattice<vobj>,
+// each vector occupying a distinct dim-5 lane (lane == vector index).
+// Lanes >= nVec are left untouched (caller Zero-fills rhs5d first).
+// Uses the portable per-lane pattern (#ifdef GRID_SIMT) since each lane reads
+// a DIFFERENT source vector (setup-time, not the fused kernel).
+///////////////////////////////////////////////////////////////////////////////
+template <typename vobj>
+inline void packRhs5d(Lattice<vobj> &rhs5d, const Lattice<vobj> *rhs4d, int nVec,
+                      GridBase *grid4d, GridCartesian *grid5d) {
+  Coordinate rdim = grid4d->_rdimensions;
+  Coordinate ostride = grid4d->_ostride;
+  Coordinate istride = grid4d->_istride;
+  int Nsimd = grid4d->Nsimd();
+  int dstOsites = grid5d->oSites();
+  // 5D geometry for in-kernel coord decode: oCoorFromOindex()/Nd() are host-
+  // only (not accelerator_inline), so call accelerator_inline
+  // Lexicographic::CoorFromIndex directly with the captured 5D _rdimensions
+  // (same pattern as PaddedCell::GatherSlice).
+  Coordinate rdim5d = grid5d->_rdimensions;
+  int nd5d = grid5d->Nd();
+
+  A2AFieldView<vobj> srcView;
+  srcView.openViews(rhs4d, nVec);
+  auto srcView_p = srcView.getView();
+
+  autoView(dst_v, rhs5d, AcceleratorWrite);
+
+  accelerator_for(ss, dstOsites, Nsimd, {
+    Coordinate phys(nd5d);
+    Lexicographic::CoorFromIndex(phys, ss, rdim5d); // phys[0..3] spatial, phys[4]=0
+#ifdef GRID_SIMT
+    {
+      int lane = acceleratorSIMTlane(Nsimd);
+#else
+    for (int lane = 0; lane < Nsimd; lane++) {
+#endif
+      if (lane < nVec) {
+        int srcOSite, srcLane;
+        src4dIndex(srcOSite, srcLane, phys, rdim, ostride, istride);
+        auto scalar = extractLane(srcLane, srcView_p[lane][srcOSite]);
+        insertLane(lane, dst_v[ss], scalar);
+      }
+#ifdef GRID_SIMT
+    }
+#else
+    }
+#endif
+  });
+
+  srcView.closeViews();
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// promoteField5d: promote a 4D Lattice<vobj> (SIMD over spatial) to a 5D
+// Lattice<vobj> (simd_layout={1,1,1,1,Nsimd}) with the scalar value REPLICATED
+// across all Nsimd dim-5 lanes. Used for the gauge field U, LHS L, and W_s:
+// these do not vary by RHS, so every lane holds the same value (broadcast).
+///////////////////////////////////////////////////////////////////////////////
+template <typename vobj>
+inline void promoteField5d(Lattice<vobj> &dst5d, const Lattice<vobj> &src4d,
+                           GridBase *grid4d, GridCartesian *grid5d) {
+  Coordinate rdim = grid4d->_rdimensions;
+  Coordinate ostride = grid4d->_ostride;
+  Coordinate istride = grid4d->_istride;
+  int Nsimd = grid4d->Nsimd();
+  int dstOsites = grid5d->oSites();
+  Coordinate rdim5d = grid5d->_rdimensions; // 5D geometry for in-kernel coord decode
+  int nd5d = grid5d->Nd();
+
+  autoView(src_v, src4d, AcceleratorRead);
+  autoView(dst_v, dst5d, AcceleratorWrite);
+
+  accelerator_for(ss, dstOsites, 1, {
+    Coordinate phys(nd5d);
+    Lexicographic::CoorFromIndex(phys, ss, rdim5d);
+    int srcOSite, srcLane;
+    src4dIndex(srcOSite, srcLane, phys, rdim, ostride, istride);
+    // Extract the scalar once, replicate into all Nsimd lanes.
+    auto scalar = extractLane(srcLane, src_v[srcOSite]);
+    vobj val;
+    for (int lane = 0; lane < Nsimd; lane++)
+      insertLane(lane, val, scalar);
+    dst_v[ss] = val;
+  });
+}
+
+NAMESPACE_END(Grid);

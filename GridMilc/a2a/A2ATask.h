@@ -14,6 +14,7 @@
 #include <Grid/GridQCDcore.h>
 #include <GridMilc/a2a/A2AView.h>
 #include <GridMilc/spin/StagGamma.h>
+#include <GridMilc/a2a/StencilGather5d.h>
 
 #ifndef MF_SUM_ARRAY_MAX
 #define MF_SUM_ARRAY_MAX 16
@@ -1447,6 +1448,467 @@ public:
     });
   }
 };
+///////////////////////////////////////////////////////////////////////////////
+// spinTasteEndpoints: enumerate the 2^nActive sign-combination endpoints for a
+// spin-taste (the lattice displacements s_ep whose covariant transports W_s the
+// gauge chain builds). Pure host-side combinatorics; cheap. Each endpoint is
+// one of the 2^popcount(spin^taste) +/-1 sign combos over the active directions
+// (gmu[] order, X/Y/Z/T).
+///////////////////////////////////////////////////////////////////////////////
+// NOTE: these helpers are NOT templated on FImpl (they work with global
+// colour-matrix types only), so they do NOT invoke A2A_TYPEDEFS. They sit
+// inside the A2A_TYPEDEFS macro's textual scope without expanding it.
+inline std::vector<Coordinate>
+spinTasteEndpoints(const StagGamma &spinTaste) {
+  int shift = spinTaste._spin ^ spinTaste._taste;
+  std::array<int, 4> dirs;
+  int nActive = 0;
+  for (int j = 0; j < 4; j++)
+    if (static_cast<int>(StagGamma::gmu[j]) & shift)
+      dirs[nActive++] = j;
+
+  std::vector<Coordinate> endpoints;
+  for (int signs = 0; signs < (1 << nActive); signs++) {
+    Coordinate s(4, 0);
+    for (int i = 0; i < nActive; i++)
+      s[dirs[i]] = (signs & (1 << i)) ? +1 : -1;
+    endpoints.push_back(s);
+  }
+  return endpoints;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// spinTasteGaugeChain: build W_s (symmetric gauge transporter + Follana phase)
+// for a single spin-taste on the 5D grid and RETURN the 2^nActive endpoint
+// transporters.
+//
+// W_s[ep](x) = phase(x) * scaling * Sum_over_orderings U-path(x -> x+s_ep),
+// reproducing StagGamma::applyGamma's internal covariant structure. The chain
+// is built ENTIRELY in 4D (U does not depend on RHS, so there is no need to
+// replicate it across dim-5 during construction) and promoted to 5D only once
+// per endpoint at the end. The Follana phase/scaling is applied in 4D via
+// applyCoeffsAndPhase (grid-agnostic, local).
+//
+// Self-contained: calls spinTasteEndpoints for the sign combos (the endpoint
+// enumeration logic lives in one place). The task move-merges the returned W_s
+// into its flattened _wsFlat — no deep copy (each Lattice is moved, a pointer
+// swap). const U: the build only reads U (PeekIndex per Lorentz component);
+// Phase 3 passes a non-const LatticeGaugeField* which binds to this const*
+// param without issue.
+///////////////////////////////////////////////////////////////////////////////
+inline std::vector<LatticeColourMatrix>
+spinTasteGaugeChain(const LatticeGaugeField *U, const StagGamma &spinTaste,
+                    GridCartesian *grid5d, GridCartesian *grid4d) {
+  static constexpr int Nd = 4;
+
+  std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
+  int nEndpoints = (int)endpoints.size();
+
+  // Active directions (recomputed; cheap) for the permutation ordering. The
+  // endpoint enumeration above derived the same dirs/nActive; recomputing here
+  // keeps the two helpers independent and costs only a 4-iteration host loop.
+  int shift = spinTaste._spin ^ spinTaste._taste;
+  std::array<int, 4> dirs;
+  int nActive = 0;
+  for (int j = 0; j < 4; j++)
+    if (static_cast<int>(StagGamma::gmu[j]) & shift)
+      dirs[nActive++] = j;
+
+  // Per-direction gauge links in 4D — peeked directly from *U (matches
+  // A2ATaskOnelink's PeekIndex<LorentzIndex>(*_U, ...) pattern). W_s is a pure
+  // gauge transporter (RHS-independent), so the covariant chain is built
+  // ENTIRELY in 4D and promoted to 5D only once per endpoint at the end.
+  // Building in 4D avoids Nsimd-fold replicated work/memory during the
+  // 2^nActive x nActive! Cshift chain construction (the dominant setup cost).
+  // The hops use the literal CovShiftForward/Backward forms
+  // (Grid/qcd/utils/CovariantCshift.h): each carries exactly one halo Cshift,
+  // inherent to the covariant chain — so no pre-shifted adjoint copy is hoisted
+  // (hoisting it would not reduce the halo count, only obscure the asymmetry).
+  std::vector<LatticeColourMatrix> Udir4d;
+  Udir4d.reserve(Nd);
+  for (int mu = 0; mu < Nd; mu++) {
+    Udir4d.emplace_back(grid4d);
+    Udir4d[mu] = PeekIndex<LorentzIndex>(*U, mu);
+  }
+
+  // Single 4D accumulator (reused per endpoint) + 4D chain scratch. Lattice has
+  // no default ctor (requires a GridBase*), so they are constructed on grid4d.
+  LatticeColourMatrix accumChain(grid4d), chain(grid4d);
+  std::array<int, 4> perm;
+
+  StagGamma st;
+  st.setSpinTaste(spinTaste._spin, spinTaste._taste);
+
+  std::vector<LatticeColourMatrix> Ws;
+  Ws.reserve(nEndpoints);
+  for (int ep = 0; ep < nEndpoints; ep++) {
+    const Coordinate &s = endpoints[ep];
+
+    // Symmetrized sum over all nActive! orderings (matches applyGamma) in 4D.
+    // This is a one-time setup cost amortized across all (l,r) contractions.
+    // A future optimization (design Future Optimization F2, v3.3b refinement)
+    // is to NOT materialize W_s at all: pad the gauge field U and apply the
+    // chain on-the-fly per site in the kernel, removing this 2^nActive x
+    // nActive! Cshift materialization cost entirely.
+    accumChain = Zero();
+    for (int i = 0; i < nActive; i++)
+      perm[i] = i;
+    do {
+      chain = 1.0;
+      for (int i = 0; i < nActive; i++) {
+        int dir = dirs[perm[i]];
+        int sign = s[dir];
+        if (sign > 0) {
+          // CovShiftForward: Out(x) = U(x) * chain(x+dir) = U * Cshift(chain,+1)
+          chain = Udir4d[dir] * Cshift(chain, dir, +1);
+        } else {
+          // CovShiftBackward: Out(x) = adj(U)(x-dir) * chain(x-dir)
+          //                        = Cshift( adj(U) * chain, -1 )
+          chain = Cshift(adj(Udir4d[dir]) * chain, dir, -1);
+        }
+      }
+      accumChain = accumChain + chain;
+    } while (std::next_permutation(perm.begin(), perm.begin() + nActive));
+
+    // Apply Follana phase + (1/2)^n / n! scaling in 4D — applyCoeffsAndPhase is
+    // local and grid-agnostic, so the S3 spatial-only caveat is moot here
+    // (there is no dim-5 yet). Then promote the finished W_s to 5D (replicated
+    // dim-5) once per endpoint. (applyCoeffsAndPhase is in-place safe: it reads
+    // rhs into a temp before overwriting lhs.)
+    st.applyCoeffsAndPhase(accumChain, accumChain);
+    Ws.emplace_back(grid5d);
+    promoteField5d(Ws[ep], accumChain, grid4d, grid5d);
+  }
+  return Ws;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// A2ATaskSpinTasteStencil: 5D stencil-based spin-taste meson-field task.
+//
+// SIMD lanes (dim-5) = RHS vectors (batched Nsimd at a time). Spatial dims are
+// simd=1, so gathers are trivial per-site offsets. L/W live on the 5D grid
+// (replicated dim-5); ψ is padded once via PaddedCell::Exchange.
+//
+// Because dim-5 is the only SIMD-split dimension, the inherited simdSumFull
+// (which reduces over time-SIMD lanes) is WRONG here; execute() is overridden
+// to assemble the output mat directly.
+///////////////////////////////////////////////////////////////////////////////
+template <typename FImpl>
+class A2ATaskSpinTasteStencil : public A2ATaskBase<FImpl> {
+public:
+  A2A_TYPEDEFS;
+
+protected:
+  std::vector<StagGamma::SpinTastePair> _gammas;
+  LatticeGaugeField *_U;
+  GridCartesian *_fullGrid; // 4D full grid (E/O joined)
+  GridCartesian *_grid5d;   // 5D grid (simd={1,1,1,1,Nsimd})
+
+  std::unique_ptr<PaddedCell> _cell5d;
+  GridCartesian *_paddedGrid5d;
+
+  // Flattened W_s on the 5D grid + its A2AFieldView (device-safe array).
+  // Assembled by move-merging each gamma's spinTasteGaugeChain result (no deep
+  // copy); no per-gamma chain object is retained.
+  std::vector<LatticeColourMatrix> _wsFlat;
+  std::shared_ptr<A2AFieldView<vColourMatrix>> _wsView;
+
+  // Flattened per-(gamma,ep,osite) padded offset (deviceVector).
+  deviceVector<int> _allOffsets;
+  deviceVector<int> _nEpDev;    // nEndpoints per gamma
+  deviceVector<int> _epStartDev;// cumulative global endpoint start per gamma
+  int _nEpTotal;
+  int _osites; // 5D spatial oSites (== grid5d oSites)
+
+  // LHS promoted to 5D + view.
+  std::vector<Lattice<vobj>> _lhs5d;
+  std::shared_ptr<A2AFieldView<vobj>> _lhsView;
+  int _sizeL;
+
+  // Padded RHS 5D batches + view.
+  std::vector<Lattice<vobj>> _paddedRight5d;
+  std::shared_ptr<A2AFieldView<vobj>> _paddedRhsView;
+  int _sizeR;
+  int _nBatches;
+  int _Nsimd;
+
+public:
+  A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
+                          const std::vector<StagGamma::SpinTastePair> &gammas,
+                          LatticeGaugeField *U, int cb = Even)
+      : A2ATaskBase<FImpl>(fullGrid, orthogDir, cb),
+        _gammas(gammas), _U(U), _fullGrid(fullGrid) {
+
+    _grid5d = createGrid5d(fullGrid);
+    _Nsimd = fullGrid->Nsimd();
+    _osites = _grid5d->oSites();
+
+    _cell5d = std::make_unique<PaddedCell>(1, _grid5d);
+    _paddedGrid5d = _cell5d->grids.back();
+
+    // Build W_s + offsets per gamma. spinTasteGaugeChain returns each gamma's
+    // W_s, which are move-merged into wsFlatHost (no deep copy) — wsFlatHost
+    // becomes the authoritative _wsFlat. spinTasteEndpoints gives the endpoint
+    // list used both for nEndpoints and buildPaddedOffset5d.
+    std::vector<LatticeColourMatrix> wsFlatHost;
+    std::vector<int> allOffsetsHost;
+    std::vector<int> nEpHost, epStartHost;
+    _nEpTotal = 0;
+    int epCum = 0;
+    StagGamma spinTaste;
+
+    for (int g = 0; g < (int)gammas.size(); g++) {
+      spinTaste.setSpinTaste(gammas[g]);
+
+      // Two pure helpers: enumerate this gamma's endpoints, build its W_s.
+      std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
+      std::vector<LatticeColourMatrix> ws =
+          spinTasteGaugeChain(U, spinTaste, _grid5d, fullGrid);
+
+      nEpHost.push_back((int)endpoints.size());
+      epStartHost.push_back(epCum);
+
+      // Flatten this gamma's offsets into the global host table. buildPaddedOffset5d
+      // returns a host std::vector<int> directly (no device round-trip); the
+      // single upload into _allOffsets happens once, after the loop (S1).
+      std::vector<int> epOffsets =
+          buildPaddedOffset5d(_grid5d, _paddedGrid5d, 1, endpoints);
+      allOffsetsHost.insert(allOffsetsHost.end(),
+                            epOffsets.begin(), epOffsets.end());
+
+      // Move-merge this gamma's W_s into the flat store (no deep copy: each
+      // Lattice is moved, a pointer swap). wsFlatHost -> _wsFlat below.
+      wsFlatHost.insert(wsFlatHost.end(),
+                        std::make_move_iterator(ws.begin()),
+                        std::make_move_iterator(ws.end()));
+
+      epCum += (int)endpoints.size();
+      _nEpTotal += (int)endpoints.size();
+    }
+
+    // wsFlatHost is the authoritative W_s store (built in place above); move it
+    // into the member and open its view.
+    _wsFlat = std::move(wsFlatHost);
+    _wsView = std::make_shared<A2AFieldView<vColourMatrix>>();
+    _wsView->openViews(_wsFlat.data(), _nEpTotal);
+
+    // Upload bookkeeping deviceVectors.
+    // acceleratorCopyToDevice requires 8-byte-aligned byte counts
+    // (thread_bcopy assert). Pad to next even element count.
+    auto upload = [](const std::vector<int> &h) {
+      size_t nPad = ((h.size() + 1) / 2) * 2;
+      std::vector<int> tmp(nPad, 0);
+      std::copy(h.begin(), h.end(), tmp.begin());
+      deviceVector<int> d(nPad);
+      acceleratorCopyToDevice((void*)tmp.data(), (void*)d.data(), nPad * sizeof(int));
+      return d;
+    };
+    _allOffsets = upload(allOffsetsHost);
+    _nEpDev = upload(nEpHost);
+    _epStartDev = upload(epStartHost);
+  }
+
+  // Reset _cell5d BEFORE deleting _grid5d: PaddedCell::~PaddedCell -> DeleteGrids
+  // reads unpadded_grid (= _grid5d) members, so _grid5d must still be alive while
+  // the cell is destroyed (else use-after-free).
+  virtual ~A2ATaskSpinTasteStencil() {
+    _cell5d.reset();
+    delete _grid5d;
+  }
+
+  virtual int getNgamma() { return (int)_gammas.size(); }
+  virtual double getFlops() { return 22.0 * _nEpTotal; }
+  // The worker reads the 4D full grid (to size full-grid input temporaries);
+  // _fullGrid is protected, so expose it (B2).
+  virtual GridCartesian *getFullGrid() const { return _fullGrid; }
+
+  // setLeft: promote each full-grid LHS vector directly to the 5D grid
+  // (replicated dim-5). Does NOT call A2ATaskBase::setLeft — that opens
+  // _left_view on the input and toggles _contract_type/_grid, none of which the
+  // custom 5D execute() uses (it indexes _lhs5d/_lhsView instead), and avoids
+  // the dangling-_left_view lifecycle hazard. grid4d is GridBase* (left[0].Grid())
+  // — promoteField5d reads only GridBase-accessible members (B4/C1).
+  virtual void setLeft(const FermionField *left, int size) {
+    _sizeL = size;
+    GridBase *grid4d = left[0].Grid();
+    _lhs5d.clear(); _lhs5d.reserve(size);
+    for (int l = 0; l < size; l++) {
+      _lhs5d.emplace_back(_grid5d);
+      promoteField5d(_lhs5d.back(), left[l], grid4d, _grid5d);
+    }
+    _lhsView = std::make_shared<A2AFieldView<vobj>>();
+    _lhsView->openViews(_lhs5d.data(), size);
+  }
+
+  // setRight: pack full-grid RHS into Nsimd-sized 5D batches, pad via Exchange.
+  // As with setLeft, does not call the base (B5/C1: grid4d is GridBase*).
+  virtual void setRight(const FermionField *right, int size) {
+    _sizeR = size;
+    _nBatches = (size + _Nsimd - 1) / _Nsimd;
+
+    _paddedRight5d.clear(); _paddedRight5d.reserve(_nBatches);
+    GridBase *grid4d = right[0].Grid();
+    for (int b = 0; b < _nBatches; b++) {
+      int nVec = std::min(_Nsimd, size - b * _Nsimd);
+      Lattice<vobj> rhs5d(_grid5d);
+      rhs5d = Zero(); // zero unused lanes of the (possible) partial last batch
+      packRhs5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d);
+      _paddedRight5d.emplace_back(_cell5d->Exchange(rhs5d));
+    }
+    _paddedRhsView = std::make_shared<A2AFieldView<vobj>>();
+    _paddedRhsView->openViews(_paddedRight5d.data(), _nBatches);
+  }
+
+  //....................................................................
+  // execute (OVERRIDE): the inherited simdSumFull is wrong for the 5D model
+  // (it reduces over time-SIMD lanes; here dim-5 is RHS, not time). We run the
+  // fused kernel into a cobj scratch buffer indexed by (mu, r_batch, l, rt),
+  // then assemble the output mat by extracting each dim-5 lane to its RHS slot.
+  //....................................................................
+  virtual void execute(scalar_type *result_p) override {
+    int nGamma = getNgamma();
+    int orthogDir = this->_orthog_dir;
+    int localSpatialVolume = _grid5d->_ostride[orthogDir];
+    // In the 5D grid (simd={1,1,1,1,Nsimd}) every spatial dim — including the
+    // orthog dir — has simd=1, so _ldimensions[orthogDir] == _rdimensions[orthogDir]:
+    // there is no separate "reduced" orthog size here (unlike the 4D time-SIMD
+    // base class). Use localOrthogDimSize throughout.
+    int localOrthogDimSize = _grid5d->_ldimensions[orthogDir];
+    int pc = _grid5d->_processor_coor[orthogDir];
+    int Nt = _grid5d->GlobalDimensions()[orthogDir];
+
+    // shm_p holds cobj (SIMD) elements: one shm_idx already encodes the Nsimd
+    // RHS lanes (coalescedRead/Write handle the lanes), so the stride is over
+    // (r_batch, l, rt) only — no _Nsimd factor (else scratch over-allocated xNsimd) (C4).
+    int gammaStride = _nBatches * _sizeL * localOrthogDimSize;
+
+    cobj *shm_p =
+        (cobj *)acceleratorAllocDevice(gammaStride * nGamma * sizeof(cobj));
+    accelerator_for(idx, gammaStride * nGamma, 1, { shm_p[idx] = Zero(); });
+
+    // Gamma batching (MF_SUM_ARRAY_MAX gammas per kernel launch).
+    for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
+      int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
+      vectorSumFull5d(shm_p, mu, nGammaBlock, localOrthogDimSize,
+                      localSpatialVolume, gammaStride);
+    }
+
+    // Assemble: extract each dim-5 lane -> its RHS slot r, with gt = rt + pc*localT.
+    // Per-lane scalar work (each lane -> one RHS slot r), so use the portable
+    // acceleratorSIMTlane pattern (matches packRhs5d): on GPU one SIMT thread per
+    // lane keeps the lanes busy (C8); on CPU a scalar lane loop.
+    // NOTE: do NOT use accelerator_for2d here. Its macro injects a third lambda
+    // param literally named `lane` (Accelerator.h:141), which collides with any
+    // user-named second loop var, and its nsimd slot claims SIMD vectorization
+    // this scalar extractLane body does not do. The 1d accelerator_for +
+    // acceleratorSIMTlane is the idiomatic per-lane form.
+    // Copy member variables to locals before the GPU lambda: on GPU the lambda
+    // captures `this` by value but `this` is a CPU pointer — any `this->member`
+    // dereference inside the kernel causes an illegal memory access.
+    auto shm_p_a = shm_p;
+    auto result_p_a = result_p;
+    int sizeL_a    = _sizeL;
+    int sizeR_a    = _sizeR;
+    int nBatches_a = _nBatches;
+    int Nsimd = _Nsimd;
+    int nOuter = nGamma * sizeL_a * nBatches_a;
+    accelerator_for(idx, nOuter, Nsimd, {
+      int mu = idx / (sizeL_a * nBatches_a);
+      int rem = idx % (sizeL_a * nBatches_a);
+      int l = rem / nBatches_a;
+      int r_batch = rem % nBatches_a;
+#ifdef GRID_SIMT
+      {
+        int lane = acceleratorSIMTlane(Nsimd);
+#else
+      for (int lane = 0; lane < Nsimd; lane++) {
+#endif
+        int r = r_batch * Nsimd + lane;
+        if (r < sizeR_a) {
+          for (int rt = 0; rt < localOrthogDimSize; rt++) {
+            int shm_idx = rt + localOrthogDimSize * (l + sizeL_a * r_batch) +
+                          mu * gammaStride;
+            cobj vals = shm_p_a[shm_idx];
+            int gt = rt + pc * localOrthogDimSize; // T is simd=1: no time-SIMD reduction
+            int mat_idx = mu * sizeR_a * sizeL_a * Nt +
+                          r + sizeR_a * (l + sizeL_a * gt);
+            result_p_a[mat_idx] = TensorRemove(extractLane(lane, vals));
+          }
+        }
+#ifdef GRID_SIMT
+      }
+#else
+      }
+#endif
+    });
+
+    acceleratorFreeDevice(shm_p);
+  }
+
+  //....................................................................
+  // vectorSumFull5d: the fused kernel. Device-safe: all field access via
+  // A2AFieldView device pointers; bookkeeping via deviceVector<int>::data().
+  // accelerator_for2d is portable (vectorized on CPU, SIMT on GPU).
+  //....................................................................
+  void vectorSumFull5d(cobj *shm_p, int mu_offset, int nGamma,
+                       int localOrthogDimSize, int localSpatialVolume,
+                       int gammaStride) {
+    int sizeL = _sizeL;
+    int nBatches = _nBatches;
+    int Nsimd = _Nsimd;
+    int osites = _osites;
+
+    GaugeView *wsView_p = _wsView->getView();          // [globalEp][ss]
+    FermView *lhsView_p = _lhsView->getView();         // [l][ss]
+    FermView *rhsView_p = _paddedRhsView->getView();   // [r_batch][paddedSS]
+
+    auto offsets_p = _allOffsets.data();   // [(epStart[g]+ep)*osites + ss]
+    auto nEp_p = _nEpDev.data();
+    auto epStart_p = _epStartDev.data();
+
+    accelerator_for2d(l_index, sizeL, r_batch, nBatches, Nsimd, {
+      calcScalar sum[MF_SUM_ARRAY_MAX];
+      for (int rt = 0; rt < localOrthogDimSize; rt++) {
+        for (int mu = 0; mu < nGamma; mu++)
+          sum[mu] = Zero();
+
+        for (int so = 0; so < localSpatialVolume; so++) {
+          int ss = rt * localSpatialVolume + so;
+          auto L = coalescedRead(lhsView_p[l_index][ss]); // broadcast (replicated)
+
+          for (int mu = 0; mu < nGamma; mu++) {
+            int g = mu_offset + mu;
+            int nEp = nEp_p[g];
+            int epStart = epStart_p[g];
+            for (int ep = 0; ep < nEp; ep++) {
+              int paddedSS = offsets_p[(epStart + ep) * osites + ss];
+              auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]); // per-lane RHS
+              auto W = coalescedRead(wsView_p[epStart + ep][ss]);     // broadcast
+              sum[mu] = sum[mu] + innerProduct(L, W * psi);
+            }
+          }
+        }
+
+        for (int mu = 0; mu < nGamma; mu++) {
+          int shm_idx = rt + localOrthogDimSize * (l_index + sizeL * r_batch) +
+                        (mu_offset + mu) * gammaStride;
+          coalescedWrite(shm_p[shm_idx], sum[mu]);
+        }
+      }
+    });
+  }
+
+  virtual void vectorSumFull(cobj *, int, int) {
+    assert(0 && "use execute(); 5D task overrides execute()");
+  }
+  virtual void vectorSumHalf(cobj *, int, int) {
+    assert(0 && "stencil task is full-grid only");
+  }
+  virtual void vectorSumMixed(cobj *, int, int) {
+    assert(0 && "stencil task is full-grid only");
+  }
+};
+
 #undef A2A_TYPEDEFS
 #undef COMMON_VARS
 

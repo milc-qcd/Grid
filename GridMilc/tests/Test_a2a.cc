@@ -4,6 +4,12 @@
  * Validates A2AWorkerSpinTaste (general spin-taste A2A meson field, Strategy C)
  * against a brute-force reference using real eigenvectors + gauge links.
  *
+ * NOTE: This test uses hardcoded 4^4 lattice data files (lat.l4444.ildg.20,
+ * fatlinks.l4444.ildg.20, longlinks.l4444.ildg.20, eigenvectors). It is too
+ * small for production machines. The portable stencil-path validation (gather +
+ * stencil-vs-cshift) lives in Test_a2a_stencil.cc, which works at any lattice
+ * size via --grid and needs no external data files.
+ *
  * Reads Odd-CB staggered eigenvectors (SciDAC), generates Even partners via
  * ImprovedStaggeredFermion::Meooe, computes meson fields for representative
  * popcount 0-4 spin-taste pairs, and compares:
@@ -301,10 +307,10 @@ int main(int argc, char **argv) {
     std::sort(bfVals.begin(), bfVals.end(), cmp);
     double multErr = 0.0;
     for (size_t k = 0; k < a2aVals.size(); k++) {
-      double denom = std::norm(bfVals[k]);
+      double denom = bfVals[k].real()*bfVals[k].real() + bfVals[k].imag()*bfVals[k].imag();
       if (denom < 1e-30) denom = 1e-30;
       multErr =
-          std::max(multErr, std::norm(a2aVals[k] - bfVals[k]) / denom);
+          std::max(multErr, [&]{ auto d = a2aVals[k]-bfVals[k]; return d.real()*d.real()+d.imag()*d.imag(); }() / denom);
     }
     if (multErr > maxRelErr) maxRelErr = multErr;
     std::cout << GridLogMessage << "  multiset relErr: " << multErr
@@ -342,7 +348,7 @@ int main(int argc, char **argv) {
           ComplexD v = mf_cb(0, 0, t, li, ri);
           if (!std::isfinite(v.real()) || !std::isfinite(v.imag()))
             cbErr = 1.0;
-          totalPwr += std::norm(v);
+          totalPwr += v.real()*v.real() + v.imag()*v.imag();
         }
     if (totalPwr == 0.0) {
       std::cerr << "CB structural FAIL: zero output power" << std::endl;
@@ -386,9 +392,11 @@ int main(int argc, char **argv) {
     for (int t = 0; t < Nt; t++)
       for (int i = 0; i < nevec; i++)
         for (int j = 0; j < nevec; j++) {
-          double d = std::norm(mf_st(0, 0, t, 2 * i, 2 * j) -
-                               mf_ref(0, 0, t, 2 * i, 2 * j));
-          double denom = std::norm(mf_ref(0, 0, t, 2 * i, 2 * j));
+          ComplexD _diff = mf_st(0, 0, t, 2 * i, 2 * j) -
+                           mf_ref(0, 0, t, 2 * i, 2 * j);
+          double d = _diff.real()*_diff.real() + _diff.imag()*_diff.imag();
+          ComplexD _ref = mf_ref(0, 0, t, 2 * i, 2 * j);
+          double denom = _ref.real()*_ref.real() + _ref.imag()*_ref.imag();
           if (denom < 1e-30) denom = 1e-30;
           xcheckErr = std::max(xcheckErr, d / denom);
         }

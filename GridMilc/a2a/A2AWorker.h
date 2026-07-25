@@ -194,6 +194,92 @@ public:
   }
 };
 
+///////////////////////////////////////////////////////////////////////////////
+// A2AWorkerSpinTasteStencil: full-grid stencil worker (full-grid only in v3.3).
+// The caller passes full-grid LHS/RHS arrays (no E/O splitting); the task
+// promotes them directly to the 5D grid. Mirrors the A2AWorkerLocal/Onelink
+// lifecycle: setLeft/setRight re-run only when the input address changes
+// (address-cache via the inherited _l_addr/_r_addr), so a worker kept alive
+// across many calls skips redundant 5D re-promotion.
+///////////////////////////////////////////////////////////////////////////////
+template <class FImpl>
+class A2AWorkerSpinTasteStencil : public A2AWorkerBase<FImpl> {
+public:
+  // NOTE (B3): A2A_TYPEDEFS is #undef'd at the end of A2ATask.h before this
+  // header is parsed — use the four explicit local typedefs, matching
+  // A2AWorkerLocal/Onelink/SpinTaste (A2AWorker.h:88-91).
+  typedef typename FImpl::ComplexField ComplexField;
+  typedef typename FImpl::FermionField FermionField;
+  typedef typename FImpl::SiteSpinor vobj;
+  typedef typename vobj::scalar_type scalar_type;
+
+  A2ATaskSpinTasteStencil<FImpl> *_stencil_task;
+
+  A2AWorkerSpinTasteStencil(GridBase *grid,
+                            const std::vector<ComplexField> &mom,
+                            const std::vector<StagGamma::SpinTastePair> &gammas,
+                            LatticeGaugeField *U, int orthogDir)
+      : A2AWorkerBase<FImpl>(grid) {
+    // Momentum projection is not implemented for the stencil path (same as the
+    // sibling A2AWorkerSpinTaste). MesonField passes `ph` unconditionally, so
+    // this guards useStencil + non-zero momentum from silently producing
+    // unprojected (wrong) results. (C3 review fix; design follow-up:
+    // .rpiv/artifacts/designs/2026-07-25_16-04-12_opt-a2a-stencil-spin-taste-v3.md)
+    if (mom.size()) {
+      assert(0 && "A2AWorkerSpinTasteStencil: momentum projection not implemented");
+    }
+    GridCartesian *fullGrid = dynamic_cast<GridCartesian *>(grid);
+    assert(fullGrid != nullptr);
+    _stencil_task = new A2ATaskSpinTasteStencil<FImpl>(
+        fullGrid, orthogDir, gammas, U, Even);
+    this->_task_e = _stencil_task;
+    this->_task_o = nullptr;
+  }
+
+  // NOTE (B1): NO custom destructor. ~A2AWorkerBase does `delete _task_e`
+  // (== _stencil_task); a custom body that also deletes _stencil_task would
+  // double-free. A2AWorkerSpinTaste has no custom dtor for the same reason.
+  // (getFullGrid() on the task exposes the protected _fullGrid if ever needed.)
+
+  template <typename TensorType>
+  void StagMesonFieldStencil(TensorType &mat,
+                             const FermionField *lhs,
+                             const FermionField *rhs,
+                             int sizeL, int sizeR) {
+    // Device cache for the output mat.
+    if (this->_cache_bytes < mat.size() * sizeof(scalar_type)) {
+      if (this->_cache_bytes != 0)
+        acceleratorFreeDevice(this->_cache_device);
+      this->_cache_bytes = mat.size() * sizeof(scalar_type);
+      this->_cache_device =
+          (scalar_type *)acceleratorAllocDevice(this->_cache_bytes);
+    }
+    scalar_type *matDevice = this->_cache_device;
+    accelerator_for(idx, mat.size(), 1, { matDevice[idx] = 0.0; });
+
+    // Address-cache (C1): re-run the 5D promotion only when the input pointer
+    // changes — mirrors the inherited StagMesonField's _l_addr/_r_addr gating.
+    // Feed the full-grid inputs directly to the task (NO sizeL/sizeR 4D
+    // full-grid temporaries); the task owns the 4D->5D promotion.
+    if (this->_l_addr != lhs) {
+      this->_l_addr = lhs;
+      _stencil_task->setLeft(lhs, sizeL);
+    }
+    if (this->_r_addr != rhs) {
+      this->_r_addr = rhs;
+      _stencil_task->setRight(rhs, sizeR);
+    }
+    _stencil_task->execute(matDevice);
+
+    acceleratorCopyFromDevice(matDevice, mat.data(),
+                              mat.size() * sizeof(scalar_type));
+    // Multi-rank reduction (B6): each rank summed only its local spatial sites;
+    // the inherited StagMesonField does this GlobalSumVector — the stencil path
+    // must too, or multi-rank mat values are wrong (breaks the BLOCKING checkpoint).
+    this->_grid->GlobalSumVector(mat.data(), mat.size());
+  }
+};
+
 template <class FImpl>
 template <typename TensorType>
 void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
