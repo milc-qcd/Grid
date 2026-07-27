@@ -291,16 +291,20 @@ public:
     cobj *shm_p = (cobj *)acceleratorAllocDevice(MFrvol * sizeof(cobj));
 
     // Loop over gammas in batches of MF_SUM_ARRAY_MAX
-    for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
-
-      int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
-
-      vectorSum(shm_p + mu * gammaStride, mu, nGammaBlock);
+    {
+      GRID_TRACE("A2A/VectorSum");
+      for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
+        int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
+        vectorSum(shm_p + mu * gammaStride, mu, nGammaBlock);
+      }
     }
 
-    for (int mu = 0; mu < nGamma; mu++) {
-      simdSum(result_p + mu * multFact * sizeR * sizeL * Nt,
-              shm_p + mu * gammaStride);
+    {
+      GRID_TRACE("A2A/SimdSum");
+      for (int mu = 0; mu < nGamma; mu++) {
+        simdSum(result_p + mu * multFact * sizeR * sizeL * Nt,
+                shm_p + mu * gammaStride);
+      }
     }
 
     acceleratorFreeDevice(shm_p);
@@ -1736,9 +1740,12 @@ public:
     _sizeL = size;
     GridBase *grid4d = left[0].Grid();
     _lhs5d.clear(); _lhs5d.reserve(size);
-    for (int l = 0; l < size; l++) {
-      _lhs5d.emplace_back(_grid5d);
-      promoteField5d(_lhs5d.back(), left[l], grid4d, _grid5d);
+    {
+      GRID_TRACE("A2AStencil/PromoteLeft");
+      for (int l = 0; l < size; l++) {
+        _lhs5d.emplace_back(_grid5d);
+        promoteField5d(_lhs5d.back(), left[l], grid4d, _grid5d);
+      }
     }
     _lhsView = std::make_shared<A2AFieldView<vobj>>();
     _lhsView->openViews(_lhs5d.data(), size);
@@ -1755,9 +1762,15 @@ public:
     for (int b = 0; b < _nBatches; b++) {
       int nVec = std::min(_Nsimd, size - b * _Nsimd);
       Lattice<vobj> rhs5d(_grid5d);
-      rhs5d = Zero(); // zero unused lanes of the (possible) partial last batch
-      packRhs5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d);
-      _paddedRight5d.emplace_back(_cell5d->Exchange(rhs5d));
+      rhs5d = Zero();
+      {
+        GRID_TRACE("A2AStencil/PackRhs5d");
+        packRhs5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d);
+      }
+      {
+        GRID_TRACE("A2AStencil/HaloExchange");
+        _paddedRight5d.emplace_back(_cell5d->Exchange(rhs5d));
+      }
     }
     _paddedRhsView = std::make_shared<A2AFieldView<vobj>>();
     _paddedRhsView->openViews(_paddedRight5d.data(), _nBatches);
@@ -1788,13 +1801,19 @@ public:
 
     cobj *shm_p =
         (cobj *)acceleratorAllocDevice(gammaStride * nGamma * sizeof(cobj));
-    accelerator_for(idx, gammaStride * nGamma, 1, { shm_p[idx] = Zero(); });
+    {
+      GRID_TRACE("A2AStencil/ZeroScratch");
+      accelerator_for(idx, gammaStride * nGamma, 1, { shm_p[idx] = Zero(); });
+    }
 
     // Gamma batching (MF_SUM_ARRAY_MAX gammas per kernel launch).
-    for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
-      int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
-      vectorSumFull5d(shm_p, mu, nGammaBlock, localOrthogDimSize,
-                      localSpatialVolume, gammaStride);
+    {
+      GRID_TRACE("A2AStencil/VectorSum5d");
+      for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
+        int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
+        vectorSumFull5d(shm_p, mu, nGammaBlock, localOrthogDimSize,
+                        localSpatialVolume, gammaStride);
+      }
     }
 
     // Assemble: extract each dim-5 lane -> its RHS slot r, with gt = rt + pc*localT.
@@ -1816,7 +1835,9 @@ public:
     int nBatches_a = _nBatches;
     int Nsimd = _Nsimd;
     int nOuter = nGamma * sizeL_a * nBatches_a;
-    accelerator_for(idx, nOuter, Nsimd, {
+    {
+      GRID_TRACE("A2AStencil/Assemble");
+      accelerator_for(idx, nOuter, Nsimd, {
       int mu = idx / (sizeL_a * nBatches_a);
       int rem = idx % (sizeL_a * nBatches_a);
       int l = rem / nBatches_a;
@@ -1845,6 +1866,7 @@ public:
       }
 #endif
     });
+    }
 
     acceleratorFreeDevice(shm_p);
   }
@@ -1857,6 +1879,7 @@ public:
   void vectorSumFull5d(cobj *shm_p, int mu_offset, int nGamma,
                        int localOrthogDimSize, int localSpatialVolume,
                        int gammaStride) {
+    GRID_TRACE("A2AStencil/vectorSumFull5d");
     int sizeL = _sizeL;
     int nBatches = _nBatches;
     int Nsimd = _Nsimd;

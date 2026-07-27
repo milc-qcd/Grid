@@ -257,7 +257,10 @@ public:
           (scalar_type *)acceleratorAllocDevice(this->_cache_bytes);
     }
     scalar_type *matDevice = this->_cache_device;
-    accelerator_for(idx, mat.size(), 1, { matDevice[idx] = 0.0; });
+    {
+      GRID_TRACE("A2AStencil/ZeroInit");
+      accelerator_for(idx, mat.size(), 1, { matDevice[idx] = 0.0; });
+    }
 
     // Address-cache (C1): re-run the 5D promotion only when the input pointer
     // changes — mirrors the inherited StagMesonField's _l_addr/_r_addr gating.
@@ -265,20 +268,30 @@ public:
     // full-grid temporaries); the task owns the 4D->5D promotion.
     if (this->_l_addr != lhs) {
       this->_l_addr = lhs;
+      GRID_TRACE("A2AStencil/SetLeft");
       _stencil_task->setLeft(lhs, sizeL);
     }
     if (this->_r_addr != rhs) {
       this->_r_addr = rhs;
+      GRID_TRACE("A2AStencil/SetRight");
       _stencil_task->setRight(rhs, sizeR);
     }
-    _stencil_task->execute(matDevice);
-
-    acceleratorCopyFromDevice(matDevice, mat.data(),
-                              mat.size() * sizeof(scalar_type));
+    {
+      GRID_TRACE("A2AStencil/Execute");
+      _stencil_task->execute(matDevice);
+    }
+    {
+      GRID_TRACE("A2AStencil/CopyFromDevice");
+      acceleratorCopyFromDevice(matDevice, mat.data(),
+                                mat.size() * sizeof(scalar_type));
+    }
     // Multi-rank reduction (B6): each rank summed only its local spatial sites;
     // the inherited StagMesonField does this GlobalSumVector — the stencil path
     // must too, or multi-rank mat values are wrong (breaks the BLOCKING checkpoint).
-    this->_grid->GlobalSumVector(mat.data(), mat.size());
+    {
+      GRID_TRACE("A2AStencil/GlobalSum");
+      this->_grid->GlobalSumVector(mat.data(), mat.size());
+    }
   }
 };
 
@@ -299,6 +312,7 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
     _cache_device = (scalar_type *)acceleratorAllocDevice(_cache_bytes);
   }
   scalar_type *matDevice = _cache_device;
+  GRID_TRACE("A2A/ZeroInit");
   accelerator_for(idx, mat.size(), 1, { matDevice[idx] = 0.0; });
 
   int sizeL = mat.dimension(3);
@@ -315,7 +329,7 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
 
   if (_l_addr != lhs_wi_E) {
     _l_addr = lhs_wi_E;
-
+    GRID_TRACE("A2A/SetLeft");
     _task_e->setLeft(lhs_wi_E, sizeL);
     if (checkerL)
       _task_o->setLeft(lhs_wi_O, sizeL);
@@ -325,7 +339,7 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
 
   if (_r_addr != rhs_vj_E) {
     _r_addr = rhs_vj_E;
-
+    GRID_TRACE("A2A/SetRight");
     if (checkerR) {
       if (_odd_shifts) {
         _task_e->setRight(rhs_vj_O, sizeR);
@@ -343,11 +357,14 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
   }
 
   _t_kernel = -usecond();
-  if (!(checkerL || checkerR)) {
-    _task_e->execute(matDevice);
-  } else {
-    _task_e->execute(matDevice);
-    _task_o->execute(matDevice);
+  {
+    GRID_TRACE("A2A/Execute");
+    if (!(checkerL || checkerR)) {
+      _task_e->execute(matDevice);
+    } else {
+      _task_e->execute(matDevice);
+      _task_o->execute(matDevice);
+    }
   }
 
   setFlops(_task_e->getFlops());
@@ -358,10 +375,16 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
 
   scalar_type *matHost = mat.data();
   size_t matBytes = mat.size() * sizeof(scalar_type);
-  acceleratorCopyFromDevice(matDevice, matHost, matBytes);
+  {
+    GRID_TRACE("A2A/CopyFromDevice");
+    acceleratorCopyFromDevice(matDevice, matHost, matBytes);
+  }
 
   _t_gsum = -usecond();
-  this->_grid->GlobalSumVector(matHost, nGamma * resultStride);
+  {
+    GRID_TRACE("A2A/GlobalSum");
+    this->_grid->GlobalSumVector(matHost, nGamma * resultStride);
+  }
   _t_gsum += usecond();
 }
 
