@@ -44,6 +44,8 @@ public:
   A2AWorkerBase(GridBase *grid)
       : _grid(grid), _l_addr(nullptr), _r_addr(nullptr) {}
 
+  void resetCache() { _l_addr = nullptr; _r_addr = nullptr; }
+
   virtual ~A2AWorkerBase() {
     if (_cache_bytes != 0) {
       acceleratorFreeDevice(_cache_device);

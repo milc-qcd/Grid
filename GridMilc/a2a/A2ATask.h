@@ -1717,7 +1717,11 @@ public:
   }
 
   virtual int getNgamma() { return (int)_gammas.size(); }
-  virtual double getFlops() { return 22.0 * _nEpTotal; }
+  virtual double getFlops() {
+    // Per (site, l, r): for each endpoint, one W_s ColourMatrix×FermionVec
+    // (66 FLOP) + one innerProduct (22 FLOP) = 88 FLOP × nEndpoints.
+    return 88.0 * _nEpTotal;
+  }
   // The worker reads the 4D full grid (to size full-grid input temporaries);
   // _fullGrid is protected, so expose it (B2).
   virtual GridCartesian *getFullGrid() const { return _fullGrid; }
