@@ -1587,6 +1587,35 @@ spinTasteGaugeChain(const LatticeGaugeField *U, const StagGamma &spinTaste,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// coalescedReadRotate: like Grid's coalescedReadPermute (Tensor_SIMT.h) but a
+// general cyclic rotation instead of the fixed single-bit XOR swap. Keeps the
+// ordinary coalesced (nsimd=Nsimd, one-thread-per-lane on GPU) launch model —
+// no need to collapse to nsimd=1/full-vobj processing.
+//   GRID_SIMT (GPU): cross-lane extractLane read. Each of the Nsimd SIMT
+//     threads independently reads a DIFFERENT lane of the same
+//     fully-materialized vobj — fully lane-parallel, no serialization
+//     (identical mechanism to coalescedReadPermute's plane = lane ^ mask,
+//     generalized to plane = (lane + s) % Nsimd).
+//   else (CPU): CPU has no per-lane threads (coalescedRead returns the whole
+//     vector unchanged there) — the rotation must be a genuine SIMD shuffle
+//     instruction, so this branch calls the recursive tensor `rotate`
+//     (Tensor_class.h) on the full vobj and returns it whole, matching
+//     coalescedRead's CPU convention of returning the (here: rotated) vector.
+///////////////////////////////////////////////////////////////////////////////
+template <typename vobj>
+accelerator_inline auto coalescedReadRotate(const vobj &vec, int s,
+    int lane = acceleratorSIMTlane(vobj::Nsimd())) -> decltype(coalescedRead(vec)) {
+#ifdef GRID_SIMT
+  int plane = (lane + s) % vobj::Nsimd();
+  return extractLane(plane, vec);
+#else
+  vobj tmp;
+  rotate(tmp, vec, s);
+  return tmp;
+#endif
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // A2ATaskSpinTasteStencil: 5D stencil-based spin-taste meson-field task.
 //
 // SIMD lanes (dim-5) = RHS vectors (batched Nsimd at a time). Spatial dims are
@@ -1624,16 +1653,20 @@ protected:
   int _nEpTotal;
   int _osites; // 5D spatial oSites (== grid5d oSites)
 
-  // LHS promoted to 5D + view.
+  // LHS packed into Nsimd-lane batches (design F1) + view. Each _lhs5d[b] holds
+  // Nsimd distinct L vectors in its dim-5 lanes (was: one replicated L per l).
   std::vector<Lattice<vobj>> _lhs5d;
   std::shared_ptr<A2AFieldView<vobj>> _lhsView;
   int _sizeL;
+  int _nBatchesL;
 
-  // Padded RHS 5D batches + view.
+  // Padded RHS 5D batches + view. The RHS batch-count member was renamed to
+  // _nBatchesR for symmetry with _nBatchesL (both L and R now batch into
+  // Nsimd-lane groups).
   std::vector<Lattice<vobj>> _paddedRight5d;
   std::shared_ptr<A2AFieldView<vobj>> _paddedRhsView;
   int _sizeR;
-  int _nBatches;
+  int _nBatchesR;
   int _Nsimd;
 
 public:
@@ -1722,82 +1755,111 @@ public:
 
   virtual int getNgamma() { return (int)_gammas.size(); }
   virtual double getFlops() {
-    // Per (site, l, r): for each endpoint, one W_s ColourMatrix×FermionVec
-    // (66 FLOP) + one innerProduct (22 FLOP) = 88 FLOP × nEndpoints.
+    // Per (site, l, r) pairing: one W_s ColourMatrix×FermionVec (66 FLOP) + one
+    // innerProduct (22 FLOP) = 88 FLOP × nEndpoints. F1 hoists W*psi out of the
+    // per-L loop (computed once per (l_batch,r_batch,site,ep), reused across the
+    // rotation sweep), so actual W*psi FLOPs drop ~Nsimd×; the reported metric is
+    // already sizeL/sizeR-independent, so this per-endpoint value stays valid.
     return 88.0 * _nEpTotal;
   }
   // The worker reads the 4D full grid (to size full-grid input temporaries);
   // _fullGrid is protected, so expose it (B2).
   virtual GridCartesian *getFullGrid() const { return _fullGrid; }
 
-  // setLeft: promote each full-grid LHS vector directly to the 5D grid
-  // (replicated dim-5). Does NOT call A2ATaskBase::setLeft — that opens
-  // _left_view on the input and toggles _contract_type/_grid, none of which the
-  // custom 5D execute() uses (it indexes _lhs5d/_lhsView instead), and avoids
-  // the dangling-_left_view lifecycle hazard. grid4d is GridBase* (left[0].Grid())
-  // — promoteField5d reads only GridBase-accessible members (B4/C1).
+  // setLeft: pack full-grid LHS into Nsimd-sized 5D batches (design F1), each
+  // batch holding Nsimd distinct L in its dim-5 lanes, via the same pack5d
+  // (Phase 1) setRight uses for RHS. Does NOT call the base (grid4d is
+  // GridBase*; the custom execute indexes _lhs5d/_lhsView). LHS is unshifted,
+  // so no PaddedCell::Exchange (unlike setRight).
   virtual void setLeft(const FermionField *left, int size) {
     _sizeL = size;
+    _nBatchesL = (size + _Nsimd - 1) / _Nsimd;
     GridBase *grid4d = left[0].Grid();
-    _lhs5d.clear(); _lhs5d.reserve(size);
-    {
-      GRID_TRACE("A2AStencil/PromoteLeft");
-      for (int l = 0; l < size; l++) {
+
+    // Reallocate only if the batch count changed; steady-state repeat calls
+    // (same sizeL) reuse the existing Lattice slots via in-place Zero()+pack5d
+    // below, avoiding a clear()+reconstruct of the 5D device buffers on every
+    // call (setLeft/setRight are address-cache-gated in the worker, but the
+    // pointer commonly changes call-to-call at fixed size).
+    if ((int)_lhs5d.size() != _nBatchesL) {
+      _lhs5d.clear();
+      _lhs5d.reserve(_nBatchesL);
+      for (int b = 0; b < _nBatchesL; b++)
         _lhs5d.emplace_back(_grid5d);
-        promoteField5d(_lhs5d.back(), left[l], grid4d, _grid5d);
+    }
+
+    {
+      GRID_TRACE("A2AStencil/PackLeft");
+      for (int b = 0; b < _nBatchesL; b++) {
+        int nVec = std::min(_Nsimd, size - b * _Nsimd);
+        _lhs5d[b] = Zero(); // zero unused lanes of the partial last batch
+        pack5d(_lhs5d[b], left + b * _Nsimd, nVec, grid4d, _grid5d);
       }
     }
     _lhsView = std::make_shared<A2AFieldView<vobj>>();
-    _lhsView->openViews(_lhs5d.data(), size);
+    _lhsView->openViews(_lhs5d.data(), _nBatchesL);
   }
 
   // setRight: pack full-grid RHS into Nsimd-sized 5D batches, pad via Exchange.
   // As with setLeft, does not call the base (B5/C1: grid4d is GridBase*).
   virtual void setRight(const FermionField *right, int size) {
     _sizeR = size;
-    _nBatches = (size + _Nsimd - 1) / _Nsimd;
+    _nBatchesR = (size + _Nsimd - 1) / _Nsimd;
 
-    _paddedRight5d.clear(); _paddedRight5d.reserve(_nBatches);
+    // Reallocate only if the batch count changed; steady-state repeat calls
+    // (same sizeR) reuse the existing Lattice slots via assignment below,
+    // avoiding a clear()+reconstruct of the padded-grid device buffers on
+    // every call.
+    if ((int)_paddedRight5d.size() != _nBatchesR) {
+      _paddedRight5d.clear();
+      _paddedRight5d.reserve(_nBatchesR);
+      for (int b = 0; b < _nBatchesR; b++)
+        _paddedRight5d.emplace_back(_paddedGrid5d);
+    }
+
     GridBase *grid4d = right[0].Grid();
-    for (int b = 0; b < _nBatches; b++) {
+    Lattice<vobj> rhs5d(_grid5d);
+    for (int b = 0; b < _nBatchesR; b++) {
       int nVec = std::min(_Nsimd, size - b * _Nsimd);
-      Lattice<vobj> rhs5d(_grid5d);
       rhs5d = Zero();
       {
         GRID_TRACE("A2AStencil/PackRhs5d");
-        packRhs5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d);
+        pack5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d);
       }
       {
         GRID_TRACE("A2AStencil/HaloExchange");
-        _paddedRight5d.emplace_back(_cell5d->Exchange(rhs5d));
+        _paddedRight5d[b] = _cell5d->Exchange(rhs5d); // assign in place, no emplace_back
       }
     }
     _paddedRhsView = std::make_shared<A2AFieldView<vobj>>();
-    _paddedRhsView->openViews(_paddedRight5d.data(), _nBatches);
+    _paddedRhsView->openViews(_paddedRight5d.data(), _nBatchesR);
   }
 
   //....................................................................
-  // execute (OVERRIDE): the inherited simdSumFull is wrong for the 5D model
-  // (it reduces over time-SIMD lanes; here dim-5 is RHS, not time). We run the
-  // fused kernel into a cobj scratch buffer indexed by (mu, r_batch, l, rt),
-  // then assemble the output mat by extracting each dim-5 lane to its RHS slot.
+  // execute (OVERRIDE): coalesced rotation-sweep model (design F1). The kernel
+  // writes Nsimd rotation rows per (l_batch, r_batch, rt); execute() assembles
+  // the mat by a circulant scatter M[l_i,r_j] = result[(i-j) mod Nsimd][j].
   //....................................................................
   virtual void execute(scalar_type *result_p) override {
     int nGamma = getNgamma();
     int orthogDir = this->_orthog_dir;
     int localSpatialVolume = _grid5d->_ostride[orthogDir];
-    // In the 5D grid (simd={1,1,1,1,Nsimd}) every spatial dim — including the
-    // orthog dir — has simd=1, so _ldimensions[orthogDir] == _rdimensions[orthogDir]:
-    // there is no separate "reduced" orthog size here (unlike the 4D time-SIMD
-    // base class). Use localOrthogDimSize throughout.
+    // 5D grid has simd=1 on all spatial dims, so _ldimensions[orthogDir] ==
+    // _rdimensions[orthogDir]: no separate reduced orthog size. Use
+    // localOrthogDimSize throughout.
     int localOrthogDimSize = _grid5d->_ldimensions[orthogDir];
     int pc = _grid5d->_processor_coor[orthogDir];
     int Nt = _grid5d->GlobalDimensions()[orthogDir];
 
-    // shm_p holds cobj (SIMD) elements: one shm_idx already encodes the Nsimd
-    // RHS lanes (coalescedRead/Write handle the lanes), so the stride is over
-    // (r_batch, l, rt) only — no _Nsimd factor (else scratch over-allocated xNsimd) (C4).
-    int gammaStride = _nBatches * _sizeL * localOrthogDimSize;
+    // shm_p holds cobj (SIMD) elements indexed, fastest-to-slowest, as
+    // (rt, s, l_batch, r_batch, mu) -- rt stays innermost (matching v3's
+    // convention: rt was always the fastest-varying index in the pre-F1
+    // layout). s is the F1 addition, positioned at stride localOrthogDimSize
+    // right where a sub-index of l_batch belongs (for fixed lane j, s and the
+    // intra-batch L index i are in 1-1 correspondence). Each cobj still
+    // encodes Nsimd lanes (extractLane in assembly), so no extra Nsimd factor
+    // beyond s.
+    int gammaStride = _nBatchesL * _nBatchesR * localOrthogDimSize * _Nsimd;
 
     cobj *shm_p =
         (cobj *)acceleratorAllocDevice(gammaStride * nGamma * sizeof(cobj));
@@ -1806,7 +1868,6 @@ public:
       accelerator_for(idx, gammaStride * nGamma, 1, { shm_p[idx] = Zero(); });
     }
 
-    // Gamma batching (MF_SUM_ARRAY_MAX gammas per kernel launch).
     {
       GRID_TRACE("A2AStencil/VectorSum5d");
       for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
@@ -1816,92 +1877,104 @@ public:
       }
     }
 
-    // Assemble: extract each dim-5 lane -> its RHS slot r, with gt = rt + pc*localT.
-    // Per-lane scalar work (each lane -> one RHS slot r), so use the portable
-    // acceleratorSIMTlane pattern (matches packRhs5d): on GPU one SIMT thread per
-    // lane keeps the lanes busy (C8); on CPU a scalar lane loop.
-    // NOTE: do NOT use accelerator_for2d here. Its macro injects a third lambda
-    // param literally named `lane` (Accelerator.h:141), which collides with any
-    // user-named second loop var, and its nsimd slot claims SIMD vectorization
-    // this scalar extractLane body does not do. The 1d accelerator_for +
-    // acceleratorSIMTlane is the idiomatic per-lane form.
-    // Copy member variables to locals before the GPU lambda: on GPU the lambda
-    // captures `this` by value but `this` is a CPU pointer — any `this->member`
-    // dereference inside the kernel causes an illegal memory access.
+    // Circulant-scatter assembly. lane j == r-local; i == l-local; pairing
+    // (l_i, r_j) lives at rotation s=(i-j) mod Nsimd, lane j. Per-lane scalar
+    // work -> portable acceleratorSIMTlane pattern (matches pack5d). Launched
+    // as (l_batch, r_batch), Nsimd (accelerator_for2d) rather than a flattened
+    // 1D index over (mu, l_batch, r_batch) — no div/mod preamble needed; mu is
+    // a plain serial loop inside (no per-mu accumulator state to chunk, unlike
+    // vectorSumFull5d's MF_SUM_ARRAY_MAX blocking).
+    // Copy members to locals: the GPU lambda captures a CPU `this`.
     auto shm_p_a = shm_p;
     auto result_p_a = result_p;
-    int sizeL_a    = _sizeL;
-    int sizeR_a    = _sizeR;
-    int nBatches_a = _nBatches;
+    int sizeL_a     = _sizeL;
+    int sizeR_a     = _sizeR;
+    int nBatchesL_a = _nBatchesL;
+    int nBatchesR_a = _nBatchesR;
     int Nsimd = _Nsimd;
-    int nOuter = nGamma * sizeL_a * nBatches_a;
+    int nGamma_a = nGamma;
     {
       GRID_TRACE("A2AStencil/Assemble");
-      accelerator_for(idx, nOuter, Nsimd, {
-      int mu = idx / (sizeL_a * nBatches_a);
-      int rem = idx % (sizeL_a * nBatches_a);
-      int l = rem / nBatches_a;
-      int r_batch = rem % nBatches_a;
+      accelerator_for2d(l_batch, nBatchesL_a, r_batch, nBatchesR_a, Nsimd, {
 #ifdef GRID_SIMT
-      {
-        int lane = acceleratorSIMTlane(Nsimd);
+        {
+          int j = acceleratorSIMTlane(Nsimd);
 #else
-      for (int lane = 0; lane < Nsimd; lane++) {
+        for (int j = 0; j < Nsimd; j++) {
 #endif
-        int r = r_batch * Nsimd + lane;
-        if (r < sizeR_a) {
-          for (int rt = 0; rt < localOrthogDimSize; rt++) {
-            int shm_idx = rt + localOrthogDimSize * (l + sizeL_a * r_batch) +
-                          mu * gammaStride;
-            cobj vals = shm_p_a[shm_idx];
-            int gt = rt + pc * localOrthogDimSize; // T is simd=1: no time-SIMD reduction
-            int mat_idx = mu * sizeR_a * sizeL_a * Nt +
-                          r + sizeR_a * (l + sizeL_a * gt);
-            result_p_a[mat_idx] = TensorRemove(extractLane(lane, vals));
+          int r = r_batch * Nsimd + j;
+          if (r < sizeR_a) {
+            for (int mu = 0; mu < nGamma_a; mu++) {
+              for (int rt = 0; rt < localOrthogDimSize; rt++) {
+                int gt = rt + pc * localOrthogDimSize; // T simd=1: no time reduction
+                for (int i = 0; i < Nsimd; i++) {
+                  int l = l_batch * Nsimd + i;
+                  if (l < sizeL_a) {
+                    int s = ((i - j) % Nsimd + Nsimd) % Nsimd;
+                    int shm_idx =
+                        rt +
+                        localOrthogDimSize * (s + Nsimd * (l_batch + nBatchesL_a * r_batch)) +
+                        mu * gammaStride;
+                    cobj vals = shm_p_a[shm_idx];
+                    int mat_idx = mu * sizeR_a * sizeL_a * Nt +
+                                  r + sizeR_a * (l + sizeL_a * gt);
+                    result_p_a[mat_idx] = TensorRemove(extractLane(j, vals));
+                  }
+                }
+              }
+            }
           }
-        }
 #ifdef GRID_SIMT
-      }
+        }
 #else
-      }
+        }
 #endif
-    });
+      });
     }
 
     acceleratorFreeDevice(shm_p);
   }
 
   //....................................................................
-  // vectorSumFull5d: the fused kernel. Device-safe: all field access via
-  // A2AFieldView device pointers; bookkeeping via deviceVector<int>::data().
-  // accelerator_for2d is portable (vectorized on CPU, SIMT on GPU).
+  // vectorSumFull5d: fused F1 kernel. Ordinary coalesced (nsimd=Nsimd) launch —
+  // same shape as v3 and the RHS/W_s reads. W*psi is read/computed per-lane
+  // exactly as v3 did; L's rotated lane comes from coalescedReadRotate (cross-
+  // lane extractLane on GPU, tensor rotate on CPU), so Wpsi is computed once
+  // and reused across all Nsimd rotations of L (the ~Nsimd bandwidth win)
+  // without giving up GPU lane parallelism. sum[s][mu] (calcScalar, per-lane
+  // scalar — not a full SIMD vobj) accumulates rotation s.
+  // Device-safe: field access via A2AFieldView device pointers; bookkeeping via
+  // deviceVector<int>::data().
   //....................................................................
   void vectorSumFull5d(cobj *shm_p, int mu_offset, int nGamma,
                        int localOrthogDimSize, int localSpatialVolume,
                        int gammaStride) {
     GRID_TRACE("A2AStencil/vectorSumFull5d");
-    int sizeL = _sizeL;
-    int nBatches = _nBatches;
+    int nBatchesL = _nBatchesL;
+    int nBatchesR = _nBatchesR;
     int Nsimd = _Nsimd;
     int osites = _osites;
 
-    GaugeView *wsView_p = _wsView->getView();          // [globalEp][ss]
-    FermView *lhsView_p = _lhsView->getView();         // [l][ss]
-    FermView *rhsView_p = _paddedRhsView->getView();   // [r_batch][paddedSS]
+    GaugeView *wsView_p = _wsView->getView();        // [globalEp][ss]
+    FermView *lhsView_p = _lhsView->getView();       // [l_batch][ss]
+    FermView *rhsView_p = _paddedRhsView->getView(); // [r_batch][paddedSS]
 
-    auto offsets_p = _allOffsets.data();   // [(epStart[g]+ep)*osites + ss]
+    auto offsets_p = _allOffsets.data();
     auto nEp_p = _nEpDev.data();
     auto epStart_p = _epStartDev.data();
 
-    accelerator_for2d(l_index, sizeL, r_batch, nBatches, Nsimd, {
-      calcScalar sum[MF_SUM_ARRAY_MAX];
+    // nsimd=Nsimd: ordinary coalesced per-lane launch (one GPU thread per
+    // r-lane), matching v3 and pack5d/coalescedReadPermute convention.
+    accelerator_for2d(l_batch, nBatchesL, r_batch, nBatchesR, Nsimd, {
+      calcScalar sum[vobj::Nsimd()][MF_SUM_ARRAY_MAX];
       for (int rt = 0; rt < localOrthogDimSize; rt++) {
-        for (int mu = 0; mu < nGamma; mu++)
-          sum[mu] = Zero();
+        for (int s = 0; s < Nsimd; s++)
+          for (int mu = 0; mu < nGamma; mu++)
+            sum[s][mu] = Zero();
 
         for (int so = 0; so < localSpatialVolume; so++) {
           int ss = rt * localSpatialVolume + so;
-          auto L = coalescedRead(lhsView_p[l_index][ss]); // broadcast (replicated)
+          const vobj &Lblock = lhsView_p[l_batch][ss]; // Nsimd distinct L in lanes
 
           for (int mu = 0; mu < nGamma; mu++) {
             int g = mu_offset + mu;
@@ -1909,18 +1982,25 @@ public:
             int epStart = epStart_p[g];
             for (int ep = 0; ep < nEp; ep++) {
               int paddedSS = offsets_p[(epStart + ep) * osites + ss];
-              auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]); // per-lane RHS
-              auto W = coalescedRead(wsView_p[epStart + ep][ss]);     // broadcast
-              sum[mu] = sum[mu] + innerProduct(L, W * psi);
+              auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]);      // own lane
+              auto W = coalescedRead(wsView_p[epStart + ep][ss]);         // broadcast
+              auto Wpsi = W * psi;
+              for (int s = 0; s < Nsimd; s++) {
+                auto Lr = coalescedReadRotate(Lblock, s); // own-lane's rotated L
+                sum[s][mu] = sum[s][mu] + innerProduct(Lr, Wpsi);
+              }
             }
           }
         }
 
-        for (int mu = 0; mu < nGamma; mu++) {
-          int shm_idx = rt + localOrthogDimSize * (l_index + sizeL * r_batch) +
-                        (mu_offset + mu) * gammaStride;
-          coalescedWrite(shm_p[shm_idx], sum[mu]);
-        }
+        for (int s = 0; s < Nsimd; s++)
+          for (int mu = 0; mu < nGamma; mu++) {
+            int shm_idx =
+                rt +
+                localOrthogDimSize * (s + Nsimd * (l_batch + nBatchesL * r_batch)) +
+                (mu_offset + mu) * gammaStride;
+            coalescedWrite(shm_p[shm_idx], sum[s][mu]);
+          }
       }
     });
   }

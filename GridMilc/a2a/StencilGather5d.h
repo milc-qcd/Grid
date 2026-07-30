@@ -102,7 +102,7 @@ inline void gatherViaOffset5d(Lattice<vobj> &result,
 // src4dIndex: maps a 5D spatial oSite (physical local coord phys[0..3]) to the
 // (oSite, lane) of the originating 4D SIMD field, using the 4D grid's
 // interleaved decomposition (phys[d] = ocoor[d] + rdim[d]*icoor[d]).
-// Shared by packRhs5d and promoteField5d.
+// Shared by pack5d and promoteField5d.
 ///////////////////////////////////////////////////////////////////////////////
 accelerator_inline void src4dIndex(int &srcOSite, int &srcLane,
                        const Coordinate &phys, const Coordinate &rdim,
@@ -117,14 +117,16 @@ accelerator_inline void src4dIndex(int &srcOSite, int &srcLane,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// packRhs5d: pack nVec 4D Lattice<vobj> RHS vectors into ONE 5D Lattice<vobj>,
-// each vector occupying a distinct dim-5 lane (lane == vector index).
-// Lanes >= nVec are left untouched (caller Zero-fills rhs5d first).
+// pack5d: pack nVec distinct 4D Lattice<vobj> vectors into ONE 5D Lattice<vobj>,
+// each vector occupying a distinct dim-5 lane (lane == vector index). Generic
+// over L or R: used for RHS (packed then padded via PaddedCell::Exchange in
+// setRight) and LHS (read at-site, unshifted — no Exchange needed) alike.
+// Lanes >= nVec are left untouched (caller Zero-fills the destination first).
 // Uses the portable per-lane pattern (#ifdef GRID_SIMT) since each lane reads
 // a DIFFERENT source vector (setup-time, not the fused kernel).
 ///////////////////////////////////////////////////////////////////////////////
 template <typename vobj>
-inline void packRhs5d(Lattice<vobj> &rhs5d, const Lattice<vobj> *rhs4d, int nVec,
+inline void pack5d(Lattice<vobj> &rhs5d, const Lattice<vobj> *rhs4d, int nVec,
                       GridBase *grid4d, GridCartesian *grid5d) {
   Coordinate rdim = grid4d->_rdimensions;
   Coordinate ostride = grid4d->_ostride;
