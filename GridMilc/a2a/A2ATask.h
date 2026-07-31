@@ -15,6 +15,10 @@
 #include <GridMilc/a2a/A2AView.h>
 #include <GridMilc/spin/StagGamma.h>
 #include <GridMilc/a2a/StencilGather5d.h>
+#ifdef GRID_CUDA
+#include <nvToolsExt.h>
+#include <cuda_profiler_api.h>
+#endif
 
 #ifndef MF_SUM_ARRAY_MAX
 #define MF_SUM_ARRAY_MAX 16
@@ -1970,6 +1974,10 @@ public:
 
     int nBatchesLT = nBatchesL * localOrthogDimSize;
 
+#ifdef GRID_CUDA
+    nvtxRangePushA("vectorSumFull5d");
+    cudaProfilerStart();
+#endif
     accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, Nsimd, {
       int l_batch = lt_batch / localOrthogDimSize;
       int rt      = lt_batch % localOrthogDimSize;
@@ -2005,6 +2013,10 @@ public:
           coalescedWrite(shm_p[shm_idx], sum[s][mu]);
         }
     });
+#ifdef GRID_CUDA
+    cudaProfilerStop();
+    nvtxRangePop();
+#endif
   }
 
   virtual void vectorSumFull(cobj *, int, int) {
