@@ -1936,15 +1936,20 @@ public:
   }
 
   //....................................................................
-  // vectorSumFull5d: fused F1 kernel. Ordinary coalesced (nsimd=Nsimd) launch —
-  // same shape as v3 and the RHS/W_s reads. W*psi is read/computed per-lane
-  // exactly as v3 did; L's rotated lane comes from coalescedReadRotate (cross-
-  // lane extractLane on GPU, tensor rotate on CPU), so Wpsi is computed once
-  // and reused across all Nsimd rotations of L (the ~Nsimd bandwidth win)
-  // without giving up GPU lane parallelism. sum[s][mu] (calcScalar, per-lane
-  // scalar — not a full SIMD vobj) accumulates rotation s.
-  // Device-safe: field access via A2AFieldView device pointers; bookkeeping via
-  // deviceVector<int>::data().
+  // vectorSumFull5d: fused F1 kernel. Ordinary coalesced (nsimd=Nsimd) launch.
+  // Loop order: (lt_batch=[l_batch,rt], r_batch) parallel; (mu, ep, so) serial.
+  //
+  // The time-slice index rt is folded into the first parallel dimension so that
+  // each (l_batch, rt, r_batch) triple gets its own block. For pc=0 this gives
+  // nBatchesL * Nt * nBatchesR = 3 * 48 * 38 = 5472 blocks vs the previous 114,
+  // filling the 108 SMs and allowing the GPU scheduler to hide L2 latency via
+  // warp switching. Each rt writes to a distinct shm slot so no reduction is
+  // needed.
+  //
+  // ep and mu remain outside the so loop so that for fixed (ep, mu) the psi
+  // gather reads traverse the padded RHS buffer sequentially
+  // (paddedSS = offsets[ep][ss] is a uniform displacement as ss increments),
+  // enabling hardware prefetching.
   //....................................................................
   void vectorSumFull5d(cobj *shm_p, int mu_offset, int nGamma,
                        int localOrthogDimSize, int localSpatialVolume,
@@ -1963,45 +1968,42 @@ public:
     auto nEp_p = _nEpDev.data();
     auto epStart_p = _epStartDev.data();
 
-    // nsimd=Nsimd: ordinary coalesced per-lane launch (one GPU thread per
-    // r-lane), matching v3 and pack5d/coalescedReadPermute convention.
-    accelerator_for2d(l_batch, nBatchesL, r_batch, nBatchesR, Nsimd, {
+    int nBatchesLT = nBatchesL * localOrthogDimSize;
+
+    accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, Nsimd, {
+      int l_batch = lt_batch / localOrthogDimSize;
+      int rt      = lt_batch % localOrthogDimSize;
+
       calcScalar sum[vobj::Nsimd()][MF_SUM_ARRAY_MAX];
-      for (int rt = 0; rt < localOrthogDimSize; rt++) {
-        for (int s = 0; s < Nsimd; s++)
-          for (int mu = 0; mu < nGamma; mu++)
-            sum[s][mu] = Zero();
+      for (int s = 0; s < Nsimd; s++)
+        for (int mu = 0; mu < nGamma; mu++)
+          sum[s][mu] = Zero();
 
-        for (int so = 0; so < localSpatialVolume; so++) {
-          int ss = rt * localSpatialVolume + so;
-          const vobj &Lblock = lhsView_p[l_batch][ss]; // Nsimd distinct L in lanes
-
-          for (int mu = 0; mu < nGamma; mu++) {
-            int g = mu_offset + mu;
-            int nEp = nEp_p[g];
-            int epStart = epStart_p[g];
-            for (int ep = 0; ep < nEp; ep++) {
-              int paddedSS = offsets_p[(epStart + ep) * osites + ss];
-              auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]);      // own lane
-              auto W = coalescedRead(wsView_p[epStart + ep][ss]);         // broadcast
-              auto Wpsi = W * psi;
-              for (int s = 0; s < Nsimd; s++) {
-                auto Lr = coalescedReadRotate(Lblock, s); // own-lane's rotated L
-                sum[s][mu] = sum[s][mu] + innerProduct(Lr, Wpsi);
-              }
-            }
+      for (int mu = 0; mu < nGamma; mu++) {
+        int g = mu_offset + mu;
+        int nEp = nEp_p[g];
+        int epStart = epStart_p[g];
+        for (int ep = 0; ep < nEp; ep++) {
+          for (int so = 0; so < localSpatialVolume; so++) {
+            int ss = rt * localSpatialVolume + so;
+            int paddedSS = offsets_p[(epStart + ep) * osites + ss];
+            auto psi  = coalescedRead(rhsView_p[r_batch][paddedSS]);
+            auto W    = coalescedRead(wsView_p[epStart + ep][ss]);
+            auto Wpsi = W * psi;
+            for (int s = 0; s < Nsimd; s++)
+              sum[s][mu] += innerProduct(coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
           }
         }
-
-        for (int s = 0; s < Nsimd; s++)
-          for (int mu = 0; mu < nGamma; mu++) {
-            int shm_idx =
-                rt +
-                localOrthogDimSize * (s + Nsimd * (l_batch + nBatchesL * r_batch)) +
-                (mu_offset + mu) * gammaStride;
-            coalescedWrite(shm_p[shm_idx], sum[s][mu]);
-          }
       }
+
+      for (int s = 0; s < Nsimd; s++)
+        for (int mu = 0; mu < nGamma; mu++) {
+          int shm_idx =
+              rt +
+              localOrthogDimSize * (s + Nsimd * (l_batch + nBatchesL * r_batch)) +
+              (mu_offset + mu) * gammaStride;
+          coalescedWrite(shm_p[shm_idx], sum[s][mu]);
+        }
     });
   }
 
