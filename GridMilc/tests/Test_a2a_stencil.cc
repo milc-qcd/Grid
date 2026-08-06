@@ -44,13 +44,22 @@ typedef StaggeredImplD FImpl;
 typedef FImpl::FermionField FermionField;
 typedef FImpl::ComplexField ComplexField;
 
-// ---- Representative spin-taste pairs, one per popcount 0-4 ----
+// ---- Spin-taste pairs spanning popcount 0-4, with ALL six popcount-2 sets ----
 static std::vector<StagGamma::SpinTastePair> testGammas() {
   typedef StagGamma::StagAlgebra A;
   return {
       {A(A::G1), A(A::G1)},   // popcount 0
       {A(A::GX), A(A::G1)},   // popcount 1
-      {A(A::GXY), A(A::G1)},  // popcount 2
+      // popcount 2: ALL six 2-direction sets (taste=G1) -> spans corr=+1 AND
+      // corr=-1 endpoint pairs (oscillateDirs ∩ active != ∅). A scalar-W
+      // pairing/phase sign error shows up ONLY on corr=-1 pairs (phase(x) !=
+      // phase(x-s) there); these catch it.
+      {A(A::GXY), A(A::G1)},
+      {A(A::GZX), A(A::G1)},
+      {A(A::GYZ), A(A::G1)},
+      {A(A::GXT), A(A::G1)},
+      {A(A::GYT), A(A::G1)},
+      {A(A::GZT), A(A::G1)},
       {A(A::G5T), A(A::G1)},  // popcount 3
       {A(A::G5), A(A::G1)},   // popcount 4
   };

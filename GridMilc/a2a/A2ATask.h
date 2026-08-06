@@ -16,7 +16,6 @@
 #include <GridMilc/spin/StagGamma.h>
 #include <GridMilc/a2a/StencilGather5d.h>
 #ifdef GRID_CUDA
-#include <nvToolsExt.h>
 #include <cuda_profiler_api.h>
 #endif
 
@@ -1486,35 +1485,87 @@ spinTasteEndpoints(const StagGamma &spinTaste) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// spinTasteGaugeChain: build W_s (symmetric gauge transporter + Follana phase)
-// for a single spin-taste on the 5D grid and RETURN the 2^nActive endpoint
-// transporters.
+// classifySpinTasteEndpoints: partition the 2^nActive endpoints into
+// forward/backward pairs {s, -s} for endpoint pairing (D3). Canonical forward =
+// first-active-direction sign +1 (so exactly one of {s,-s} is forward).
+// pc=0 (nActive=0, single endpoint) is forward-only with no pair.
 //
-// W_s[ep](x) = phase(x) * scaling * Sum_over_orderings U-path(x -> x+s_ep),
-// reproducing StagGamma::applyGamma's internal covariant structure. The chain
-// is built ENTIRELY in 4D (U does not depend on RHS, so there is no need to
-// replicate it across dim-5 during construction) and promoted to 5D only once
-// per endpoint at the end. The Follana phase/scaling is applied in 4D via
-// applyCoeffsAndPhase (grid-agnostic, local).
-//
-// Self-contained: calls spinTasteEndpoints for the sign combos (the endpoint
-// enumeration logic lives in one place). The task move-merges the returned W_s
-// into its flattened _wsFlat — no deep copy (each Lattice is moved, a pointer
-// swap). const U: the build only reads U (PeekIndex per Lorentz component);
-// Phase 3 passes a non-const LatticeGaugeField* which binds to this const*
-// param without issue.
+// Outputs:
+//   forwardEndpoints - the nPairs stored forward endpoint coordinates
+//   forwardRep[ep]   - compact forward-field index (0..nPairs-1) for endpoint ep
+//                      (== its own index if forward, == its pair's if backward)
+//   isForward[ep]    - true iff ep is itself a forward endpoint
+// The backward read adj(C_s(x-s)) uses forwardRep[ep] to locate the stored
+// forward field. Host-only (one-time setup); O(nEp^2) with nEp <= 16.
+///////////////////////////////////////////////////////////////////////////////
+inline void classifySpinTasteEndpoints(const std::vector<Coordinate> &endpoints,
+                                       const std::array<int, 4> &dirs, int nActive,
+                                       std::vector<Coordinate> &forwardEndpoints,
+                                       std::vector<int> &forwardRep,
+                                       std::vector<bool> &isForward) {
+  int nEp = (int)endpoints.size();
+  forwardEndpoints.clear();
+  forwardRep.assign(nEp, -1);
+  isForward.assign(nEp, false);
+
+  if (nActive == 0) {
+    // pc=0: single endpoint, forward-only, no backward partner.
+    forwardEndpoints.push_back(endpoints[0]);
+    forwardRep[0] = 0;
+    isForward[0] = true;
+    return;
+  }
+
+  int firstDir = dirs[0];
+  // Forward endpoints: first-active-direction sign +1. Assign compact indices.
+  for (int ep = 0; ep < nEp; ep++) {
+    if (endpoints[ep][firstDir] > 0) {
+      isForward[ep] = true;
+      forwardRep[ep] = (int)forwardEndpoints.size();
+      forwardEndpoints.push_back(endpoints[ep]);
+    }
+  }
+  // Backward endpoints: map to the forward endpoint whose coordinate is the
+  // negation of this one (the {s,-s} partner). The full 2^nActive sign cube is
+  // closed under negation, so every backward ep finds a forward partner.
+  for (int ep = 0; ep < nEp; ep++) {
+    if (!isForward[ep]) {
+      for (int ep2 = 0; ep2 < nEp; ep2++) {
+        if (!isForward[ep2])
+          continue;
+        bool match = true;
+        for (int d = 0; d < 4; d++)
+          if (endpoints[ep2][d] != -endpoints[ep][d]) {
+            match = false;
+            break;
+          }
+        if (match) {
+          forwardRep[ep] = forwardRep[ep2];
+          break;
+        }
+      }
+    }
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// spinTasteGaugeChainUnphasedForward: build the UNPHASED symmetric gauge
+// transporter C_s for the FORWARD endpoints only, on grid4d (SIMD Cshift).
+// Same covariant chain as spinTasteGaugeChain (the symmetric n!-permutation
+// sum, CovShiftForward/Backward) but: (1) iterates only forwardEndpoints (the
+// nPairs stored reps -- D3), and (2) applies NO applyCoeffsAndPhase -- the
+// Follana phase + (1/2)^n/n! scaling is applied in the kernel via the per-gamma
+// phase field (D1/D6), so the pairing hermiticity C_{-s}(x)=adj(C_s(x-s)) is
+// exact (corr always +1). Returns grid4d chains (no promoteField5d here -- the
+// task ctor promotes/pads/unpacks to the scalar store). One-time setup cost.
 ///////////////////////////////////////////////////////////////////////////////
 inline std::vector<LatticeColourMatrix>
-spinTasteGaugeChain(const LatticeGaugeField *U, const StagGamma &spinTaste,
-                    GridCartesian *grid5d, GridCartesian *grid4d) {
+spinTasteGaugeChainUnphasedForward(const LatticeGaugeField *U,
+                                   const StagGamma &spinTaste,
+                                   GridCartesian *grid4d,
+                                   const std::vector<Coordinate> &forwardEndpoints) {
   static constexpr int Nd = 4;
 
-  std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
-  int nEndpoints = (int)endpoints.size();
-
-  // Active directions (recomputed; cheap) for the permutation ordering. The
-  // endpoint enumeration above derived the same dirs/nActive; recomputing here
-  // keeps the two helpers independent and costs only a 4-iteration host loop.
   int shift = spinTaste._spin ^ spinTaste._taste;
   std::array<int, 4> dirs;
   int nActive = 0;
@@ -1522,16 +1573,6 @@ spinTasteGaugeChain(const LatticeGaugeField *U, const StagGamma &spinTaste,
     if (static_cast<int>(StagGamma::gmu[j]) & shift)
       dirs[nActive++] = j;
 
-  // Per-direction gauge links in 4D — peeked directly from *U (matches
-  // A2ATaskOnelink's PeekIndex<LorentzIndex>(*_U, ...) pattern). W_s is a pure
-  // gauge transporter (RHS-independent), so the covariant chain is built
-  // ENTIRELY in 4D and promoted to 5D only once per endpoint at the end.
-  // Building in 4D avoids Nsimd-fold replicated work/memory during the
-  // 2^nActive x nActive! Cshift chain construction (the dominant setup cost).
-  // The hops use the literal CovShiftForward/Backward forms
-  // (Grid/qcd/utils/CovariantCshift.h): each carries exactly one halo Cshift,
-  // inherent to the covariant chain — so no pre-shifted adjoint copy is hoisted
-  // (hoisting it would not reduce the halo count, only obscure the asymmetry).
   std::vector<LatticeColourMatrix> Udir4d;
   Udir4d.reserve(Nd);
   for (int mu = 0; mu < Nd; mu++) {
@@ -1539,25 +1580,12 @@ spinTasteGaugeChain(const LatticeGaugeField *U, const StagGamma &spinTaste,
     Udir4d[mu] = PeekIndex<LorentzIndex>(*U, mu);
   }
 
-  // Single 4D accumulator (reused per endpoint) + 4D chain scratch. Lattice has
-  // no default ctor (requires a GridBase*), so they are constructed on grid4d.
   LatticeColourMatrix accumChain(grid4d), chain(grid4d);
   std::array<int, 4> perm;
 
-  StagGamma st;
-  st.setSpinTaste(spinTaste._spin, spinTaste._taste);
-
   std::vector<LatticeColourMatrix> Ws;
-  Ws.reserve(nEndpoints);
-  for (int ep = 0; ep < nEndpoints; ep++) {
-    const Coordinate &s = endpoints[ep];
-
-    // Symmetrized sum over all nActive! orderings (matches applyGamma) in 4D.
-    // This is a one-time setup cost amortized across all (l,r) contractions.
-    // A future optimization (design Future Optimization F2, v3.3b refinement)
-    // is to NOT materialize W_s at all: pad the gauge field U and apply the
-    // chain on-the-fly per site in the kernel, removing this 2^nActive x
-    // nActive! Cshift materialization cost entirely.
+  Ws.reserve(forwardEndpoints.size());
+  for (const auto &s : forwardEndpoints) {
     accumChain = Zero();
     for (int i = 0; i < nActive; i++)
       perm[i] = i;
@@ -1567,25 +1595,14 @@ spinTasteGaugeChain(const LatticeGaugeField *U, const StagGamma &spinTaste,
         int dir = dirs[perm[i]];
         int sign = s[dir];
         if (sign > 0) {
-          // CovShiftForward: Out(x) = U(x) * chain(x+dir) = U * Cshift(chain,+1)
-          chain = Udir4d[dir] * Cshift(chain, dir, +1);
+          chain = Udir4d[dir] * Cshift(chain, dir, +1);       // CovShiftForward
         } else {
-          // CovShiftBackward: Out(x) = adj(U)(x-dir) * chain(x-dir)
-          //                        = Cshift( adj(U) * chain, -1 )
-          chain = Cshift(adj(Udir4d[dir]) * chain, dir, -1);
+          chain = Cshift(adj(Udir4d[dir]) * chain, dir, -1);  // CovShiftBackward
         }
       }
       accumChain = accumChain + chain;
     } while (std::next_permutation(perm.begin(), perm.begin() + nActive));
-
-    // Apply Follana phase + (1/2)^n / n! scaling in 4D — applyCoeffsAndPhase is
-    // local and grid-agnostic, so the S3 spatial-only caveat is moot here
-    // (there is no dim-5 yet). Then promote the finished W_s to 5D (replicated
-    // dim-5) once per endpoint. (applyCoeffsAndPhase is in-place safe: it reads
-    // rhs into a temp before overwriting lhs.)
-    st.applyCoeffsAndPhase(accumChain, accumChain);
-    Ws.emplace_back(grid5d);
-    promoteField5d(Ws[ep], accumChain, grid4d, grid5d);
+    Ws.push_back(accumChain); // grid4d, unphased, forward endpoint
   }
   return Ws;
 }
@@ -1620,6 +1637,26 @@ accelerator_inline auto coalescedReadRotate(const vobj &vec, int s,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// promoteColourMatrix: promote a scalar ColourMatrix (read directly from the
+// _wScalarGrid view) to a calcColourMatrix. GPU: the per-lane calcColourMatrix
+// IS the scalar ColourMatrix; CPU: replicate the scalar into a vColourMatrix.
+// Mirrors coalescedReadRotate's #ifdef GRID_SIMT per-lane vs whole-vobj
+// convention. (The caller reads wsScalar_p[idx] DIRECTLY -- no coalescedRead,
+// per the GPU scalar-vobj expr-template constraint.)
+///////////////////////////////////////////////////////////////////////////////
+accelerator_inline auto promoteColourMatrix(const ColourMatrix &s)
+    -> decltype(coalescedRead(vColourMatrix())) {
+#ifdef GRID_SIMT
+  return s;
+#else
+  vColourMatrix v;
+  for (int lane = 0; lane < vColourMatrix::Nsimd(); lane++)
+    insertLane(lane, v, s);
+  return v;
+#endif
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // A2ATaskSpinTasteStencil: 5D stencil-based spin-taste meson-field task.
 //
 // SIMD lanes (dim-5) = RHS vectors (batched Nsimd at a time). Spatial dims are
@@ -1644,12 +1681,6 @@ protected:
   std::unique_ptr<PaddedCell> _cell5d;
   GridCartesian *_paddedGrid5d;
 
-  // Flattened W_s on the 5D grid + its A2AFieldView (device-safe array).
-  // Assembled by move-merging each gamma's spinTasteGaugeChain result (no deep
-  // copy); no per-gamma chain object is retained.
-  std::vector<LatticeColourMatrix> _wsFlat;
-  std::shared_ptr<A2AFieldView<vColourMatrix>> _wsView;
-
   // Flattened per-(gamma,ep,osite) padded offset (deviceVector).
   deviceVector<int> _allOffsets;
   deviceVector<int> _nEpDev;    // nEndpoints per gamma
@@ -1673,6 +1704,23 @@ protected:
   int _nBatchesR;
   int _Nsimd;
 
+  // --- Scalar W Lattice + pairing + phase (Slice 2+3). The kernel reads these
+  //     scalar fields directly (the old phased-all flattened-W path was removed
+  //     in Slice 3). ---
+  // W = Lattice<ColourMatrix> on a 5D Nsimd=1 grid (dim-5 = forward endpoints).
+  // Populated/read ONLY via direct view indexing (no expr templates -- D5/GPU note).
+  GridCartesian *_gridW = nullptr;
+  std::unique_ptr<PaddedCell> _cellW;
+  GridCartesian *_paddedGridW = nullptr;
+  std::unique_ptr<Lattice<ColourMatrix>> _wScalarGrid; // on _paddedGridW
+  int _nFwdEpTotal = 0;  // dim-5 size (total forward endpoints)
+  int _paddedOsites = 0; // padded spatial oSites (== paddedGrid5d oSites)
+  deviceVector<int> _forwardRepDev;     // [epTotal] global forward-field index
+  deviceVector<int> _isForwardDev;      // [epTotal] 0/1
+  deviceVector<int> _interiorOffsetDev; // [osites] shift-0 padded interior oSite (D7)
+  std::vector<ComplexField> _phaseFields;         // [nGamma] grid5d phase (D6)
+  std::shared_ptr<A2AFieldView<cobj>> _phaseView;
+
 public:
   A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
                           const std::vector<StagGamma::SpinTastePair> &gammas,
@@ -1687,11 +1735,12 @@ public:
     _cell5d = std::make_unique<PaddedCell>(1, _grid5d);
     _paddedGrid5d = _cell5d->grids.back();
 
-    // Build W_s + offsets per gamma. spinTasteGaugeChain returns each gamma's
-    // W_s, which are move-merged into wsFlatHost (no deep copy) — wsFlatHost
-    // becomes the authoritative _wsFlat. spinTasteEndpoints gives the endpoint
-    // list used both for nEndpoints and buildPaddedOffset5d.
-    std::vector<LatticeColourMatrix> wsFlatHost;
+    // Build per-gamma endpoint offsets + nEndpoints/epStart bookkeeping. Only
+    // the offset table + endpoint counts are assembled here; the W_s gauge chain
+    // is built separately below as the unphased forward scalar store (the old
+    // phased-all flattened-W path was removed in Slice 3).
+    // spinTasteEndpoints gives the endpoint list used both for nEndpoints and
+    // buildPaddedOffset5d.
     std::vector<int> allOffsetsHost;
     std::vector<int> nEpHost, epStartHost;
     _nEpTotal = 0;
@@ -1701,10 +1750,7 @@ public:
     for (int g = 0; g < (int)gammas.size(); g++) {
       spinTaste.setSpinTaste(gammas[g]);
 
-      // Two pure helpers: enumerate this gamma's endpoints, build its W_s.
       std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
-      std::vector<LatticeColourMatrix> ws =
-          spinTasteGaugeChain(U, spinTaste, _grid5d, fullGrid);
 
       nEpHost.push_back((int)endpoints.size());
       epStartHost.push_back(epCum);
@@ -1717,21 +1763,9 @@ public:
       allOffsetsHost.insert(allOffsetsHost.end(),
                             epOffsets.begin(), epOffsets.end());
 
-      // Move-merge this gamma's W_s into the flat store (no deep copy: each
-      // Lattice is moved, a pointer swap). wsFlatHost -> _wsFlat below.
-      wsFlatHost.insert(wsFlatHost.end(),
-                        std::make_move_iterator(ws.begin()),
-                        std::make_move_iterator(ws.end()));
-
       epCum += (int)endpoints.size();
       _nEpTotal += (int)endpoints.size();
     }
-
-    // wsFlatHost is the authoritative W_s store (built in place above); move it
-    // into the member and open its view.
-    _wsFlat = std::move(wsFlatHost);
-    _wsView = std::make_shared<A2AFieldView<vColourMatrix>>();
-    _wsView->openViews(_wsFlat.data(), _nEpTotal);
 
     // Upload bookkeeping deviceVectors.
     // acceleratorCopyToDevice requires 8-byte-aligned byte counts
@@ -1747,12 +1781,134 @@ public:
     _allOffsets = upload(allOffsetsHost);
     _nEpDev = upload(nEpHost);
     _epStartDev = upload(epStartHost);
+
+    // === Scalar W store + phase + pairing maps (Slice 2; additive) ============
+    _paddedOsites = _paddedGrid5d->oSites();
+
+    // Forward-W read site (D7): shift-0 padded interior oSite per source ss.
+    {
+      std::vector<int> interiorHost =
+          buildInteriorOffset(_grid5d, _paddedGrid5d, 1);
+      _interiorOffsetDev = upload(interiorHost);
+    }
+
+    // Phase fields (D1/D6): applyCoeffsAndPhase on a grid5d ones field mirrors
+    // A2ATaskLocal's phase pre-bake (A2ATask.h ctor). grid5d so ss matches the
+    // kernel osites; phase is spatial-only so dim-5 lanes are replicated. This
+    // is the SAME phase the old spinTasteGaugeChain baked into W -- applying it
+    // here (separate from the unphased W) is what makes the pairing hermiticity
+    // exact; the kernel must NOT also receive phased W (double-phase trap).
+    {
+      ComplexField ones5d(_grid5d);
+      ones5d = 1.0;
+      StagGamma spinTaste;
+      _phaseFields.reserve(gammas.size());
+      for (int g = 0; g < (int)gammas.size(); g++)
+        _phaseFields.emplace_back(_grid5d);
+      for (int g = 0; g < (int)gammas.size(); g++) {
+        spinTaste.setSpinTaste(gammas[g]);
+        spinTaste.applyCoeffsAndPhase(_phaseFields[g], ones5d);
+      }
+      _phaseView = std::make_shared<A2AFieldView<cobj>>();
+      _phaseView->openViews(_phaseFields.data(), (int)gammas.size());
+    }
+
+    // Pairing maps (D3): classify per gamma; global forward-field index =
+    // fwdEpCum + local compact index. Also accumulates _nFwdEpTotal.
+    std::vector<int> forwardRepHost, isForwardHost;
+    _nFwdEpTotal = 0;
+    {
+      StagGamma spinTaste;
+      int epBase = 0;   // running global endpoint index (== epCum above)
+      int fwdEpCum = 0; // running global forward-field index
+      for (int g = 0; g < (int)gammas.size(); g++) {
+        spinTaste.setSpinTaste(gammas[g]);
+        std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
+        int shift = spinTaste._spin ^ spinTaste._taste;
+        std::array<int, 4> dirs;
+        int nActive = 0;
+        for (int j = 0; j < 4; j++)
+          if (static_cast<int>(StagGamma::gmu[j]) & shift)
+            dirs[nActive++] = j;
+        std::vector<Coordinate> fwd;
+        std::vector<int> fwdRepLocal;
+        std::vector<bool> isFwdLocal;
+        classifySpinTasteEndpoints(endpoints, dirs, nActive, fwd, fwdRepLocal,
+                                   isFwdLocal);
+        int nEp = (int)endpoints.size();
+        forwardRepHost.resize(epBase + nEp);
+        isForwardHost.resize(epBase + nEp);
+        for (int ep = 0; ep < nEp; ep++) {
+          forwardRepHost[epBase + ep] = fwdEpCum + fwdRepLocal[ep];
+          isForwardHost[epBase + ep] = isFwdLocal[ep] ? 1 : 0;
+        }
+        epBase += nEp;
+        fwdEpCum += (int)fwd.size();
+        _nFwdEpTotal += (int)fwd.size();
+      }
+    }
+    _forwardRepDev = upload(forwardRepHost);
+    _isForwardDev = upload(isForwardHost);
+
+    // Scalar W Lattice (D5): gridW is a 5D Nsimd=1 grid whose dim-5 indexes the
+    // forward endpoints ("directions"); _wScalarGrid lives on its padded grid
+    // (spatial matches paddedGrid5d, so interiorOffset/paddedSS align). Build
+    // per forward direction: grid4d unphased chain -> promote grid5d -> pad
+    // (Exchange) -> unpackScalarW (extractLane 0) into the dim-5 slice. DIRECT
+    // view writes only (no expr/coalescedWrite -- GPU scalar-vobj constraint).
+    _gridW = createGridW(fullGrid, _nFwdEpTotal);
+    _cellW = std::make_unique<PaddedCell>(1, _gridW);
+    _paddedGridW = _cellW->grids.back();
+    _wScalarGrid = std::make_unique<Lattice<ColourMatrix>>(_paddedGridW);
+    {
+      // Bind a local reference: autoView(l_v, l, mode) expands l.View(mode)
+      // verbatim, so a unique_ptr must be dereferenced into a Lattice& first
+      // (else *_wScalarGrid.View(mode) binds .View to the unique_ptr).
+      Lattice<ColourMatrix> &wScalar = *_wScalarGrid;
+      autoView(wsGrid_v, wScalar, AcceleratorWrite);
+      int fwdEpCum = 0;
+      StagGamma spinTaste;
+      for (int g = 0; g < (int)gammas.size(); g++) {
+        spinTaste.setSpinTaste(gammas[g]);
+        std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
+        int shift = spinTaste._spin ^ spinTaste._taste;
+        std::array<int, 4> dirs;
+        int nActive = 0;
+        for (int j = 0; j < 4; j++)
+          if (static_cast<int>(StagGamma::gmu[j]) & shift)
+            dirs[nActive++] = j;
+        std::vector<Coordinate> fwd;
+        std::vector<int> fwdRepLocal;
+        std::vector<bool> isFwdLocal;
+        classifySpinTasteEndpoints(endpoints, dirs, nActive, fwd, fwdRepLocal,
+                                   isFwdLocal);
+
+        std::vector<LatticeColourMatrix> fwdChains =
+            spinTasteGaugeChainUnphasedForward(_U, spinTaste, fullGrid, fwd);
+        for (int fp = 0; fp < (int)fwdChains.size(); fp++) {
+          LatticeColourMatrix chain5d(_grid5d);
+          promoteField5d(chain5d, fwdChains[fp], fullGrid, _grid5d);
+          LatticeColourMatrix paddedChain5d = _cell5d->Exchange(chain5d);
+          // extract lane 0 -> scalar Lattice dim-5 slice (fwdEpCum+fp).
+          // &wsGrid_v[offset] is a ColourMatrix* into the view; unpackScalarW
+          // writes dst[ss] directly (no coalescedWrite).
+          unpackScalarW(&wsGrid_v[(size_t)(fwdEpCum + fp) * _paddedOsites],
+                        paddedChain5d, _paddedOsites);
+        }
+        fwdEpCum += (int)fwdChains.size();
+      }
+    }
   }
 
   // Reset _cell5d BEFORE deleting _grid5d: PaddedCell::~PaddedCell -> DeleteGrids
   // reads unpadded_grid (= _grid5d) members, so _grid5d must still be alive while
-  // the cell is destroyed (else use-after-free).
+  // the cell is destroyed (else use-after-free). Same ordering for the scalar-W
+  // trio: _wScalarGrid (a Lattice on _paddedGridW) must be reset before _cellW
+  // (which destroys _paddedGridW) and _gridW.
   virtual ~A2ATaskSpinTasteStencil() {
+    _wScalarGrid.reset();   // destroy scalar W Lattice before its padded grid
+    _cellW.reset();         // destroys _paddedGridW (reads _gridW members)
+    delete _gridW;
     _cell5d.reset();
     delete _grid5d;
   }
@@ -1928,11 +2084,7 @@ public:
               }
             }
           }
-#ifdef GRID_SIMT
         }
-#else
-        }
-#endif
       });
     }
 
@@ -1963,19 +2115,27 @@ public:
     int nBatchesR = _nBatchesR;
     int Nsimd = _Nsimd;
     int osites = _osites;
+    int paddedOsites = _paddedOsites;
 
-    GaugeView *wsView_p = _wsView->getView();        // [globalEp][ss]
+    // Scalar W store (Slice 2): bind a local Lattice& before autoView -- the
+    // macro expands w.View(mode) verbatim, so a unique_ptr must be dereferenced
+    // first (else *_wScalarGrid.View(mode) binds .View to the unique_ptr).
+    Lattice<ColourMatrix> &wScalar = *_wScalarGrid;
+    autoView(wsGrid_v, wScalar, AcceleratorRead);
+    ColourMatrix *wsScalar_p = &wsGrid_v[0];         // [globalFwdEp][paddedOsites]
     FermView *lhsView_p = _lhsView->getView();       // [l_batch][ss]
     FermView *rhsView_p = _paddedRhsView->getView(); // [r_batch][paddedSS]
+    ComplexView *phaseView_p = _phaseView->getView() + mu_offset; // [mu][ss]
 
-    auto offsets_p = _allOffsets.data();
+    auto offsets_p = _allOffsets.data();        // [(epStart+ep)*osites + ss]
     auto nEp_p = _nEpDev.data();
     auto epStart_p = _epStartDev.data();
+    auto forwardRep_p = _forwardRepDev.data();  // [globalEp] -> global fwd-field idx
+    auto isForward_p = _isForwardDev.data();    // [globalEp] 0/1
+    auto interiorOffset_p = _interiorOffsetDev.data(); // [ss]
 
     int nBatchesLT = nBatchesL * localOrthogDimSize;
-
 #ifdef GRID_CUDA
-    nvtxRangePushA("vectorSumFull5d");
     cudaProfilerStart();
 #endif
     accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, Nsimd, {
@@ -1992,14 +2152,29 @@ public:
         int nEp = nEp_p[g];
         int epStart = epStart_p[g];
         for (int ep = 0; ep < nEp; ep++) {
+          int ge = epStart + ep;           // global endpoint index
+          int fwdEp = forwardRep_p[ge];    // global forward-field index
+          bool isFwd = isForward_p[ge] != 0;
           for (int so = 0; so < localSpatialVolume; so++) {
             int ss = rt * localSpatialVolume + so;
-            int paddedSS = offsets_p[(epStart + ep) * osites + ss];
-            auto psi  = coalescedRead(rhsView_p[r_batch][paddedSS]);
-            auto W    = coalescedRead(wsView_p[epStart + ep][ss]);
+            int paddedSS = offsets_p[(size_t)ge * osites + ss];
+            auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]);
+            // W read site (D7): forward -> source x (interiorOffset, local);
+            // backward -> x-s (paddedSS, halo) + adj. W is UNPHASED C_s (D1/D4).
+            int wSS = isFwd ? interiorOffset_p[ss] : paddedSS;
+            auto W = promoteColourMatrix(wsScalar_p[(size_t)fwdEp * paddedOsites + wSS]);
+            if (!isFwd)
+              W = adj(W);
             auto Wpsi = W * psi;
+            // Follana phase + scaling at the SOURCE site x (D1/D6). W is unphased
+            // so the {s,-s} pairing hermiticity is exact (corr == +1). Phase is
+            // ep-independent; applied per-ep here (forced by the S1 ep-outside-so
+            // loop order -- restructuring to (mu,so,ep) would defeat the S1 psi
+            // stream) -- mathematically phase * sum_ep IP == sum_ep phase*IP.
+            calcScalar gamma_phase = coalescedRead(phaseView_p[mu][ss]);
             for (int s = 0; s < Nsimd; s++)
-              sum[s][mu] += innerProduct(coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
+              sum[s][mu] = sum[s][mu] + gamma_phase * innerProduct(
+                  coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
           }
         }
       }
@@ -2015,7 +2190,6 @@ public:
     });
 #ifdef GRID_CUDA
     cudaProfilerStop();
-    nvtxRangePop();
 #endif
   }
 

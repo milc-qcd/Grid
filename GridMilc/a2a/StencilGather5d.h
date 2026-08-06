@@ -205,4 +205,73 @@ inline void promoteField5d(Lattice<vobj> &dst5d, const Lattice<vobj> &src4d,
   });
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// createGridW: 5D GridCartesian with simd_layout={1,1,1,1,1} (Nsimd=1) for the
+// scalar W Lattice. Dim-4 = nDirections (the forward endpoints); spatial procs
+// inherited from grid4d; procs[4]=1. Spatial simd=1 matches the 5D gather grid
+// (so paddedSS/interiorOffset indices align). Nsimd=1 is consistent with the
+// scalar ColourMatrix element (ColourMatrix::Nsimd()==1) -- no SIMD mismatch.
+///////////////////////////////////////////////////////////////////////////////
+inline GridCartesian *createGridW(GridCartesian *grid4d, int nDirections) {
+  Coordinate gdim4d = grid4d->_fdimensions;
+  Coordinate procs4d = grid4d->_processors;
+  Coordinate gdimW(std::vector<int>(
+      {gdim4d[0], gdim4d[1], gdim4d[2], gdim4d[3], nDirections}));
+  Coordinate simdW(std::vector<int>({1, 1, 1, 1, 1}));
+  Coordinate procsW(std::vector<int>(
+      {procs4d[0], procs4d[1], procs4d[2], procs4d[3], 1}));
+  return new GridCartesian(gdimW, simdW, procsW);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// unpackScalarW: unpack a padded 5D SIMD field (replicated dim-5) into a
+// SCALAR store (a Lattice<ColourMatrix> view slice), one scalar object per
+// padded oSite. Because the field was
+// produced by promoteField5d (every dim-5 lane holds the same value),
+// extractLane(0) yields the canonical scalar. Used at task construction to
+// build the persistent scalar W store from the transient padded grid5d field.
+// Generic over vobj/sobj (GridCore-only: no QCD types named here); the caller
+// (A2ATask.h) instantiates vobj=vColourMatrix, sobj=ColourMatrix.
+///////////////////////////////////////////////////////////////////////////////
+template <typename vobj, typename sobj>
+inline void unpackScalarW(sobj *dst, const Lattice<vobj> &padded5d,
+                          int paddedOsites) {
+  autoView(padded_v, padded5d, AcceleratorRead);
+  accelerator_for(ss, paddedOsites, 1, {
+    dst[ss] = extractLane(0, padded_v[ss]);
+  });
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// buildInteriorOffset: per-source-oSite padded-grid oSite for a SHIFT-0
+// (identity) gather = the interior copy of each original site in the padded
+// grid. Forward-endpoint W is read at the SOURCE site x (always local); this
+// maps ss -> the padded interior oSite (D7). Mirrors buildPaddedOffset5d's
+// arithmetic with a zero endpoint. Host-only (oCoorFromOindex/oIndexReduced).
+///////////////////////////////////////////////////////////////////////////////
+inline std::vector<int>
+buildInteriorOffset(GridCartesian *grid5d, GridCartesian *paddedGrid5d,
+                    int depth) {
+  static constexpr int Nd = 4;
+  int osites = grid5d->oSites();
+  Coordinate procs = grid5d->_processors;
+
+  std::vector<int> hostOffset(osites);
+  for (int ss = 0; ss < osites; ss++) {
+    Coordinate ocoor(grid5d->Nd());
+    grid5d->oCoorFromOindex(ocoor, ss);
+    Coordinate paddedOcoor(grid5d->Nd());
+    for (int d = 0; d < Nd; d++) {
+      if (procs[d] > 1) {
+        paddedOcoor[d] = ocoor[d] + depth; // interior offset by depth
+      } else {
+        paddedOcoor[d] = ocoor[d]; // shift 0: identity, no periodic wrap needed
+      }
+    }
+    paddedOcoor[Nd] = 0; // dim 4 (vector) never shifted
+    hostOffset[ss] = paddedGrid5d->oIndexReduced(paddedOcoor);
+  }
+  return hostOffset;
+}
+
 NAMESPACE_END(Grid);
