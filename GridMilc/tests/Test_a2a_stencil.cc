@@ -44,6 +44,26 @@ typedef StaggeredImplD FImpl;
 typedef FImpl::FermionField FermionField;
 typedef FImpl::ComplexField ComplexField;
 
+// (L2-01) Test-only 5D padded gather via per-site offset. Moved here from
+// StencilGather5d.h so the production header ships only production code.
+// (Symbols autoView/Lattice/deviceVector/coalescedRead/coalescedWrite/
+//  accelerator_for come transitively from <Grid/Grid.h>.)
+template <typename vobj>
+inline void gatherViaOffset5d(Lattice<vobj> &result,
+                              const Lattice<vobj> &padded5d,
+                              const deviceVector<int> &offset, int ep,
+                              int osites) {
+  autoView(result_v, result, AcceleratorWrite);
+  autoView(padded_v, padded5d, AcceleratorRead);
+  auto offset_p = offset.data();
+  int Nsimd = result.Grid()->Nsimd();
+
+  accelerator_for(ss, osites, Nsimd, {
+    int paddedSS = offset_p[ep * osites + ss];
+    coalescedWrite(result_v[ss], coalescedRead(padded_v[paddedSS]));
+  });
+}
+
 // ---- Spin-taste pairs spanning popcount 0-4, with ALL six popcount-2 sets ----
 static std::vector<StagGamma::SpinTastePair> testGammas() {
   typedef StagGamma::StagAlgebra A;

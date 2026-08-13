@@ -78,27 +78,6 @@ buildPaddedOffset5d(GridCartesian *grid5d, GridCartesian *paddedGrid5d,
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-// gatherViaOffset5d: TEST ONLY -- gathers a shifted field from the 5D padded
-// grid using the per-site offset. Validates the offset against Cshift.
-// Each dim-5 lane (RHS vector) is shifted by the same spatial offset.
-///////////////////////////////////////////////////////////////////////////////
-template <typename vobj>
-inline void gatherViaOffset5d(Lattice<vobj> &result,
-                              const Lattice<vobj> &padded5d,
-                              const deviceVector<int> &offset, int ep,
-                              int osites) {
-  autoView(result_v, result, AcceleratorWrite);
-  autoView(padded_v, padded5d, AcceleratorRead);
-  auto offset_p = offset.data();
-  int Nsimd = result.Grid()->Nsimd();
-
-  accelerator_for(ss, osites, Nsimd, {
-    int paddedSS = offset_p[ep * osites + ss];
-    coalescedWrite(result_v[ss], coalescedRead(padded_v[paddedSS]));
-  });
-}
-
-///////////////////////////////////////////////////////////////////////////////
 // src4dIndex: maps a 5D spatial oSite (physical local coord phys[0..3]) to the
 // (oSite, lane) of the originating 4D SIMD field, using the 4D grid's
 // interleaved decomposition (phys[d] = ocoor[d] + rdim[d]*icoor[d]).
@@ -114,6 +93,23 @@ accelerator_inline void src4dIndex(int &srcOSite, int &srcLane,
     srcOSite += ostride[d] * (phys[d] % rdim[d]);
     srcLane += istride[d] * (phys[d] / rdim[d]);
   }
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// src4dSiteFrom5d: decode a 5D spatial oSite `ss` into the (oSite, lane) of
+// its originating 4D SIMD field. Wraps the CoorFromIndex + src4dIndex preamble
+// shared by pack5d and promoteField5d (L2-05). Lane-independent: for a fixed ss
+// the (srcOSite, srcLane) result is the same for every dim-5 lane, so callers
+// may compute it once and reuse across lanes.
+///////////////////////////////////////////////////////////////////////////////
+accelerator_inline void src4dSiteFrom5d(int &srcOSite, int &srcLane, int ss,
+                                        int nd5d, const Coordinate &rdim5d,
+                                        const Coordinate &rdim,
+                                        const Coordinate &ostride,
+                                        const Coordinate &istride) {
+  Coordinate phys(nd5d);
+  Lexicographic::CoorFromIndex(phys, ss, rdim5d);
+  src4dIndex(srcOSite, srcLane, phys, rdim, ostride, istride);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -147,8 +143,8 @@ inline void pack5d(Lattice<vobj> &rhs5d, const Lattice<vobj> *rhs4d, int nVec,
   autoView(dst_v, rhs5d, AcceleratorWrite);
 
   accelerator_for(ss, dstOsites, Nsimd, {
-    Coordinate phys(nd5d);
-    Lexicographic::CoorFromIndex(phys, ss, rdim5d); // phys[0..3] spatial, phys[4]=0
+    int srcOSite, srcLane;
+    src4dSiteFrom5d(srcOSite, srcLane, ss, nd5d, rdim5d, rdim, ostride, istride);
 #ifdef GRID_SIMT
     {
       int lane = acceleratorSIMTlane(Nsimd);
@@ -156,8 +152,6 @@ inline void pack5d(Lattice<vobj> &rhs5d, const Lattice<vobj> *rhs4d, int nVec,
     for (int lane = 0; lane < Nsimd; lane++) {
 #endif
       if (lane < nVec) {
-        int srcOSite, srcLane;
-        src4dIndex(srcOSite, srcLane, phys, rdim, ostride, istride);
         auto scalar = extractLane(srcLane, srcView_p[lane][srcOSite]);
         insertLane(lane, dst_v[ss], scalar);
       }
@@ -192,10 +186,8 @@ inline void promoteField5d(Lattice<vobj> &dst5d, const Lattice<vobj> &src4d,
   autoView(dst_v, dst5d, AcceleratorWrite);
 
   accelerator_for(ss, dstOsites, 1, {
-    Coordinate phys(nd5d);
-    Lexicographic::CoorFromIndex(phys, ss, rdim5d);
     int srcOSite, srcLane;
-    src4dIndex(srcOSite, srcLane, phys, rdim, ostride, istride);
+    src4dSiteFrom5d(srcOSite, srcLane, ss, nd5d, rdim5d, rdim, ostride, istride);
     // Extract the scalar once, replicate into all Nsimd lanes.
     auto scalar = extractLane(srcLane, src_v[srcOSite]);
     vobj val;
