@@ -18,8 +18,8 @@ NAMESPACE_BEGIN(Grid);
 template <typename Vtype, typename obj> class A2AViewBase {
 public:
   std::vector<Vtype> _view;
-  Vtype *_view_device;
-  size_t _view_device_size;
+  Vtype *_view_device = nullptr;
+  size_t _view_device_size = 0;
 
 public:
   A2AViewBase() = default;
@@ -31,7 +31,7 @@ public:
   void reserve(int size) {
     _view.reserve(size);
     _view_device_size = size * sizeof(Vtype);
-    _view_device = (Vtype *)acceleratorAllocDevice(_view_device_size);
+    _view_device = static_cast<Vtype*>(acceleratorAllocDevice(_view_device_size));
   }
 
   Vtype *getView() { return _view_device; }
@@ -40,6 +40,10 @@ public:
     acceleratorCopyToDevice(_view.data(), _view_device, _view_device_size);
   }
 
+  // (L3-02) Idempotent: callers may release device memory early via an explicit
+  // closeViews() while the shared_ptr-wrapped view stays alive; the dtor calls
+  // it again. The size guard + null-after-free make the repeat call a no-op.
+  // Safe on a view never reserve()'d (members default to nullptr/0).
   virtual void closeViews() {
     for (int p = 0; p < this->_view.size(); p++)
       this->_view[p].ViewClose();
@@ -49,6 +53,7 @@ public:
     if (this->_view_device_size > 0) {
       acceleratorFreeDevice(this->_view_device);
       this->_view_device_size = 0;
+      this->_view_device = nullptr;
     }
   }
 
@@ -74,12 +79,12 @@ protected:
   std::vector<std::unique_ptr<CartesianStencil<obj, obj, FImplParams>>>
       _stencils;
 
-  obj *_buffer_device;
-  size_t _buffer_device_size;
+  obj *_buffer_device = nullptr;
+  size_t _buffer_device_size = 0;
 
   std::vector<Integer> _offset;
-  Integer *_offset_device;
-  size_t _offset_device_size;
+  Integer *_offset_device = nullptr;
+  size_t _offset_device_size = 0;
 
 public:
   obj *getBuffer() { return _buffer_device; }
@@ -137,14 +142,16 @@ public:
         j++;
     }
     _offset_device_size = _offset.size() * sizeof(Integer);
-    _offset_device = (Integer *)acceleratorAllocDevice(_offset_device_size);
+    _offset_device = static_cast<Integer*>(acceleratorAllocDevice(_offset_device_size));
     acceleratorCopyToDevice(_offset.data(), _offset_device,
                             _offset_device_size);
 
     _buffer_device_size = buffer.size() * sizeof(obj);
-    _buffer_device = (obj *)acceleratorAllocDevice(_buffer_device_size);
+    _buffer_device = static_cast<obj*>(acceleratorAllocDevice(_buffer_device_size));
     acceleratorCopyToDevice(buffer.data(), _buffer_device, _buffer_device_size);
   }
+  // (L3-02) null the buffer/offset pointers after free so the explicit+dtor
+  // dual closeViews() call is a safe no-op the second time.
   virtual void closeViews() {
 
     A2AViewBase<CartesianStencilView<obj, obj, FImplParams>, obj>::closeViews();
@@ -156,6 +163,8 @@ public:
       acceleratorFreeDevice(_buffer_device);
       acceleratorFreeDevice(_offset_device);
 
+      _buffer_device = nullptr;
+      _offset_device = nullptr;
       _offset_device_size = 0;
       _buffer_device_size = 0;
     }

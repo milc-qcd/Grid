@@ -26,7 +26,7 @@ public:
   typedef typename vobj::scalar_type scalar_type;
 
 public:
-  GridBase *_grid, *_cb_grid;
+  GridBase *_grid;
 
   double _flops, _t_kernel, _t_gsum;
 
@@ -254,7 +254,7 @@ public:
         acceleratorFreeDevice(this->_cache_device);
       this->_cache_bytes = mat.size() * sizeof(scalar_type);
       this->_cache_device =
-          (scalar_type *)acceleratorAllocDevice(this->_cache_bytes);
+          static_cast<scalar_type*>(acceleratorAllocDevice(this->_cache_bytes));
     }
     scalar_type *matDevice = this->_cache_device;
     {
@@ -307,9 +307,7 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
       acceleratorFreeDevice(_cache_device);
     }
     _cache_bytes = mat.size() * sizeof(scalar_type);
-    std::cout << GridLogPerformance << "cache bytes: " << _cache_bytes
-              << std::endl;
-    _cache_device = (scalar_type *)acceleratorAllocDevice(_cache_bytes);
+    _cache_device = static_cast<scalar_type*>(acceleratorAllocDevice(_cache_bytes));
   }
   scalar_type *matDevice = _cache_device;
   GRID_TRACE("A2A/ZeroInit");

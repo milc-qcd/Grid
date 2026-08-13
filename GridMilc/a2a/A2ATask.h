@@ -15,9 +15,6 @@
 #include <GridMilc/a2a/A2AView.h>
 #include <GridMilc/spin/StagGamma.h>
 #include <GridMilc/a2a/StencilGather5d.h>
-#ifdef GRID_CUDA
-#include <cuda_profiler_api.h>
-#endif
 
 #ifndef MF_SUM_ARRAY_MAX
 #define MF_SUM_ARRAY_MAX 16
@@ -113,7 +110,7 @@ public:
     }
 
     size_t size = _i_coor_container.size() * sizeof(Coordinate);
-    _i_coor_container_device = (Coordinate *)acceleratorAllocDevice(size);
+    _i_coor_container_device = static_cast<Coordinate*>(acceleratorAllocDevice(size));
     acceleratorCopyToDevice(_i_coor_container.data(), _i_coor_container_device,
                             size);
   }
@@ -133,8 +130,8 @@ public:
 
     if (_o_coor_map.size() == 0) {
       _o_coor_map.resize(_grid->oSites(), 0);
-      _o_coor_map_device = (Integer *)acceleratorAllocDevice(
-          _o_coor_map.size() * sizeof(Integer));
+      _o_coor_map_device = static_cast<Integer*>(acceleratorAllocDevice(
+          _o_coor_map.size() * sizeof(Integer)));
 
       int nBlocks = _grid->_slice_nblock[_orthog_dir];
       int vecsPerSlicePerBlock = _grid->_slice_block[_orthog_dir];
@@ -185,6 +182,7 @@ public:
     case ContractType::BothHalf:
     case ContractType::Full:
       _grid = left[0].Grid();
+      break;
     default:
       break;
     }
@@ -217,6 +215,7 @@ public:
     case ContractType::BothHalf:
     case ContractType::Full:
       _grid = right[0].Grid();
+      break;
     default:
       break;
     }
@@ -291,7 +290,7 @@ public:
     int gammaStride = sizeR * sizeL * reducedOrthogDimSize;
     int MFrvol = gammaStride * nGamma;
 
-    cobj *shm_p = (cobj *)acceleratorAllocDevice(MFrvol * sizeof(cobj));
+    cobj *shm_p = static_cast<cobj*>(acceleratorAllocDevice(MFrvol * sizeof(cobj)));
 
     // Loop over gammas in batches of MF_SUM_ARRAY_MAX
     {
@@ -834,12 +833,14 @@ public:
     switch (this->_contract_type) {
     case ContractType::Full:
       cb = Even;
+      [[fallthrough]];
     case ContractType::BothHalf:
     case ContractType::RightHalf:
       this->_grid = right[0].Grid();
       break;
     case ContractType::LeftHalf:
       cb = Even;
+      break;
     default:
       break;
     }
@@ -1254,6 +1255,7 @@ public:
     case ContractType::BothHalf:
     case ContractType::Full:
       this->_grid = right[0].Grid();
+      break;
     default:
       break;
     }
@@ -2022,7 +2024,7 @@ public:
     int gammaStride = _nBatchesL * _nBatchesR * localOrthogDimSize * _Nsimd;
 
     cobj *shm_p =
-        (cobj *)acceleratorAllocDevice(gammaStride * nGamma * sizeof(cobj));
+        static_cast<cobj*>(acceleratorAllocDevice(gammaStride * nGamma * sizeof(cobj)));
     {
       GRID_TRACE("A2AStencil/ZeroScratch");
       accelerator_for(idx, gammaStride * nGamma, 1, { shm_p[idx] = Zero(); });
@@ -2135,9 +2137,6 @@ public:
     auto interiorOffset_p = _interiorOffsetDev.data(); // [ss]
 
     int nBatchesLT = nBatchesL * localOrthogDimSize;
-#ifdef GRID_CUDA
-    cudaProfilerStart();
-#endif
     accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, Nsimd, {
       int l_batch = lt_batch / localOrthogDimSize;
       int rt      = lt_batch % localOrthogDimSize;
@@ -2188,9 +2187,6 @@ public:
           coalescedWrite(shm_p[shm_idx], sum[s][mu]);
         }
     });
-#ifdef GRID_CUDA
-    cudaProfilerStop();
-#endif
   }
 
   virtual void vectorSumFull(cobj *, int, int) {
