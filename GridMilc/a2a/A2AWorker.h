@@ -14,6 +14,7 @@
 #include <Grid/GridQCDcore.h>
 #include <Grid/Grid_Eigen_Tensor.h>
 #include <GridMilc/a2a/A2ATask.h>
+#include <GridMilc/a2a/A2ACache.h>
 #include <GridMilc/spin/StagGamma.h>
 
 NAMESPACE_BEGIN(Grid);
