@@ -15,6 +15,7 @@
 #include <GridMilc/a2a/A2AView.h>
 #include <GridMilc/spin/StagGamma.h>
 #include <GridMilc/a2a/StencilGather5d.h>
+#include <GridMilc/a2a/A2AContractType.h>
 
 #ifndef MF_SUM_ARRAY_MAX
 #define MF_SUM_ARRAY_MAX 16
@@ -44,7 +45,6 @@ NAMESPACE_BEGIN(Grid);
   typedef LatticeView<vColourMatrix> GaugeView;                                \
   typedef LatticeView<cobj> ComplexView;                                       \
   typedef LatticeView<vobj> FermView;                                          \
-  typedef typename A2ATaskBase<FImpl>::ContractType ContractType;              \
   typedef std::function<void(scalar_type *, cobj *)> SimdFunc;                 \
   typedef std::function<void(cobj *, int, int)> VectorFunc;
 
@@ -77,9 +77,6 @@ NAMESPACE_BEGIN(Grid);
 
 template <typename FImpl> class A2ATaskBase {
 public:
-  GRID_SERIALIZABLE_ENUM(ContractType, undef, Full, 0, RightHalf, 1, LeftHalf,
-                         2, BothHalf, 3);
-
   A2A_TYPEDEFS;
 
 protected:
