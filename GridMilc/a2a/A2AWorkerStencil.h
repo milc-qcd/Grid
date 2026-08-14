@@ -1,0 +1,123 @@
+/******************************************************************************/
+/* A2AWorkerStencil.h -- split stencil worker for the a2a meson-field path.    */
+/*                                                                            */
+/* A2AWorkerSpinTasteStencil is the full-grid, single-task production worker,  */
+/* detached from the legacy worker base class hierarchy: it owns its grid, an  */
+/* output-mat device cache (via the A2ACache DOD facility), an L/R address     */
+/* cache, and the stencil task by concrete pointer.                           */
+/*                                                                            */
+/* Part of GridMilc (https://github.com/paboyle/Grid).                       */
+/******************************************************************************/
+#pragma once
+
+#include <Grid/GridQCDcore.h>
+#include <Grid/Grid_Eigen_Tensor.h>
+#include <GridMilc/a2a/A2ACache.h>
+#include <GridMilc/a2a/A2ATaskStencil.h>
+#include <GridMilc/spin/StagGamma.h>
+
+NAMESPACE_BEGIN(Grid);
+
+///////////////////////////////////////////////////////////////////////////////
+// A2AWorkerSpinTasteStencil: full-grid stencil worker (full-grid only in v3.3).
+// The caller passes full-grid LHS/RHS arrays (no E/O splitting); the task
+// promotes them directly to the 5D grid. Mirrors the A2AWorkerLocal/Onelink
+// lifecycle: setLeft/setRight re-run only when the input address changes
+// (address-cache via _l_addr/_r_addr), so a worker kept alive across many calls
+// skips redundant 5D re-promotion.
+///////////////////////////////////////////////////////////////////////////////
+template <class FImpl>
+class A2AWorkerSpinTasteStencil {
+public:
+  typedef typename FImpl::ComplexField ComplexField;
+  typedef typename FImpl::FermionField FermionField;
+  typedef typename FImpl::SiteSpinor vobj;
+  typedef typename vobj::scalar_type scalar_type;
+
+  GridBase *_grid;
+
+  // Output-mat device cache (A2ACache facility): grow-only, reused across the
+  // many StagMesonField calls a long-lived worker serves, freed at dtor.
+  A2AMatCache<scalar_type> _matCache;
+
+  // L/R address cache.
+  const FermionField *_l_addr = nullptr;
+  const FermionField *_r_addr = nullptr;
+
+  // The stencil task. Public: benchmarks read task->getFlops() directly
+  // (Benchmark_a2a_spin_taste.cc reaches in via worker._stencil_task->getFlops()).
+  A2ATaskSpinTasteStencil<FImpl> *_stencil_task;
+
+  A2AWorkerSpinTasteStencil() = delete;
+  A2AWorkerSpinTasteStencil(GridBase *grid,
+                            const std::vector<ComplexField> &mom,
+                            const std::vector<StagGamma::SpinTastePair> &gammas,
+                            LatticeGaugeField *U, int orthogDir)
+      : _grid(grid) {
+    // Momentum projection is not implemented for the stencil path (same as the
+    // sibling A2AWorkerSpinTaste). MesonField passes `ph` unconditionally, so
+    // this guards useStencil + non-zero momentum from silently producing
+    // unprojected (wrong) results.
+    if (mom.size()) {
+      assert(0 && "A2AWorkerSpinTasteStencil: momentum projection not implemented");
+    }
+    GridCartesian *fullGrid = dynamic_cast<GridCartesian *>(grid);
+    assert(fullGrid != nullptr);
+    _stencil_task = new A2ATaskSpinTasteStencil<FImpl>(
+        fullGrid, orthogDir, gammas, U);
+  }
+
+  // Owns both the task and the cache (freeMatCache is a safe no-op on an
+  // unused cache).
+  ~A2AWorkerSpinTasteStencil() {
+    freeMatCache(_matCache);
+    delete _stencil_task;
+  }
+
+  void resetCache() { _l_addr = nullptr; _r_addr = nullptr; }
+
+  template <typename TensorType>
+  void StagMesonFieldStencil(TensorType &mat,
+                             const FermionField *lhs,
+                             const FermionField *rhs,
+                             int sizeL, int sizeR) {
+    // Output-mat device cache + zero (A2ACache facility).
+    scalar_type *matDevice =
+        ensureMatCache(_matCache, mat.size() * sizeof(scalar_type));
+    {
+      GRID_TRACE("A2AStencil/ZeroInit");
+      zeroMatCache(matDevice, mat.size());
+    }
+
+    // Address-cache (C1): re-run the 5D promotion only when the input pointer
+    // changes -- mirrors the inherited StagMesonField's _l_addr/_r_addr gating.
+    // Feed the full-grid inputs directly to the task (NO sizeL/sizeR 4D
+    // full-grid temporaries); the task owns the 4D->5D promotion.
+    if (_l_addr != lhs) {
+      _l_addr = lhs;
+      GRID_TRACE("A2AStencil/SetLeft");
+      _stencil_task->setLeft(lhs, sizeL);
+    }
+    if (_r_addr != rhs) {
+      _r_addr = rhs;
+      GRID_TRACE("A2AStencil/SetRight");
+      _stencil_task->setRight(rhs, sizeR);
+    }
+    {
+      GRID_TRACE("A2AStencil/Execute");
+      _stencil_task->execute(matDevice);
+    }
+    {
+      GRID_TRACE("A2AStencil/CopyFromDevice");
+      copyFromDeviceMat(matDevice, mat.data(), mat.size());
+    }
+    // Multi-rank reduction (B6): each rank summed only its local spatial sites;
+    // the mat values must be GlobalSum'd or multi-rank output is wrong.
+    {
+      GRID_TRACE("A2AStencil/GlobalSum");
+      globalSumMat(_grid, mat.data(), mat.size());
+    }
+  }
+};
+
+NAMESPACE_END(Grid);
