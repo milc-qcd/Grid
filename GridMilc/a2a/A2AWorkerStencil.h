@@ -44,9 +44,10 @@ public:
   const FermionField *_l_addr = nullptr;
   const FermionField *_r_addr = nullptr;
 
-  // The stencil task. Public: benchmarks read task->getFlops() directly
-  // (Benchmark_a2a_spin_taste.cc reaches in via worker._stencil_task->getFlops()).
-  A2ATaskSpinTasteStencil<FImpl> *_stencil_task;
+  // The stencil task (RAII-owned). Public: benchmarks read task->getFlops()
+  // directly (Benchmark_a2a_spin_taste.cc reaches in via
+  // worker._stencil_task->getFlops(), which works via unique_ptr::operator->).
+  std::unique_ptr<A2ATaskSpinTasteStencil<FImpl>> _stencil_task;
 
   A2AWorkerSpinTasteStencil() = delete;
   A2AWorkerSpinTasteStencil(GridBase *grid,
@@ -63,15 +64,16 @@ public:
     }
     GridCartesian *fullGrid = dynamic_cast<GridCartesian *>(grid);
     assert(fullGrid != nullptr);
-    _stencil_task = new A2ATaskSpinTasteStencil<FImpl>(
+    _stencil_task = std::make_unique<A2ATaskSpinTasteStencil<FImpl>>(
         fullGrid, orthogDir, gammas, U);
   }
 
   // Owns both the task and the cache (freeMatCache is a safe no-op on an
-  // unused cache).
+  // unused cache). The task itself is auto-freed (unique_ptr); no
+  // teardown-order hazard: the task's device state is independent of the
+  // output-mat cache.
   ~A2AWorkerSpinTasteStencil() {
     freeMatCache(_matCache);
-    delete _stencil_task;
   }
 
   void resetCache() { _l_addr = nullptr; _r_addr = nullptr; }

@@ -245,8 +245,8 @@ public:
 protected:
   std::vector<StagGamma::SpinTastePair> _gammas;
   LatticeGaugeField *_U;
-  GridCartesian *_fullGrid; // 4D full grid (E/O joined)
-  GridCartesian *_grid5d;   // 5D grid (simd={1,1,1,1,Nsimd})
+  GridCartesian *_fullGrid; // 4D full grid (E/O joined, non-owning: caller owns)
+  std::unique_ptr<GridCartesian> _grid5d; // 5D grid (simd={1,1,1,1,Nsimd})
   int _orthog_dir;          // orthogonal direction (only ex-base member)
 
   std::unique_ptr<PaddedCell> _cell5d;
@@ -280,7 +280,7 @@ protected:
   //     in Slice 3). ---
   // W = Lattice<ColourMatrix> on a 5D Nsimd=1 grid (dim-5 = forward endpoints).
   // Populated/read ONLY via direct view indexing (no expr templates -- D5/GPU note).
-  GridCartesian *_gridW = nullptr;
+  std::unique_ptr<GridCartesian> _gridW;
   std::unique_ptr<PaddedCell> _cellW;
   GridCartesian *_paddedGridW = nullptr;
   std::unique_ptr<Lattice<ColourMatrix>> _wScalarGrid; // on _paddedGridW
@@ -302,7 +302,7 @@ public:
     _Nsimd = fullGrid->Nsimd();
     _osites = _grid5d->oSites();
 
-    _cell5d = std::make_unique<PaddedCell>(1, _grid5d);
+    _cell5d = std::make_unique<PaddedCell>(1, _grid5d.get());
     _paddedGrid5d = _cell5d->grids.back();
 
     // Build per-gamma endpoint offsets + nEndpoints/epStart bookkeeping. Only
@@ -329,7 +329,7 @@ public:
       // returns a host std::vector<int> directly (no device round-trip); the
       // single upload into _allOffsets happens once, after the loop (S1).
       std::vector<int> epOffsets =
-          buildPaddedOffset5d(_grid5d, _paddedGrid5d, 1, endpoints);
+          buildPaddedOffset5d(_grid5d.get(), _paddedGrid5d, 1, endpoints);
       allOffsetsHost.insert(allOffsetsHost.end(),
                             epOffsets.begin(), epOffsets.end());
 
@@ -358,7 +358,7 @@ public:
     // Forward-W read site (D7): shift-0 padded interior oSite per source ss.
     {
       std::vector<int> interiorHost =
-          buildInteriorOffset(_grid5d, _paddedGrid5d, 1);
+          buildInteriorOffset(_grid5d.get(), _paddedGrid5d, 1);
       _interiorOffsetDev = upload(interiorHost);
     }
 
@@ -369,12 +369,12 @@ public:
     // here (separate from the unphased W) is what makes the pairing hermiticity
     // exact; the kernel must NOT also receive phased W (double-phase trap).
     {
-      ComplexField ones5d(_grid5d);
+      ComplexField ones5d(_grid5d.get());
       ones5d = 1.0;
       StagGamma spinTaste;
       _phaseFields.reserve(gammas.size());
       for (int g = 0; g < (int)gammas.size(); g++)
-        _phaseFields.emplace_back(_grid5d);
+        _phaseFields.emplace_back(_grid5d.get());
       for (int g = 0; g < (int)gammas.size(); g++) {
         spinTaste.setSpinTaste(gammas[g]);
         spinTaste.applyCoeffsAndPhase(_phaseFields[g], ones5d);
@@ -427,7 +427,7 @@ public:
     // (Exchange) -> unpackScalarW (extractLane 0) into the dim-5 slice. DIRECT
     // view writes only (no expr/coalescedWrite -- GPU scalar-vobj constraint).
     _gridW = createGridW(fullGrid, _nFwdEpTotal);
-    _cellW = std::make_unique<PaddedCell>(1, _gridW);
+    _cellW = std::make_unique<PaddedCell>(1, _gridW.get());
     _paddedGridW = _cellW->grids.back();
     _wScalarGrid = std::make_unique<Lattice<ColourMatrix>>(_paddedGridW);
     {
@@ -456,8 +456,8 @@ public:
         std::vector<LatticeColourMatrix> fwdChains =
             spinTasteGaugeChainUnphasedForward(_U, spinTaste, fullGrid, fwd);
         for (int fp = 0; fp < (int)fwdChains.size(); fp++) {
-          LatticeColourMatrix chain5d(_grid5d);
-          promoteField5d(chain5d, fwdChains[fp], fullGrid, _grid5d);
+          LatticeColourMatrix chain5d(_grid5d.get());
+          promoteField5d(chain5d, fwdChains[fp], fullGrid, _grid5d.get());
           LatticeColourMatrix paddedChain5d = _cell5d->Exchange(chain5d);
           // extract lane 0 -> scalar Lattice dim-5 slice (fwdEpCum+fp).
           // &wsGrid_v[offset] is a ColourMatrix* into the view; unpackScalarW
@@ -470,18 +470,14 @@ public:
     }
   }
 
-  // Reset _cell5d BEFORE deleting _grid5d: PaddedCell::~PaddedCell -> DeleteGrids
-  // reads unpadded_grid (= _grid5d) members, so _grid5d must still be alive while
-  // the cell is destroyed (else use-after-free). Same ordering for the scalar-W
-  // trio: _wScalarGrid (a Lattice on _paddedGridW) must be reset before _cellW
-  // (which destroys _paddedGridW) and _gridW.
-  ~A2ATaskSpinTasteStencil() {
-    _wScalarGrid.reset();   // destroy scalar W Lattice before its padded grid
-    _cellW.reset();         // destroys _paddedGridW (reads _gridW members)
-    delete _gridW;
-    _cell5d.reset();
-    delete _grid5d;
-  }
+  // Teardown is safe-by-construction (L1.2-04): members destroy in REVERSE
+  // declaration order, and the declaration layout encodes the PaddedCell
+  // teardown invariant -- ~PaddedCell -> DeleteGrids reads
+  // unpadded_grid->_processors, so a cell must die before the grid it wraps.
+  // Declaration order gives _wScalarGrid (Lattice on _paddedGridW) -> _cellW
+  // (destroys _paddedGridW) -> _gridW, and _cell5d -> _grid5d.
+  // Do NOT reorder the data members.
+  ~A2ATaskSpinTasteStencil() = default;
 
   int getNgamma() { return (int)_gammas.size(); }
   double getFlops() {
@@ -515,7 +511,7 @@ public:
       _lhs5d.clear();
       _lhs5d.reserve(_nBatchesL);
       for (int b = 0; b < _nBatchesL; b++)
-        _lhs5d.emplace_back(_grid5d);
+        _lhs5d.emplace_back(_grid5d.get());
     }
 
     {
@@ -523,7 +519,7 @@ public:
       for (int b = 0; b < _nBatchesL; b++) {
         int nVec = std::min(_Nsimd, size - b * _Nsimd);
         _lhs5d[b] = Zero(); // zero unused lanes of the partial last batch
-        pack5d(_lhs5d[b], left + b * _Nsimd, nVec, grid4d, _grid5d);
+        pack5d(_lhs5d[b], left + b * _Nsimd, nVec, grid4d, _grid5d.get());
       }
     }
     _lhsView = std::make_shared<A2AFieldView<vobj>>();
@@ -548,13 +544,13 @@ public:
     }
 
     GridBase *grid4d = right[0].Grid();
-    Lattice<vobj> rhs5d(_grid5d);
+    Lattice<vobj> rhs5d(_grid5d.get());
     for (int b = 0; b < _nBatchesR; b++) {
       int nVec = std::min(_Nsimd, size - b * _Nsimd);
       rhs5d = Zero();
       {
         GRID_TRACE("A2AStencil/PackRhs5d");
-        pack5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d);
+        pack5d(rhs5d, right + b * _Nsimd, nVec, grid4d, _grid5d.get());
       }
       {
         GRID_TRACE("A2AStencil/HaloExchange");

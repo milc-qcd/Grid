@@ -18,8 +18,10 @@ NAMESPACE_BEGIN(Grid);
 // createGrid5d: creates a 5D GridCartesian from a 4D one.
 // Dim 4 = Nsimd (RHS vector batching), simd_layout = {1,1,1,1,Nsimd}.
 // Spatial procs inherited from 4D; procs[4] = 1 (no MPI split in vector dim).
+// Returns an OWNING unique_ptr (the caller owns the grid; derive non-owning
+// raw views with .get() where by-value GridCartesian* is required).
 ///////////////////////////////////////////////////////////////////////////////
-inline GridCartesian *createGrid5d(GridCartesian *grid4d) {
+inline std::unique_ptr<GridCartesian> createGrid5d(GridCartesian *grid4d) {
   Coordinate gdim4d = grid4d->_fdimensions;
   Coordinate procs4d = grid4d->_processors;
   int Nsimd = grid4d->Nsimd();
@@ -30,7 +32,7 @@ inline GridCartesian *createGrid5d(GridCartesian *grid4d) {
   Coordinate procs5d(std::vector<int>(
       {procs4d[0], procs4d[1], procs4d[2], procs4d[3], 1}));
 
-  return new GridCartesian(gdim5d, simd5d, procs5d);
+  return std::make_unique<GridCartesian>(gdim5d, simd5d, procs5d);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -203,8 +205,9 @@ inline void promoteField5d(Lattice<vobj> &dst5d, const Lattice<vobj> &src4d,
 // inherited from grid4d; procs[4]=1. Spatial simd=1 matches the 5D gather grid
 // (so paddedSS/interiorOffset indices align). Nsimd=1 is consistent with the
 // scalar ColourMatrix element (ColourMatrix::Nsimd()==1) -- no SIMD mismatch.
+// Returns an OWNING unique_ptr (same ownership convention as createGrid5d).
 ///////////////////////////////////////////////////////////////////////////////
-inline GridCartesian *createGridW(GridCartesian *grid4d, int nDirections) {
+inline std::unique_ptr<GridCartesian> createGridW(GridCartesian *grid4d, int nDirections) {
   Coordinate gdim4d = grid4d->_fdimensions;
   Coordinate procs4d = grid4d->_processors;
   Coordinate gdimW(std::vector<int>(
@@ -212,7 +215,7 @@ inline GridCartesian *createGridW(GridCartesian *grid4d, int nDirections) {
   Coordinate simdW(std::vector<int>({1, 1, 1, 1, 1}));
   Coordinate procsW(std::vector<int>(
       {procs4d[0], procs4d[1], procs4d[2], procs4d[3], 1}));
-  return new GridCartesian(gdimW, simdW, procsW);
+  return std::make_unique<GridCartesian>(gdimW, simdW, procsW);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -104,7 +104,11 @@ void testStencilGather5d(void) {
 
   GridCartesian grid4d(dims, Coordinate({1,1,1,Nsimd}), procs);
 
-  GridCartesian *grid5d = createGrid5d(&grid4d);
+  // createGrid5d returns an owning unique_ptr; hold it for scope-exit
+  // release and derive a non-owning raw view so the test body's raw-pointer
+  // call sites are unchanged.
+  auto grid5dOwned = createGrid5d(&grid4d);
+  GridCartesian *grid5d = grid5dOwned.get();
   std::cout << GridLogMessage << "  5D grid: simd_layout={1,1,1,1,"
             << Nsimd << "}, Nsimd=" << Nsimd
             << ", procs={" << procs[0] << "," << procs[1] << ","
@@ -180,7 +184,7 @@ void testStencilGather5d(void) {
     }
   }
 
-  delete grid5d;
+  // grid5dOwned (unique_ptr) releases the 5D grid at scope exit.
   if (nFail > 0) {
     std::cerr << "testStencilGather5d: " << nFail << " failures!" << std::endl;
     GridAbort();
