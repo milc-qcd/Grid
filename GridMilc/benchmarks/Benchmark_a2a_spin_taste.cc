@@ -289,8 +289,7 @@ int main(int argc, char **argv) {
       auto res = runBench(blabel("Stencil", b), flops, 0, nrep, [&] {
         worker.resetCache();
         mat.setZero();
-        worker.StagMesonFieldStencil(mat, vecs.data(), vecs.data(),
-                                     nevec, nevec);
+        worker.StagMesonField(mat, vecs.data(), vecs.data(), nevec, nevec);
       });
       printResult(res);
     }

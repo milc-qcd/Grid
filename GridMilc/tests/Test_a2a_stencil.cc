@@ -12,6 +12,8 @@
  *       Differential test on identical input, so random gauge + random
  *       fermion vectors are sufficient (both paths do the same covariant
  *       shift math).
+ *       Alternates the default and explicit ContractType::Full call shapes
+ *       (both must take the identical Full path).
  *
  * Gauge field: read from --gauge (ILDG) if provided, else random.
  * Fermion vectors: random.
@@ -283,13 +285,21 @@ int main(int argc, char **argv) {
     }
 
     // ---- Stencil path (A2AWorkerSpinTasteStencil) on the full grid ----
+    // Alternate the call shape per gamma: even-index gammas use the default
+    // ContractType argument, odd-index gammas pass ContractType::Full
+    // explicitly -- both must take the identical Full path (coverage for the
+    // canonical entry's contract parameter).
     Eigen::Tensor<ComplexD, 5> mf_stencil(1, 1, Nt, nevec, nevec);
     mf_stencil.setZero();
     {
       A2AWorkerSpinTasteStencil<FImpl> sw(grid, emptyMom, oneGamma, &U,
                                          orthogDir);
-      sw.StagMesonFieldStencil(mf_stencil, vecs.data(), vecs.data(),
-                               nevec, nevec);
+      if (gi % 2 == 0) {
+        sw.StagMesonField(mf_stencil, vecs.data(), vecs.data(), nevec, nevec);
+      } else {
+        sw.StagMesonField(mf_stencil, vecs.data(), vecs.data(), nevec, nevec,
+                          ContractType::Full);
+      }
     }
 
     // ---- Direct element-by-element comparison ----

@@ -9,6 +9,7 @@
 #pragma once
 
 #include <Grid/GridQCDcore.h>
+#include <GridMilc/a2a/A2AContractType.h>
 #include <GridMilc/a2a/A2AView.h>
 #include <GridMilc/a2a/StencilGather5d.h>
 #include <GridMilc/spin/StagGamma.h>
@@ -248,6 +249,7 @@ protected:
   GridCartesian *_fullGrid; // 4D full grid (E/O joined, non-owning: caller owns)
   std::unique_ptr<GridCartesian> _grid5d; // 5D grid (simd={1,1,1,1,Nsimd})
   int _orthog_dir;          // orthogonal direction (only ex-base member)
+  ContractType _contract_type = ContractType::undef;
 
   std::unique_ptr<PaddedCell> _cell5d;
   GridCartesian *_paddedGrid5d;
@@ -566,7 +568,16 @@ public:
   // writes Nsimd rotation rows per (l_batch, r_batch, rt); execute() assembles
   // the mat by a circulant scatter M[l_i,r_j] = result[(i-j) mod Nsimd][j].
   //....................................................................
-  void execute(scalar_type *result_p) {
+  void execute(scalar_type *result_p,
+               ContractType contract_type = ContractType::Full) {
+    _contract_type = contract_type;
+    if (contract_type != ContractType::Full) {
+      std::cerr << "A2ATaskSpinTasteStencil::execute: ContractType "
+                << (int)contract_type
+                << " not implemented (stencil task is full-grid only)"
+                << std::endl;
+      GridAbort();
+    }
     int nGamma = getNgamma();
     int orthogDir = this->_orthog_dir;
     int localSpatialVolume = _grid5d->_ostride[orthogDir];

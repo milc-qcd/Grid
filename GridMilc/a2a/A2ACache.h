@@ -2,7 +2,7 @@
 /* A2ACache.h -- procedural/DOD device-cache facility for the a2a meson-field */
 /* workers. De-duplicates the output-mat device-cache reallocation, device    */
 /* zero-init, and copy-from-device + multi-rank reduction tail shared by the  */
-/* stencil (StagMesonFieldStencil) and legacy (StagMesonField) paths.         */
+/* stencil and legacy StagMesonField paths.                                   */
 /*                                                                             */
 /* DOD, not OOP: a POD state struct (A2AMatCache) + free functions. No        */
 /* inheritance, no dynamic dispatch in the hot path (methodology principle M1).*/
