@@ -261,6 +261,15 @@ protected:
   int _nEpTotal;
   int _osites; // 5D spatial oSites (== grid5d oSites)
 
+  // Site parity for the half/mixed CB modes: parity[ss] = (x+y+z+t)&1 per 5D
+  // oSite (dim-4 lane coordinate excluded), matching the GridRedBlackCartesian
+  // {1,1,1,1} checker-dim mask that setCheckerboard/pickCheckerboard use to
+  // place CB data into full-grid objects (Lattice_transfer.h). Host-built once
+  // in the ctor and uploaded (the A2ATaskBase::generateCoorMap device-map
+  // precedent, A2ATask.h). Read by the wantParity 0/1 kernel passes; unused
+  // by Full.
+  deviceVector<int> _siteParity;
+
   // LHS packed into Nsimd-lane batches (design F1) + view. Each _lhs5d[b] holds
   // Nsimd distinct L vectors in its dim-5 lanes (was: one replicated L per l).
   std::vector<Lattice<vobj>> _lhs5d;
@@ -353,6 +362,19 @@ public:
     _allOffsets = upload(allOffsetsHost);
     _nEpDev = upload(nEpHost);
     _epStartDev = upload(epStartHost);
+
+    // Parity table for the CB half/mixed modes (consumed by the wantParity
+    // 0/1 vectorSum5d passes). Convention identical to setCheckerboard
+    // placement: 4D-site parity = (x+y+z+t)&1 (all four dims checker-masked).
+    {
+      std::vector<int> parityHost(_osites);
+      for (int ss = 0; ss < _osites; ss++) {
+        Coordinate ocoor(_grid5d->Nd());
+        _grid5d->oCoorFromOindex(ocoor, ss);
+        parityHost[ss] = (ocoor[0] + ocoor[1] + ocoor[2] + ocoor[3]) & 1;
+      }
+      _siteParity = upload(parityHost);
+    }
 
     // === Scalar W store + phase + pairing maps (Slice 2; additive) ============
     _paddedOsites = _paddedGrid5d->oSites();
@@ -504,6 +526,10 @@ public:
     _nBatchesL = (size + _Nsimd - 1) / _Nsimd;
     GridBase *grid4d = left[0].Grid();
 
+    // Release the previous view first: it holds open AcceleratorRead locks
+    // on the _lhs5d lattices the writes below would conflict with.
+    _lhsView = nullptr;
+
     // Reallocate only if the batch count changed; steady-state repeat calls
     // (same sizeL) reuse the existing Lattice slots via in-place Zero()+pack5d
     // below, avoiding a clear()+reconstruct of the 5D device buffers on every
@@ -533,6 +559,9 @@ public:
   void setRight(const FermionField *right, int size) {
     _sizeR = size;
     _nBatchesR = (size + _Nsimd - 1) / _Nsimd;
+
+    // Release the previous view first (same hazard as setLeft).
+    _paddedRhsView = nullptr;
 
     // Reallocate only if the batch count changed; steady-state repeat calls
     // (same sizeR) reuse the existing Lattice slots via assignment below,
@@ -564,29 +593,28 @@ public:
   }
 
   //....................................................................
-  // execute (OVERRIDE): coalesced rotation-sweep model (design F1). The kernel
-  // writes Nsimd rotation rows per (l_batch, r_batch, rt); execute() assembles
-  // the mat by a circulant scatter M[l_i,r_j] = result[(i-j) mod Nsimd][j].
+  // execute (ContractType dispatch). Full: one unfiltered vectorSum5d pass
+  // + circulant scatter. Half/mixed (LeftHalf/RightHalf/BothHalf): two
+  // parity-filtered passes (even/odd source sites) into a parity-split
+  // scratch, then assembleMat applies the L1.1-03 placement table.
   //....................................................................
   void execute(scalar_type *result_p,
                ContractType contract_type = ContractType::Full) {
     _contract_type = contract_type;
-    if (contract_type != ContractType::Full) {
-      std::cerr << "A2ATaskSpinTasteStencil::execute: ContractType "
-                << (int)contract_type
-                << " not implemented (stencil task is full-grid only)"
+    if (contract_type == ContractType::undef) {
+      std::cerr << "A2ATaskSpinTasteStencil::execute: ContractType undef"
                 << std::endl;
       GridAbort();
     }
     int nGamma = getNgamma();
     int orthogDir = this->_orthog_dir;
     int localSpatialVolume = _grid5d->_ostride[orthogDir];
-    // 5D grid has simd=1 on all spatial dims, so _ldimensions[orthogDir] ==
-    // _rdimensions[orthogDir]: no separate reduced orthog size. Use
-    // localOrthogDimSize throughout.
     int localOrthogDimSize = _grid5d->_ldimensions[orthogDir];
     int pc = _grid5d->_processor_coor[orthogDir];
     int Nt = _grid5d->GlobalDimensions()[orthogDir];
+
+    bool cbSplit = (contract_type != ContractType::Full);
+    int nParity = cbSplit ? 2 : 1;
 
     // shm_p holds cobj (SIMD) elements indexed, fastest-to-slowest, as
     // (rt, s, l_batch, r_batch, mu) -- rt stays innermost (matching v3's
@@ -595,41 +623,94 @@ public:
     // right where a sub-index of l_batch belongs (for fixed lane j, s and the
     // intra-batch L index i are in 1-1 correspondence). Each cobj still
     // encodes Nsimd lanes (extractLane in assembly), so no extra Nsimd factor
-    // beyond s.
+    // beyond s. Half/mixed adds one further parity slice: pass p (even/odd
+    // source sites) writes into shm_p + p * nGamma * gammaStride.
     int gammaStride = _nBatchesL * _nBatchesR * localOrthogDimSize * _Nsimd;
 
-    cobj *shm_p =
-        static_cast<cobj*>(acceleratorAllocDevice(gammaStride * nGamma * sizeof(cobj)));
+    cobj *shm_p = static_cast<cobj *>(acceleratorAllocDevice(
+        gammaStride * nGamma * nParity * sizeof(cobj)));
     {
       GRID_TRACE("A2AStencil/ZeroScratch");
-      accelerator_for(idx, gammaStride * nGamma, 1, { shm_p[idx] = Zero(); });
+      accelerator_for(idx, gammaStride * nGamma * nParity, 1,
+                      { shm_p[idx] = Zero(); });
     }
 
     {
       GRID_TRACE("A2AStencil/VectorSum5d");
-      for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
-        int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
-        vectorSumFull5d(shm_p, mu, nGammaBlock, localOrthogDimSize,
-                        localSpatialVolume, gammaStride);
+      for (int p = 0; p < nParity; p++) {
+        for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
+          int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
+          vectorSum5d(shm_p + (size_t)p * nGamma * gammaStride, mu,
+                      nGammaBlock, localOrthogDimSize, localSpatialVolume,
+                      gammaStride, _siteParity.data(), cbSplit ? p : -1);
+        }
       }
     }
 
-    // Circulant-scatter assembly. lane j == r-local; i == l-local; pairing
-    // (l_i, r_j) lives at rotation s=(i-j) mod Nsimd, lane j. Per-lane scalar
-    // work -> portable acceleratorSIMTlane pattern (matches pack5d). Launched
-    // as (l_batch, r_batch), Nsimd (accelerator_for2d) rather than a flattened
-    // 1D index over (mu, l_batch, r_batch) — no div/mod preamble needed; mu is
-    // a plain serial loop inside (no per-mu accumulator state to chunk, unlike
-    // vectorSumFull5d's MF_SUM_ARRAY_MAX blocking).
+    assembleMat(result_p, shm_p, contract_type, nGamma, gammaStride,
+                localOrthogDimSize, pc, Nt);
+
+    acceleratorFreeDevice(shm_p);
+  }
+
+  //....................................................................
+  // assembleMat: circulant-scatter assembly. lane j == r-local; i == l-local;
+  // pairing (l_i, r_j) lives at rotation s=(i-j) mod Nsimd, lane j. Per-lane
+  // scalar work -> portable acceleratorSIMTlane pattern (matches pack5d).
+  // Launched as (l_batch, r_batch), Nsimd (accelerator_for2d); mu is a plain
+  // serial loop inside (no per-mu accumulator state to chunk, unlike
+  // vectorSum5d's MF_SUM_ARRAY_MAX blocking).
+  //
+  // CB output-placement reference (L1.1-03) -- the even/odd placement
+  // truth tables extracted from the legacy A2ATaskBase::simdSumHalf /
+  // simdSumMixed (A2ATask.h). The legacy kernels accumulate per-CB-task
+  // temps into the doubled output slots with signs keyed on
+  // (cbEven x oddShifts); expressed per parity (M0 = even source-site sum,
+  // identical to the legacy even-CB-task temp; M1 = odd; sigma = -1 for
+  // odd popcount, the legacy oddShifts, else +1):
+  //
+  //   BothHalf  slots (row 2l+lc, col 2r+rc):
+  //     (0,0): M0+M1          (0,1): sigma*(M0-M1)
+  //     (1,0): M0-M1          (1,1): sigma*(M0+M1)
+  //   LeftHalf  slots (row 2l+lc, col r):
+  //     (0): M0+M1            (1): M0-M1
+  //   RightHalf slots (row l, col 2r+rc):
+  //     (0): M0+M1            (1): sigma*(M0-M1)
+  //
+  // Equivalence to the legacy per-task routing: every endpoint of a gamma
+  // displaces by popcount hops, so parity(x+s) = parity(x) ^ (pc%2); with
+  // CB copies packed into full objects, the even-site pass pairs L_E with
+  // R_E (even pc) or R_O (odd pc) -- exactly the legacy _odd_shifts E/O
+  // routing (A2AWorker.h StagMesonField). Reducing the legacy cbEven /
+  // oddShifts sign tables modulo that routing yields the slot forms above.
+  //....................................................................
+  void assembleMat(scalar_type *result_p, cobj *shm_p, ContractType ct,
+                   int nGamma, int gammaStride, int localOrthogDimSize,
+                   int pc, int Nt) {
+    bool cbL = ((int)ct & (int)ContractType::LeftHalf) != 0;
+    bool cbR = ((int)ct & (int)ContractType::RightHalf) != 0;
+    bool cbSplit = (ct != ContractType::Full);
+    int nLC = cbL ? 2 : 1;   // l-slot multiplicity (packed pairs doubled)
+    int nRC = cbR ? 2 : 1;   // r-slot multiplicity
+    int matL = _sizeL * nLC; // output rows
+    int matR = _sizeR * nRC; // output cols
+    int parityStride = nGamma * gammaStride; // even slice | odd slice
+
     // Copy members to locals: the GPU lambda captures a CPU `this`.
     auto shm_p_a = shm_p;
     auto result_p_a = result_p;
-    int sizeL_a     = _sizeL;
-    int sizeR_a     = _sizeR;
+    int sizeL_a = _sizeL;
+    int sizeR_a = _sizeR;
     int nBatchesL_a = _nBatchesL;
     int nBatchesR_a = _nBatchesR;
     int Nsimd = _Nsimd;
-    int nGamma_a = nGamma;
+    int matL_a = matL;
+    int matR_a = matR;
+    int nLC_a = nLC;
+    int nRC_a = nRC;
+    int parityStride_a = parityStride;
+    bool cbSplit_a = cbSplit;
+    auto nEp_p = _nEpDev.data();
     {
       GRID_TRACE("A2AStencil/Assemble");
       accelerator_for2d(l_batch, nBatchesL_a, r_batch, nBatchesR_a, Nsimd, {
@@ -641,21 +722,66 @@ public:
 #endif
           int r = r_batch * Nsimd + j;
           if (r < sizeR_a) {
-            for (int mu = 0; mu < nGamma_a; mu++) {
+            for (int mu = 0; mu < nGamma; mu++) {
+              // sigma = -1 for odd popcount: nEp = 2^popcount, so
+              // nEp in {2, 8} <=> popcount in {1, 3}.
+              scalar_type sig =
+                  (nEp_p[mu] == 2 || nEp_p[mu] == 8) ? scalar_type(-1.0)
+                                                     : scalar_type(1.0);
               for (int rt = 0; rt < localOrthogDimSize; rt++) {
-                int gt = rt + pc * localOrthogDimSize; // T simd=1: no time reduction
+                int gt = rt + pc * localOrthogDimSize; // T simd=1
                 for (int i = 0; i < Nsimd; i++) {
                   int l = l_batch * Nsimd + i;
                   if (l < sizeL_a) {
                     int s = ((i - j) % Nsimd + Nsimd) % Nsimd;
                     int shm_idx =
                         rt +
-                        localOrthogDimSize * (s + Nsimd * (l_batch + nBatchesL_a * r_batch)) +
+                        localOrthogDimSize *
+                            (s + Nsimd * (l_batch + nBatchesL_a * r_batch)) +
                         mu * gammaStride;
-                    cobj vals = shm_p_a[shm_idx];
-                    int mat_idx = mu * sizeR_a * sizeL_a * Nt +
-                                  r + sizeR_a * (l + sizeL_a * gt);
-                    result_p_a[mat_idx] = TensorRemove(extractLane(j, vals));
+                    auto M0 = TensorRemove(extractLane(j, shm_p_a[shm_idx]));
+                    if (!cbSplit_a) {
+                      // Full: one slot per (l, r), single parity slice, each
+                      // slot written exactly once (plain assignment keeps
+                      // execute() free of a pre-zeroed-result dependency).
+                      int64_t mat_idx = (int64_t)mu * matL_a * matR_a * Nt +
+                                         r + matR_a * (l + matL_a * gt);
+                      result_p_a[mat_idx] = M0;
+                    } else {
+                      auto M1 = TensorRemove(extractLane(
+                          j, shm_p_a[shm_idx + parityStride_a]));
+                      for (int lc = 0; lc < nLC_a; lc++) {
+                        for (int rc = 0; rc < nRC_a; rc++) {
+                          scalar_type sA, sB; // slot = sA*M0 + sB*M1
+                          if (cbL && cbR) { // BothHalf
+                            sA = (rc == 1) ? sig : scalar_type(1.0);
+                            if (lc == 0 && rc == 0)
+                              sB = scalar_type(1.0);
+                            else if (lc == 0 && rc == 1)
+                              sB = -sig;
+                            else if (lc == 1 && rc == 0)
+                              sB = scalar_type(-1.0);
+                            else
+                              sB = sig;
+                          } else if (cbL) { // LeftHalf
+                            sA = scalar_type(1.0);
+                            sB = (lc == 0) ? scalar_type(1.0)
+                                           : scalar_type(-1.0);
+                          } else { // RightHalf
+                            sA = (rc == 0) ? scalar_type(1.0) : sig;
+                            sB = (rc == 0) ? scalar_type(1.0) : -sig;
+                          }
+                          // int64_t: BothHalf quadruples the flattened
+                          // output; int would overflow the mu stride at
+                          // 4x smaller sizes than Full (silent wrong slots).
+                          int64_t mat_idx =
+                              (int64_t)mu * matL_a * matR_a * Nt +
+                              nRC_a * r + rc +
+                              matR_a * (nLC_a * l + lc + matL_a * gt);
+                          result_p_a[mat_idx] += sA * M0 + sB * M1;
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -664,13 +790,13 @@ public:
         }
       });
     }
-
-    acceleratorFreeDevice(shm_p);
   }
 
   //....................................................................
-  // vectorSumFull5d: fused F1 kernel. Ordinary coalesced (nsimd=Nsimd) launch.
-  // Loop order: (lt_batch=[l_batch,rt], r_batch) parallel; (mu, ep, so) serial.
+  // vectorSum5d: fused F1 kernel, shared by the Full and CB half/mixed modes
+  // (the name drops "Full" accordingly). Ordinary coalesced (nsimd=Nsimd)
+  // launch. Loop order: (lt_batch=[l_batch,rt], r_batch) parallel; (mu, ep,
+  // so) serial.
   //
   // The time-slice index rt is folded into the first parallel dimension so that
   // each (l_batch, rt, r_batch) triple gets its own block. For pc=0 this gives
@@ -683,11 +809,15 @@ public:
   // gather reads traverse the padded RHS buffer sequentially
   // (paddedSS = offsets[ep][ss] is a uniform displacement as ss increments),
   // enabling hardware prefetching.
+  //
+  // wantParity: -1 (Full) accumulates every source site; 0/1 (half/mixed)
+  // keep only even/odd-parity sites, so two passes give the assemble step
+  // separate even/odd partial sums from the same kernel.
   //....................................................................
-  void vectorSumFull5d(cobj *shm_p, int mu_offset, int nGamma,
-                       int localOrthogDimSize, int localSpatialVolume,
-                       int gammaStride) {
-    GRID_TRACE("A2AStencil/vectorSumFull5d");
+  void vectorSum5d(cobj *shm_p, int mu_offset, int nGamma,
+                   int localOrthogDimSize, int localSpatialVolume,
+                   int gammaStride, const int *siteParity_p, int wantParity) {
+    GRID_TRACE("A2AStencil/vectorSum5d");
     int nBatchesL = _nBatchesL;
     int nBatchesR = _nBatchesR;
     int Nsimd = _Nsimd;
@@ -731,6 +861,9 @@ public:
           bool isFwd = isForward_p[ge] != 0;
           for (int so = 0; so < localSpatialVolume; so++) {
             int ss = rt * localSpatialVolume + so;
+            // CB parity split: the non-matching pass handles this site.
+            if (wantParity >= 0 && siteParity_p[ss] != wantParity)
+              continue;
             int paddedSS = offsets_p[(size_t)ge * osites + ss];
             auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]);
             // W read site (D7): forward -> source x (interiorOffset, local);

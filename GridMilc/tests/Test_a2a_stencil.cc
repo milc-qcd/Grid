@@ -341,9 +341,201 @@ int main(int argc, char **argv) {
             << "testStencilVsCshiftSpinTaste: ALL PASSED"
             << " (maxRelErr=" << stencilMaxErrAll << ")" << std::endl;
 
+  // ---- CB half/mixed differential: stencil (packed full objects + ct) vs
+  // legacy A2AWorkerSpinTaste (CB-grid arrays, 4-arg entry). The legacy
+  // output layout is mat(0,0,t, 2*l+cb_l, 2*r+cb_r) on CB-flagged sides
+  // (interleaved); the stencil must reproduce it value-for-value. Packed
+  // objects are built with setCheckerboard (E copy on even sites, O copy on
+  // odd) -- the same convention Test_a2a uses for w_full.
+  int nCbFail = 0;
+  double cbMaxErrAll = 0.0;
+  {
+    GridRedBlackCartesian *cbGrid =
+        SpaceTimeGrid::makeFourDimRedBlackGrid(grid);
+    int nl = nevec, nr = nevec;
+
+    std::vector<FermionField> lhsE(nl, cbGrid), lhsO(nl, cbGrid);
+    std::vector<FermionField> rhsE(nr, cbGrid), rhsO(nr, cbGrid);
+    for (auto &e : lhsE) e.Checkerboard() = Even;
+    for (auto &e : lhsO) e.Checkerboard() = Odd;
+    for (auto &e : rhsE) e.Checkerboard() = Even;
+    for (auto &e : rhsO) e.Checkerboard() = Odd;
+    {
+      // RNG on the FULL grid (not cbGrid): GridParallelRNG::fill recurses
+      // through a temporary on the RNG's own grid for CB lattices
+      // (Lattice_rng.h), so a CB-grid RNG would recurse forever. With a
+      // full-grid RNG, random(rng, cbField) fills a full-grid temp and
+      // pickCheckerboards it into the CB field -- values are well-formed.
+      GridParallelRNG rngCb(grid);
+      std::vector<int> seed = {5, 6, 7, 8};
+      rngCb.SeedFixedIntegers(seed);
+      for (auto &e : lhsE) { e = Zero(); random(rngCb, e); }
+      for (auto &e : lhsO) { e = Zero(); random(rngCb, e); }
+      for (auto &e : rhsE) { e = Zero(); random(rngCb, e); }
+      for (auto &e : rhsO) { e = Zero(); random(rngCb, e); }
+    }
+
+    // Packed full objects: E copy on even sites, O copy on odd sites.
+    std::vector<FermionField> lhsPack(nl, grid), rhsPack(nr, grid);
+    for (int k = 0; k < nl; k++) {
+      lhsPack[k] = Zero();
+      setCheckerboard(lhsPack[k], lhsE[k]);
+      setCheckerboard(lhsPack[k], lhsO[k]);
+    }
+    for (int k = 0; k < nr; k++) {
+      rhsPack[k] = Zero();
+      setCheckerboard(rhsPack[k], rhsE[k]);
+      setCheckerboard(rhsPack[k], rhsO[k]);
+    }
+
+    std::vector<ComplexField> emptyMom;
+
+    struct CbMode {
+      const char *name;
+      ContractType ct;
+      int outL, outR; // output-dim multipliers on (lhs, rhs)
+    } modes[3] = {
+        {"BothHalf", ContractType::BothHalf, 2, 2},
+        {"LeftHalf",  ContractType::LeftHalf,  2, 1},
+        {"RightHalf", ContractType::RightHalf, 1, 2},
+    };
+
+    for (int gi = 0; gi < (int)gammas.size(); gi++) {
+      auto &gamma = gammas[gi];
+      StagGamma spinTaste;
+      spinTaste.setSpinTaste(gamma);
+      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      std::vector<StagGamma::SpinTastePair> oneGamma = {gamma};
+
+      // Stencil worker: one per gamma (kept alive across modes).
+      A2AWorkerSpinTasteStencil<FImpl> sw(grid, emptyMom, oneGamma, &U,
+                                          orthogDir);
+
+      for (int m = 0; m < 3; m++) {
+        CbMode &mode = modes[m];
+        std::cout << GridLogMessage << "=== CB " << mode.name << " gamma "
+                  << StagGamma::GetName(gamma) << " (popcount " << pc
+                  << ") ===" << std::endl;
+
+        // Legacy oracle (4-arg E/O entry). Mixed modes pass the full-grid
+        // array twice for the non-CB side (only the E array is read there).
+        // Created per mode to avoid _transformed vector reuse issues in
+        // the legacy task's setRight.
+        Eigen::Tensor<ComplexD, 5> mf_leg(1, 1, Nt, mode.outL * nl,
+                                          mode.outR * nr);
+        mf_leg.setZero();
+        {
+          A2AWorkerSpinTaste<FImpl> w(grid, emptyMom, oneGamma, &U, orthogDir);
+          if (mode.ct == ContractType::BothHalf) {
+            w.StagMesonField(mf_leg, lhsE.data(), lhsO.data(), rhsE.data(),
+                             rhsO.data());
+          } else if (mode.ct == ContractType::LeftHalf) {
+            w.StagMesonField(mf_leg, lhsE.data(), lhsO.data(), vecs.data(),
+                             vecs.data());
+          } else {
+            w.StagMesonField(mf_leg, vecs.data(), vecs.data(), rhsE.data(),
+                             rhsO.data());
+          }
+        }
+
+        // Stencil path (packed full objects + explicit ct).
+        Eigen::Tensor<ComplexD, 5> mf_stn(1, 1, Nt, mode.outL * nl,
+                                          mode.outR * nr);
+        mf_stn.setZero();
+        if (mode.ct == ContractType::BothHalf) {
+          sw.StagMesonField(mf_stn, lhsPack.data(), rhsPack.data(), nl, nr,
+                            ContractType::BothHalf);
+        } else if (mode.ct == ContractType::LeftHalf) {
+          sw.StagMesonField(mf_stn, lhsPack.data(), vecs.data(), nl, nr,
+                            ContractType::LeftHalf);
+        } else {
+          sw.StagMesonField(mf_stn, vecs.data(), rhsPack.data(), nl, nr,
+                            ContractType::RightHalf);
+        }
+
+        double cbErr = 0.0;
+        for (int t = 0; t < Nt; t++)
+          for (int i = 0; i < mode.outL * nl; i++)
+            for (int j = 0; j < mode.outR * nr; j++) {
+              ComplexD lv = mf_leg(0, 0, t, i, j);
+              ComplexD sv = mf_stn(0, 0, t, i, j);
+              auto mag = [](ComplexD z) {
+                return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
+              };
+              double denom = std::max(mag(lv), mag(sv));
+              double e = (denom > 0.0) ? mag(lv - sv) / denom : mag(lv - sv);
+              cbErr = std::max(cbErr, e);
+            }
+        cbMaxErrAll = std::max(cbMaxErrAll, cbErr);
+        if (cbErr > 1e-10) {
+          std::cerr << "    CB " << mode.name << " FAIL gamma "
+                    << StagGamma::GetName(gamma) << " (popcount " << pc
+                    << ") maxRelErr=" << cbErr << std::endl;
+          nCbFail++;
+        } else {
+          std::cout << GridLogMessage << "    CB " << mode.name
+                    << " OK gamma " << StagGamma::GetName(gamma)
+                    << " (popcount " << pc << ") maxRelErr=" << cbErr
+                    << std::endl;
+        }
+
+        // Physics consistency: the BothHalf (2l, 2r) block equals the Full
+        // contraction of the packed objects (M0+M1 over all sites) --
+        // oracle-independent check of the diagonal slot form.
+        if (mode.ct == ContractType::BothHalf) {
+          Eigen::Tensor<ComplexD, 5> mf_full(1, 1, Nt, nl, nr);
+          mf_full.setZero();
+          {
+            A2AWorkerSpinTasteStencil<FImpl> sw(grid, emptyMom, oneGamma, &U,
+                                                orthogDir);
+            sw.StagMesonField(mf_full, lhsPack.data(), rhsPack.data(), nl, nr);
+          }
+          // Compare via flat data(): the workers write row-major
+          // (gt*matL*matR + l*matR + r) but Eigen::Tensor is ColMajor; the
+          // stride mismatch cancels in same-shape differentials only.
+          double eeErr = 0.0;
+          for (int t = 0; t < Nt; t++)
+            for (int i = 0; i < nl; i++)
+              for (int j = 0; j < nr; j++) {
+                ComplexD a =
+                    mf_full.data()[(size_t)t * nl * nr + (size_t)i * nr + j];
+                ComplexD b = mf_stn.data()[(size_t)t * (2 * nl) * (2 * nr) +
+                                           (size_t)(2 * i) * (2 * nr) + 2 * j];
+                auto mag = [](ComplexD z) {
+                  return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
+                };
+                double denom = std::max(mag(a), mag(b));
+                double e = (denom > 0.0) ? mag(a - b) / denom : mag(a - b);
+                eeErr = std::max(eeErr, e);
+              }
+          if (eeErr > 1e-10) {
+            std::cerr << "    CB BothHalf ee-block FAIL gamma "
+                      << StagGamma::GetName(gamma)
+                      << " maxRelErr=" << eeErr << std::endl;
+            nCbFail++;
+          } else {
+            std::cout << GridLogMessage
+                      << "    CB BothHalf ee-block OK gamma "
+                      << StagGamma::GetName(gamma)
+                      << " maxRelErr=" << eeErr << std::endl;
+          }
+        }
+      }
+    }
+
+    delete cbGrid;
+  }
+  if (nCbFail > 0) {
+    std::cerr << "testStencilCbVsLegacy: " << nCbFail << " failures!"
+              << std::endl;
+    GridAbort();
+  }
+  std::cout << GridLogMessage << "testStencilCbVsLegacy: ALL PASSED"
+            << " (maxRelErr=" << cbMaxErrAll << ")" << std::endl;
+
   // ---- Result ----
   std::cout << GridLogMessage << "=== Test_a2a_stencil complete ===" << std::endl;
-  bool ok = (nStencilFail == 0);
+  bool ok = (nStencilFail == 0 && nCbFail == 0);
   if (ok) {
     std::cout << GridLogMessage << "PASS" << std::endl;
   } else {

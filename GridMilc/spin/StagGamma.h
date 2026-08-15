@@ -487,10 +487,33 @@ void StagGamma::applyCoeffsAndPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) 
     stag_dirs.Checkerboard() = cb;
   }
 
+  // On CB grids the checker dim is stored halved, so LatticeCoordinate
+  // returns x/2 there; the physical parity x = 2*(x/2) + b has
+  // b = cb + sum of the other checker-masked coordinates. Only the parity of
+  // stag_dirs is consumed, so substitute b for the checker-dim term.
+  Lattice<iScalar<vInteger>> xchk(grid);
+  if (grid->_isCheckerBoarded &&
+      (gmu[grid->_checker_dim] & _oscillateDirs)) {
+    xchk.Checkerboard() = cb;
+    xchk = (Integer)cb;
+    for (int d = 0; d < (int)gmu.size(); d++) {
+      if (d == grid->_checker_dim || !grid->_checker_dim_mask[d])
+        continue;
+      Lattice<iScalar<vInteger>> xd(grid);
+      LatticeCoordinate(xd, d);
+      xd.Checkerboard() = cb;
+      xchk += xd;
+    }
+  }
+
   for (int dir = 0; dir < gmu.size(); dir++) {
     if (gmu[dir] & _oscillateDirs) { // gmu[dir] maps Grid XYZT convention to
                                      // binary flags
-      LatticeCoordinate(coor, dir);
+      if (grid->_isCheckerBoarded && dir == grid->_checker_dim) {
+        coor = xchk;
+      } else {
+        LatticeCoordinate(coor, dir);
+      }
       if (grid->_isCheckerBoarded) {
         coor.Checkerboard() = cb;
       }

@@ -6,8 +6,11 @@
 /* output-mat device cache (via the A2ACache DOD facility), an L/R address     */
 /* cache, and the stencil task by concrete pointer. The public entry is        */
 /* StagMesonField(mat, lhs, rhs, sizeL, sizeR, ct): full-grid LHS/RHS arrays   */
-/* plus an explicit ContractType flag (Full only this cycle; half/mixed is     */
-/* pending the checkerboard split).                                           */
+/* StagMesonField(mat, lhs, rhs, sizeL, sizeR, ct): full-grid LHS/RHS arrays   */
+/* plus an explicit ContractType flag. For the half/mixed CB modes            */
+/* (LeftHalf/RightHalf/BothHalf) each CB-side array entry packs two copies in */
+/* one full object (E values on even sites, O on odd -- the setCheckerboard   */
+/* convention) and the output doubles that side's dims.                       */
 /*                                                                            */
 /* Part of GridMilc (https://github.com/paboyle/Grid).                       */
 /******************************************************************************/
@@ -23,12 +26,15 @@
 NAMESPACE_BEGIN(Grid);
 
 ///////////////////////////////////////////////////////////////////////////////
-// A2AWorkerSpinTasteStencil: full-grid stencil worker (full-grid only in v3.3).
-// The caller passes full-grid LHS/RHS arrays (no E/O splitting); the task
-// promotes them directly to the 5D grid. Mirrors the A2AWorkerLocal/Onelink
-// lifecycle: setLeft/setRight re-run only when the input address changes
-// (address-cache via _l_addr/_r_addr), so a worker kept alive across many calls
-// skips redundant 5D re-promotion.
+// A2AWorkerSpinTasteStencil: full-grid stencil worker. The caller passes
+// full-grid LHS/RHS arrays (no E/O splitting); the task promotes them directly
+// to the 5D grid. For the CB half/mixed contract modes each CB-side array
+// entry packs two copies in one full object (E values on even sites, O on odd
+// -- the setCheckerboard convention); the task splits the source-site sum by
+// parity internally. Mirrors the A2AWorkerLocal/Onelink lifecycle:
+// setLeft/setRight re-run only when the input address changes (address-cache
+// via _l_addr/_r_addr), so a worker kept alive across many calls skips
+// redundant 5D re-promotion.
 ///////////////////////////////////////////////////////////////////////////////
 template <class FImpl>
 class A2AWorkerSpinTasteStencil {
@@ -90,12 +96,30 @@ public:
 
   // Canonical full-array meson-field entry. lhs/rhs are full-grid vector
   // arrays; ct states the checkerboard/contraction mode explicitly (never
-  // probed from the lattice). Only ContractType::Full is implemented;
-  // half/mixed lands with the checkerboard split.
+  // probed from the lattice). For the CB modes each CB-side array entry
+  // packs two copies in one full object (E values on even sites, O on odd
+  // -- the setCheckerboard convention) and the output doubles that side's
+  // dims with interleaved 2*l+lc / 2*r+rc slots.
   template <typename TensorType>
   void StagMesonField(TensorType &mat, const FermionField *lhs,
                       const FermionField *rhs, int sizeL, int sizeR,
                       ContractType ct = ContractType::Full) {
+    // Contract/dims consistency: sizeL/sizeR are array entry counts; the
+    // output dims are doubled on CB-flagged sides.
+    {
+      int cbL = ((int)ct & (int)ContractType::LeftHalf) ? 2 : 1;
+      int cbR = ((int)ct & (int)ContractType::RightHalf) ? 2 : 1;
+      if (ct == ContractType::undef ||
+          (int)mat.dimension(3) != cbL * sizeL ||
+          (int)mat.dimension(4) != cbR * sizeR) {
+        std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: mat dims ("
+                  << mat.dimension(3) << "," << mat.dimension(4)
+                  << ") inconsistent with sizes (" << cbL * sizeL << ","
+                  << cbR * sizeR << ") for ContractType " << (int)ct
+                  << std::endl;
+        GridAbort();
+      }
+    }
     // Output-mat device cache + zero (A2ACache facility).
     scalar_type *matDevice =
         ensureMatCache(_matCache, mat.size() * sizeof(scalar_type));

@@ -51,8 +51,10 @@ public:
     if (_cache_bytes != 0) {
       acceleratorFreeDevice(_cache_device);
     }
-    delete _task_e;
+    // _task_o first: mixed modes share _task_e's views (setLeft/Right(*_task_e)),
+    // so it must release them before _task_e frees the underlying lattices.
     delete _task_o;
+    delete _task_e;
   }
 
 public:
