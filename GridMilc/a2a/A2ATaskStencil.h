@@ -1,6 +1,6 @@
 /******************************************************************************/
 /* A2ATaskStencil.h -- 5D stencil spin-taste meson-field task + its file-scope */
-/* helpers, split off the legacy task machinery (Phase 3, L1.2-05/L1.2-01).    */
+/* helpers, split off the legacy task machinery.                             */
 /* Self-contained (T1): depends on no legacy a2a worker/task header. The task  */
 /* owns its state directly (no base-class inheritance).                        */
 /*                                                                             */
@@ -48,7 +48,7 @@ spinTasteEndpoints(const StagGamma &spinTaste) {
 
 ///////////////////////////////////////////////////////////////////////////////
 // classifySpinTasteEndpoints: partition the 2^nActive endpoints into
-// forward/backward pairs {s, -s} for endpoint pairing (D3). Canonical forward =
+// forward/backward pairs {s, -s} for endpoint pairing. Canonical forward =
 // first-active-direction sign +1 (so exactly one of {s,-s} is forward).
 // pc=0 (nActive=0, single endpoint) is forward-only with no pair.
 //
@@ -115,9 +115,9 @@ inline void classifySpinTasteEndpoints(const std::vector<Coordinate> &endpoints,
 // transporter C_s for the FORWARD endpoints only, on grid4d (SIMD Cshift).
 // Same covariant chain as spinTasteGaugeChain (the symmetric n!-permutation
 // sum, CovShiftForward/Backward) but: (1) iterates only forwardEndpoints (the
-// nPairs stored reps -- D3), and (2) applies NO applyCoeffsAndPhase -- the
+// nPairs stored reps), and (2) applies NO applyCoeffsAndPhase -- the
 // Follana phase + (1/2)^n/n! scaling is applied in the kernel via the per-gamma
-// phase field (D1/D6), so the pairing hermiticity C_{-s}(x)=adj(C_s(x-s)) is
+// phase field, so the pairing hermiticity C_{-s}(x)=adj(C_s(x-s)) is
 // exact (corr always +1). Returns grid4d chains (no promoteField5d here -- the
 // task ctor promotes/pads/unpacks to the scalar store). One-time setup cost.
 ///////////////////////////////////////////////////////////////////////////////
@@ -270,7 +270,7 @@ protected:
   // by Full.
   deviceVector<int> _siteParity;
 
-  // LHS packed into Nsimd-lane batches (design F1) + view. Each _lhs5d[b] holds
+  // LHS packed into Nsimd-lane batches + view. Each _lhs5d[b] holds
   // Nsimd distinct L vectors in its dim-5 lanes (was: one replicated L per l).
   std::vector<Lattice<vobj>> _lhs5d;
   std::shared_ptr<A2AFieldView<vobj>> _lhsView;
@@ -286,11 +286,10 @@ protected:
   int _nBatchesR;
   int _Nsimd;
 
-  // --- Scalar W Lattice + pairing + phase (Slice 2+3). The kernel reads these
-  //     scalar fields directly (the old phased-all flattened-W path was removed
-  //     in Slice 3). ---
+  // --- Scalar W Lattice + pairing + phase. The kernel reads these
+  //     scalar fields directly.
   // W = Lattice<ColourMatrix> on a 5D Nsimd=1 grid (dim-5 = forward endpoints).
-  // Populated/read ONLY via direct view indexing (no expr templates -- D5/GPU note).
+  // Populated/read ONLY via direct view indexing (no expr templates).
   std::unique_ptr<GridCartesian> _gridW;
   std::unique_ptr<PaddedCell> _cellW;
   GridCartesian *_paddedGridW = nullptr;
@@ -299,8 +298,8 @@ protected:
   int _paddedOsites = 0; // padded spatial oSites (== paddedGrid5d oSites)
   deviceVector<int> _forwardRepDev;     // [epTotal] global forward-field index
   deviceVector<int> _isForwardDev;      // [epTotal] 0/1
-  deviceVector<int> _interiorOffsetDev; // [osites] shift-0 padded interior oSite (D7)
-  std::vector<ComplexField> _phaseFields;         // [nGamma] grid5d phase (D6)
+  deviceVector<int> _interiorOffsetDev; // [osites] shift-0 padded interior oSite
+  std::vector<ComplexField> _phaseFields;         // [nGamma] grid5d phase
   std::shared_ptr<A2AFieldView<cobj>> _phaseView;
 
 public:
@@ -318,8 +317,7 @@ public:
 
     // Build per-gamma endpoint offsets + nEndpoints/epStart bookkeeping. Only
     // the offset table + endpoint counts are assembled here; the W_s gauge chain
-    // is built separately below as the unphased forward scalar store (the old
-    // phased-all flattened-W path was removed in Slice 3).
+    // is built separately below as the unphased forward scalar store.
     // spinTasteEndpoints gives the endpoint list used both for nEndpoints and
     // buildPaddedOffset5d.
     std::vector<int> allOffsetsHost;
@@ -338,7 +336,7 @@ public:
 
       // Flatten this gamma's offsets into the global host table. buildPaddedOffset5d
       // returns a host std::vector<int> directly (no device round-trip); the
-      // single upload into _allOffsets happens once, after the loop (S1).
+      // single upload into _allOffsets happens once, after the loop.
       std::vector<int> epOffsets =
           buildPaddedOffset5d(_grid5d.get(), _paddedGrid5d, 1, endpoints);
       allOffsetsHost.insert(allOffsetsHost.end(),
@@ -376,17 +374,17 @@ public:
       _siteParity = upload(parityHost);
     }
 
-    // === Scalar W store + phase + pairing maps (Slice 2; additive) ============
+    // === Scalar W store + phase + pairing maps ============
     _paddedOsites = _paddedGrid5d->oSites();
 
-    // Forward-W read site (D7): shift-0 padded interior oSite per source ss.
+    // Forward-W read site: shift-0 padded interior oSite per source ss.
     {
       std::vector<int> interiorHost =
           buildInteriorOffset(_grid5d.get(), _paddedGrid5d, 1);
       _interiorOffsetDev = upload(interiorHost);
     }
 
-    // Phase fields (D1/D6): applyCoeffsAndPhase on a grid5d ones field mirrors
+    // Phase fields: applyCoeffsAndPhase on a grid5d ones field mirrors
     // local task's phase pre-bake (its ctor). grid5d so ss matches the
     // kernel osites; phase is spatial-only so dim-5 lanes are replicated. This
     // is the SAME phase the old spinTasteGaugeChain baked into W -- applying it
@@ -407,7 +405,7 @@ public:
       _phaseView->openViews(_phaseFields.data(), (int)gammas.size());
     }
 
-    // Pairing maps (D3): classify per gamma; global forward-field index =
+    // Pairing maps: classify per gamma; global forward-field index =
     // fwdEpCum + local compact index. Also accumulates _nFwdEpTotal.
     std::vector<int> forwardRepHost, isForwardHost;
     _nFwdEpTotal = 0;
@@ -444,7 +442,7 @@ public:
     _forwardRepDev = upload(forwardRepHost);
     _isForwardDev = upload(isForwardHost);
 
-    // Scalar W Lattice (D5): gridW is a 5D Nsimd=1 grid whose dim-5 indexes the
+    // Scalar W Lattice: gridW is a 5D Nsimd=1 grid whose dim-5 indexes the
     // forward endpoints ("directions"); _wScalarGrid lives on its padded grid
     // (spatial matches paddedGrid5d, so interiorOffset/paddedSS align). Build
     // per forward direction: grid4d unphased chain -> promote grid5d -> pad
@@ -494,7 +492,7 @@ public:
     }
   }
 
-  // Teardown is safe-by-construction (L1.2-04): members destroy in REVERSE
+  // Teardown is safe-by-construction: members destroy in REVERSE
   // declaration order, and the declaration layout encodes the PaddedCell
   // teardown invariant -- ~PaddedCell -> DeleteGrids reads
   // unpadded_grid->_processors, so a cell must die before the grid it wraps.
@@ -506,20 +504,19 @@ public:
   int getNgamma() { return (int)_gammas.size(); }
   double getFlops() {
     // Per (site, l, r) pairing: one W_s ColourMatrix×FermionVec (66 FLOP) + one
-    // innerProduct (22 FLOP) = 88 FLOP × nEndpoints. F1 hoists W*psi out of the
+    // innerProduct (22 FLOP) = 88 FLOP × nEndpoints. W*psi is hoisted out of the
     // per-L loop (computed once per (l_batch,r_batch,site,ep), reused across the
     // rotation sweep), so actual W*psi FLOPs drop ~Nsimd×; the reported metric is
     // already sizeL/sizeR-independent, so this per-endpoint value stays valid.
     return 88.0 * _nEpTotal;
   }
   // The worker reads the 4D full grid (to size full-grid input temporaries);
-  // _fullGrid is protected, so expose it (B2).
+  // _fullGrid is protected, so expose it.
   GridCartesian *getFullGrid() const { return _fullGrid; }
 
-  // setLeft: pack full-grid LHS into Nsimd-sized 5D batches (design F1), each
+  // setLeft: pack full-grid LHS into Nsimd-sized 5D batches, each
   // batch holding Nsimd distinct L in its dim-5 lanes, via the same pack5d
-  // (Phase 1) setRight uses for RHS. Does NOT call the base (grid4d is
-  // GridBase*; the custom execute indexes _lhs5d/_lhsView). LHS is unshifted,
+  // setRight uses for RHS. LHS is unshifted,
   // so no PaddedCell::Exchange (unlike setRight).
   void setLeft(const FermionField *left, int size) {
     _sizeL = size;
@@ -555,7 +552,6 @@ public:
   }
 
   // setRight: pack full-grid RHS into Nsimd-sized 5D batches, pad via Exchange.
-  // As with setLeft, does not call the base (B5/C1: grid4d is GridBase*).
   void setRight(const FermionField *right, int size) {
     _sizeR = size;
     _nBatchesR = (size + _Nsimd - 1) / _Nsimd;
@@ -596,7 +592,7 @@ public:
   // execute (ContractType dispatch). Full: one unfiltered vectorSum5d pass
   // + circulant scatter. Half/mixed (LeftHalf/RightHalf/BothHalf): two
   // parity-filtered passes (even/odd source sites) into a parity-split
-  // scratch, then assembleMat applies the L1.1-03 placement table.
+  // scratch, then assembleMat applies the placement table.
   //....................................................................
   void execute(scalar_type *result_p,
                ContractType contract_type = ContractType::Full) {
@@ -617,9 +613,8 @@ public:
     int nParity = cbSplit ? 2 : 1;
 
     // shm_p holds cobj (SIMD) elements indexed, fastest-to-slowest, as
-    // (rt, s, l_batch, r_batch, mu) -- rt stays innermost (matching v3's
-    // convention: rt was always the fastest-varying index in the pre-F1
-    // layout). s is the F1 addition, positioned at stride localOrthogDimSize
+    // (rt, s, l_batch, r_batch, mu) -- rt stays innermost. s is positioned
+    // at stride localOrthogDimSize
     // right where a sub-index of l_batch belongs (for fixed lane j, s and the
     // intra-batch L index i are in 1-1 correspondence). Each cobj still
     // encodes Nsimd lanes (extractLane in assembly), so no extra Nsimd factor
@@ -661,13 +656,10 @@ public:
   // serial loop inside (no per-mu accumulator state to chunk, unlike
   // vectorSum5d's MF_SUM_ARRAY_MAX blocking).
   //
-  // CB output-placement reference (L1.1-03) -- the even/odd placement
-  // truth tables extracted from the legacy A2ATaskBase::simdSumHalf /
-  // simdSumMixed (A2ATask.h). The legacy kernels accumulate per-CB-task
-  // temps into the doubled output slots with signs keyed on
-  // (cbEven x oddShifts); expressed per parity (M0 = even source-site sum,
-  // identical to the legacy even-CB-task temp; M1 = odd; sigma = -1 for
-  // odd popcount, the legacy oddShifts, else +1):
+  // CB output-placement: the even/odd placement
+  // truth tables for the doubled output slots, keyed on
+  // (cbEven x oddShifts); expressed per parity (M0 = even source-site sum;
+  // M1 = odd; sigma = -1 for odd popcount, else +1):
   //
   //   BothHalf  slots (row 2l+lc, col 2r+rc):
   //     (0,0): M0+M1          (0,1): sigma*(M0-M1)
@@ -677,12 +669,11 @@ public:
   //   RightHalf slots (row l, col 2r+rc):
   //     (0): M0+M1            (1): sigma*(M0-M1)
   //
-  // Equivalence to the legacy per-task routing: every endpoint of a gamma
-  // displaces by popcount hops, so parity(x+s) = parity(x) ^ (pc%2); with
-  // CB copies packed into full objects, the even-site pass pairs L_E with
-  // R_E (even pc) or R_O (odd pc) -- exactly the legacy _odd_shifts E/O
-  // routing (A2AWorker.h StagMesonField). Reducing the legacy cbEven /
-  // oddShifts sign tables modulo that routing yields the slot forms above.
+  // Derivation: every endpoint of a gamma displaces by popcount hops, so
+  // parity(x+s) = parity(x) ^ (pc%2); with CB copies packed into full
+  // objects, the even-site pass pairs L_E with R_E (even pc) or R_O
+  // (odd pc). Reducing the cbEven/oddShifts sign tables modulo that
+  // routing yields the slot forms above.
   //....................................................................
   void assembleMat(scalar_type *result_p, cobj *shm_p, ContractType ct,
                    int nGamma, int gammaStride, int localOrthogDimSize,
@@ -793,7 +784,7 @@ public:
   }
 
   //....................................................................
-  // vectorSum5d: fused F1 kernel, shared by the Full and CB half/mixed modes
+  // vectorSum5d: fused kernel, shared by the Full and CB half/mixed modes
   // (the name drops "Full" accordingly). Ordinary coalesced (nsimd=Nsimd)
   // launch. Loop order: (lt_batch=[l_batch,rt], r_batch) parallel; (mu, ep,
   // so) serial.
@@ -824,7 +815,7 @@ public:
     int osites = _osites;
     int paddedOsites = _paddedOsites;
 
-    // Scalar W store (Slice 2): bind a local Lattice& before autoView -- the
+    // Scalar W store: bind a local Lattice& before autoView -- the
     // macro expands w.View(mode) verbatim, so a unique_ptr must be dereferenced
     // first (else *_wScalarGrid.View(mode) binds .View to the unique_ptr).
     Lattice<ColourMatrix> &wScalar = *_wScalarGrid;
@@ -866,18 +857,18 @@ public:
               continue;
             int paddedSS = offsets_p[(size_t)ge * osites + ss];
             auto psi = coalescedRead(rhsView_p[r_batch][paddedSS]);
-            // W read site (D7): forward -> source x (interiorOffset, local);
-            // backward -> x-s (paddedSS, halo) + adj. W is UNPHASED C_s (D1/D4).
+            // W read site: forward -> source x (interiorOffset, local);
+            // backward -> x-s (paddedSS, halo) + adj. W is UNPHASED C_s.
             int wSS = isFwd ? interiorOffset_p[ss] : paddedSS;
             auto W = promoteColourMatrix(wsScalar_p[(size_t)fwdEp * paddedOsites + wSS]);
             if (!isFwd)
               W = adj(W);
             auto Wpsi = W * psi;
-            // Follana phase + scaling at the SOURCE site x (D1/D6). W is unphased
+            // Follana phase + scaling at the SOURCE site x. W is unphased
             // so the {s,-s} pairing hermiticity is exact (corr == +1). Phase is
-            // ep-independent; applied per-ep here (forced by the S1 ep-outside-so
-            // loop order -- restructuring to (mu,so,ep) would defeat the S1 psi
-            // stream) -- mathematically phase * sum_ep IP == sum_ep phase*IP.
+            // ep-independent; applied per-ep here (the ep-outside-so
+            // loop order keeps the RHS buffer sequentially-accessible;
+            // mathematically phase * sum_ep IP == sum_ep phase*IP).
             calcScalar gamma_phase = coalescedRead(phaseView_p[mu][ss]);
             for (int s = 0; s < Nsimd; s++)
               sum[s][mu] = sum[s][mu] + gamma_phase * innerProduct(

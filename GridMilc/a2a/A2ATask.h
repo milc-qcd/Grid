@@ -1,14 +1,17 @@
-/*
- * GridMilc/a2a/A2ATask.h — part of GridMilc (https://github.com/paboyle/Grid)
- *
- * All-to-all staggered meson-field contraction tasks (local + one-link).
- * Header-only; lifted from HadronsMILC. Self-contained via Grid's QCD core
- * umbrella.
- *
- * GridMilc is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 (or, at your option,
- * any later version). See COPYING/LICENSE in the top-level distribution.
- */
+/******************************************************************************/
+/* A2ATask.h -- legacy all-to-all meson-field contraction tasks.              */
+/*                                                                            */
+/* Legacy task base (A2ATaskBase) with the 4-CB-arg E/O routing and concrete  */
+/* legacy tasks: Local, OneLink, SpinTaste. The production stencil task        */
+/* (A2ATaskSpinTasteStencil) and its 5 file-scope helpers were split off to   */
+/* A2ATaskStencil.h. ContractType was lifted to A2AContractType.h.           */
+/*                                                                            */
+/* Part of GridMilc (https://github.com/paboyle/Grid).                       */
+/*                                                                            */
+/* GridMilc is free software; you can redistribute it and/or modify it under  */
+/* the terms of the GNU General Public License version 2 (or, at your option, */
+/* any later version). See COPYING/LICENSE in the top-level distribution.    */
+/******************************************************************************/
 #pragma once
 
 #include <Grid/GridQCDcore.h>
@@ -1454,11 +1457,6 @@ public:
     });
   }
 };
-// === Phase 3 (L1.2-05/L1.2-01): the 5 stencil helpers and the stencil task
-//     class (formerly here) were removed and relocated, split off the task
-//     base, to GridMilc/a2a/A2ATaskStencil.h. This header is now legacy-only
-//     (task base + Local/Onelink/SpinTaste tasks). ===
-
 #undef A2A_TYPEDEFS
 #undef COMMON_VARS
 

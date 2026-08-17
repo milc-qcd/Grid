@@ -1,14 +1,17 @@
-/*
- * GridMilc/a2a/A2AWorker.h — part of GridMilc (https://github.com/paboyle/Grid)
- *
- * All-to-all staggered meson-field worker: top-level StagMesonField entry
- * point driving the local / one-link tasks. Header-only; lifted from
- * HadronsMILC. Self-contained via Grid's QCD core umbrella + Eigen Tensor.
- *
- * GridMilc is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 (or, at your option,
- * any later version). See COPYING/LICENSE in the top-level distribution.
- */
+/******************************************************************************/
+/* A2AWorker.h -- legacy all-to-all meson-field worker facade.               */
+/*                                                                            */
+/* Legacy worker base (A2AWorkerBase) and concrete legacy workers: Local,     */
+/* OneLink, SpinTaste. The production stencil worker (A2AWorkerSpinTasteStencil)*/
+/* was split off to A2AWorkerStencil.h. The base StagMesonField entry here    */
+/* is the legacy 4-CB-arg signature used by the deprecated worker family.     */
+/*                                                                            */
+/* Part of GridMilc (https://github.com/paboyle/Grid).                       */
+/*                                                                            */
+/* GridMilc is free software; you can redistribute it and/or modify it under  */
+/* the terms of the GNU General Public License version 2 (or, at your option, */
+/* any later version). See COPYING/LICENSE in the top-level distribution.    */
+/******************************************************************************/
 #pragma once
 
 #include <Grid/GridQCDcore.h>
@@ -198,12 +201,6 @@ public:
         new A2ATaskSpinTaste<FImpl>(grid, orthogDir, gammas, U, Odd);
   }
 };
-
-// === Phase 3 (L0-01): the stencil worker class and its preceding /////
-//     doc-comment block (formerly here) were removed and relocated, split
-//     off the worker base, to GridMilc/a2a/A2AWorkerStencil.h. This header now
-//     holds only the legacy family: the worker base + Local/Onelink/SpinTaste
-//     workers + the base StagMesonField. ===
 
 template <class FImpl>
 template <typename TensorType>

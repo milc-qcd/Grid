@@ -6,7 +6,6 @@
 /* output-mat device cache (via the A2ACache DOD facility), an L/R address     */
 /* cache, and the stencil task by concrete pointer. The public entry is        */
 /* StagMesonField(mat, lhs, rhs, sizeL, sizeR, ct): full-grid LHS/RHS arrays   */
-/* StagMesonField(mat, lhs, rhs, sizeL, sizeR, ct): full-grid LHS/RHS arrays   */
 /* plus an explicit ContractType flag. For the half/mixed CB modes            */
 /* (LeftHalf/RightHalf/BothHalf) each CB-side array entry packs two copies in */
 /* one full object (E values on even sites, O on odd -- the setCheckerboard   */

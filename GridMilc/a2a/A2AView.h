@@ -1,14 +1,16 @@
-/*
- * GridMilc/a2a/A2AView.h — part of GridMilc (https://github.com/paboyle/Grid)
- *
- * All-to-all device-side view objects (lattice + stencil views) for the
- * staggered meson-field contraction kernels. Header-only; lifted from
- * HadronsMILC. Self-contained via Grid's core umbrella.
- *
- * GridMilc is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 (or, at your option,
- * any later version). See COPYING/LICENSE in the top-level distribution.
- */
+/******************************************************************************/
+/* A2AView.h -- device-side view objects (lattice + stencil views) for the    */
+/* staggered meson-field contraction kernels.                                */
+/*                                                                            */
+/* Wraps Grid's LatticeView / CartesianStencilView into device-resident arrays */
+/* with open/close lifecycle.                                                 */
+/*                                                                            */
+/* Part of GridMilc (https://github.com/paboyle/Grid).                       */
+/*                                                                            */
+/* GridMilc is free software; you can redistribute it and/or modify it under  */
+/* the terms of the GNU General Public License version 2 (or, at your option, */
+/* any later version). See COPYING/LICENSE in the top-level distribution.    */
+/******************************************************************************/
 #pragma once
 
 #include <Grid/GridCore.h>
@@ -40,7 +42,7 @@ public:
     acceleratorCopyToDevice(_view.data(), _view_device, _view_device_size);
   }
 
-  // (L3-02) Idempotent: callers may release device memory early via an explicit
+  // Idempotent: callers may release device memory early via an explicit
   // closeViews() while the shared_ptr-wrapped view stays alive; the dtor calls
   // it again. The size guard + null-after-free make the repeat call a no-op.
   // Safe on a view never reserve()'d (members default to nullptr/0).
@@ -150,7 +152,7 @@ public:
     _buffer_device = static_cast<obj*>(acceleratorAllocDevice(_buffer_device_size));
     acceleratorCopyToDevice(buffer.data(), _buffer_device, _buffer_device_size);
   }
-  // (L3-02) null the buffer/offset pointers after free so the explicit+dtor
+  // null the buffer/offset pointers after free so the explicit+dtor
   // dual closeViews() call is a safe no-op the second time.
   virtual void closeViews() {
 

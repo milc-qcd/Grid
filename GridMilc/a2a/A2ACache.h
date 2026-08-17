@@ -5,9 +5,9 @@
 /* stencil and legacy StagMesonField paths.                                   */
 /*                                                                             */
 /* DOD, not OOP: a POD state struct (A2AMatCache) + free functions. No        */
-/* inheritance, no dynamic dispatch in the hot path (methodology principle M1).*/
+/* inheritance, no dynamic dispatch in the hot path.                    */
 /* The cache is grow-only and reused across the many StagMesonField calls a   */
-/* long-lived worker serves, freed at worker dtor (M4).                       */
+/* long-lived worker serves, freed at worker dtor.                         */
 /*                                                                             */
 /* Part of GridMilc (https://github.com/paboyle/Grid).                       */
 /******************************************************************************/
@@ -30,8 +30,7 @@ template <typename Scalar> struct A2AMatCache {
 
 // Ensure the cache can hold nBytes; grow-only (never shrinks), freeing the
 // previous allocation on growth. Returns the device pointer. Equivalent to the
-// inline `_cache_bytes < needed` realloc block in A2AWorker.h
-// StagMesonField[Stencil] (A2AWorker.h:252-261 and :305-311).
+// inline `_cache_bytes < needed` realloc block in the workers.
 template <typename Scalar>
 inline Scalar *ensureMatCache(A2AMatCache<Scalar> &c, size_t nBytes) {
   if (c.bytes < nBytes) {
@@ -44,9 +43,7 @@ inline Scalar *ensureMatCache(A2AMatCache<Scalar> &c, size_t nBytes) {
 }
 
 // Release the cache. Safe on a default-constructed/already-freed cache (no-op
-// when bytes == 0). Intended for the worker destructor (mirrors the
-// `if (_cache_bytes != 0) acceleratorFreeDevice(_cache_device)` in
-// ~A2AWorkerBase, A2AWorker.h:49-52).
+// when bytes == 0). Intended for the worker destructor.
 template <typename Scalar>
 inline void freeMatCache(A2AMatCache<Scalar> &c) {
   if (c.bytes != 0) {
@@ -63,18 +60,17 @@ inline void zeroMatCache(Scalar *device, size_t n) {
   accelerator_for(idx, n, 1, { device[idx] = Scalar(0); });
 }
 
-// Copy device -> host. Equivalent to the acceleratorCopyFromDevice block in the
-// workers (A2AWorker.h:285 stencil, :377 legacy). `count` is the element count
-// (bytes = count*sizeof(Scalar)). The facility emits no GRID_TRACE of its own;
-// Phase 3 wraps the call in a GRID_TRACE region at the call site, matching the
-// inline pattern (separate CopyFromDevice / GlobalSum regions).
+// Copy device -> host. Equivalent to the acceleratorCopyFromDevice block in
+// the workers. `count` is the element count (bytes = count*sizeof(Scalar)).
+// The facility emits no GRID_TRACE of its own; the call site wraps this
+// in a GRID_TRACE region.
 template <typename Scalar>
 inline void copyFromDeviceMat(Scalar *device, Scalar *host, size_t count) {
   acceleratorCopyFromDevice(device, host, count * sizeof(Scalar));
 }
 
-// Reduce across MPI ranks. Equivalent to the grid->GlobalSumVector tail in the
-// workers (A2AWorker.h:292 stencil, :383 legacy). Trace at the call site.
+// Reduce across MPI ranks. Equivalent to the grid->GlobalSumVector tail
+// in the workers. Trace at the call site.
 template <typename Scalar>
 inline void globalSumMat(GridBase *grid, Scalar *host, size_t count) {
   grid->GlobalSumVector(host, (int)count);

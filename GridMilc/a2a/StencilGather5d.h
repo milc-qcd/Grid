@@ -100,7 +100,7 @@ accelerator_inline void src4dIndex(int &srcOSite, int &srcLane,
 ///////////////////////////////////////////////////////////////////////////////
 // src4dSiteFrom5d: decode a 5D spatial oSite `ss` into the (oSite, lane) of
 // its originating 4D SIMD field. Wraps the CoorFromIndex + src4dIndex preamble
-// shared by pack5d and promoteField5d (L2-05). Lane-independent: for a fixed ss
+// shared by pack5d and promoteField5d. Lane-independent: for a fixed ss
 // the (srcOSite, srcLane) result is the same for every dim-5 lane, so callers
 // may compute it once and reuse across lanes.
 ///////////////////////////////////////////////////////////////////////////////
@@ -241,7 +241,7 @@ inline void unpackScalarW(sobj *dst, const Lattice<vobj> &padded5d,
 // buildInteriorOffset: per-source-oSite padded-grid oSite for a SHIFT-0
 // (identity) gather = the interior copy of each original site in the padded
 // grid. Forward-endpoint W is read at the SOURCE site x (always local); this
-// maps ss -> the padded interior oSite (D7). Mirrors buildPaddedOffset5d's
+// maps ss -> the padded interior oSite. Mirrors buildPaddedOffset5d's
 // arithmetic with a zero endpoint. Host-only (oCoorFromOindex/oIndexReduced).
 ///////////////////////////////////////////////////////////////////////////////
 inline std::vector<int>
