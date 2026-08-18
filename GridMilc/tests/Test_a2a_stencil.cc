@@ -87,6 +87,42 @@ static std::vector<StagGamma::SpinTastePair> testGammas() {
   };
 }
 
+// Reconstruction of the legacy combined CB slots from the raw parity
+// partials M0 (even source sites) / M1 (odd) emitted by the stencil worker.
+// This table is the exact algebraic image of the sign branches the stencil
+// kernel applied before the raw-parity redesign and of the frozen legacy
+// oracle's simdSumHalf/simdSumMixed tables (A2ATask.h): slot = sA*M0 +
+// sB*M1 with sigma = -1 for odd popcount. sigma enters RightHalf's rc=1
+// slot and BothHalf's rc=1 column slots -- (0,1) and (1,1) -- while the
+// rc=0 slots and all LeftHalf slots are sigma-free (the legacy
+// LeftHalf-vs-RightHalf asymmetry); a reconstruction that wrongly applies
+// sigma to LeftHalf passes all even-popcount gammas and fails only the
+// popcount-1/3 ones (testGammas spans both).
+//   BothHalf  slot (row 2l+lc, col 2r+rc):
+//     (0,0): M0+M1          (0,1): sigma*(M0-M1)
+//     (1,0): M0-M1          (1,1): sigma*(M0+M1)
+//   LeftHalf  slot (row 2l+lc, col r):   lc=0: M0+M1   lc=1: M0-M1
+//   RightHalf slot (row l, col 2r+rc):   rc=0: M0+M1   rc=1: sigma*(M0-M1)
+// lc/rc select the e/o combination on each CB-flagged side (the legacy
+// interleaved layout); sig = -1 for odd popcount, else +1.
+static ComplexD reconstructLegacySlot(ContractType ct, int lc, int rc,
+                                      ComplexD M0, ComplexD M1,
+                                      ComplexD sig) {
+  if (ct == ContractType::BothHalf) {
+    if (lc == 0 && rc == 0)
+      return M0 + M1;
+    if (lc == 0 && rc == 1)
+      return sig * (M0 - M1);
+    if (lc == 1 && rc == 0)
+      return M0 - M1;
+    return sig * (M0 + M1); // (1,1)
+  } else if (ct == ContractType::LeftHalf) {
+    return (lc == 0) ? (M0 + M1) : (M0 - M1);
+  } else { // RightHalf
+    return (rc == 0) ? (M0 + M1) : (sig * (M0 - M1));
+  }
+}
+
 // =============================================================================
 // testStencilGather5d: validates the 5D padded gather against Cshift.
 // Creates a 5D grid (simd_layout={1,1,1,1,Nsimd}), builds padded offsets for
@@ -342,9 +378,11 @@ int main(int argc, char **argv) {
             << " (maxRelErr=" << stencilMaxErrAll << ")" << std::endl;
 
   // ---- CB half/mixed differential: stencil (packed full objects + ct) vs
-  // legacy A2AWorkerSpinTaste (CB-grid arrays, 4-arg entry). The legacy
-  // output layout is mat(0,0,t, 2*l+cb_l, 2*r+cb_r) on CB-flagged sides
-  // (interleaved); the stencil must reproduce it value-for-value. Packed
+  // legacy A2AWorkerSpinTaste (CB-grid arrays, 4-arg entry). The stencil
+  // emits RAW parity partials in one uniform block layout -- (2nl, nr)
+  // with rows [0,nl) = M0 = <e|.> and rows [nl,2nl) = M1 = <o|.> -- for
+  // every CB mode; the legacy combined slots are RECONSTRUCTED test-side
+  // via reconstructLegacySlot() and compared value-for-value. Packed
   // objects are built with setCheckerboard (E copy on even sites, O copy on
   // odd) -- the same convention Test_a2a uses for w_full.
   int nCbFail = 0;
@@ -393,7 +431,8 @@ int main(int argc, char **argv) {
     struct CbMode {
       const char *name;
       ContractType ct;
-      int outL, outR; // output-dim multipliers on (lhs, rhs)
+      int legL, legR; // LEGACY-oracle output multipliers on (lhs, rhs);
+                      // the stencil output is always (2*nl, nr)
     } modes[3] = {
         {"BothHalf", ContractType::BothHalf, 2, 2},
         {"LeftHalf",  ContractType::LeftHalf,  2, 1},
@@ -421,8 +460,11 @@ int main(int argc, char **argv) {
         // array twice for the non-CB side (only the E array is read there).
         // Created per mode to avoid _transformed vector reuse issues in
         // the legacy task's setRight.
-        Eigen::Tensor<ComplexD, 5> mf_leg(1, 1, Nt, mode.outL * nl,
-                                          mode.outR * nr);
+        // RowMajor: the workers memcpy flat row-major device buffers
+        // into mat.data(), so operator() maps 1:1 onto the worker
+        // slots (default ColMajor would permute (t,l,r) across shapes).
+        Eigen::Tensor<ComplexD, 5, Eigen::RowMajor> mf_leg(
+            1, 1, Nt, mode.legL * nl, mode.legR * nr);
         mf_leg.setZero();
         {
           A2AWorkerSpinTaste<FImpl> w(grid, emptyMom, oneGamma, &U, orthogDir);
@@ -438,9 +480,11 @@ int main(int argc, char **argv) {
           }
         }
 
-        // Stencil path (packed full objects + explicit ct).
-        Eigen::Tensor<ComplexD, 5> mf_stn(1, 1, Nt, mode.outL * nl,
-                                          mode.outR * nr);
+        // Stencil path (packed full objects + explicit ct): uniform raw
+        // block layout (2*nl, nr) for every CB mode. RowMajor so
+        // operator() matches the worker's flat row-major write (see the
+        // mf_leg note above).
+        Eigen::Tensor<ComplexD, 5, Eigen::RowMajor> mf_stn(1, 1, Nt, 2 * nl, nr);
         mf_stn.setZero();
         if (mode.ct == ContractType::BothHalf) {
           sw.StagMesonField(mf_stn, lhsPack.data(), rhsPack.data(), nl, nr,
@@ -453,18 +497,32 @@ int main(int argc, char **argv) {
                             ContractType::RightHalf);
         }
 
+        // Reconstruct-then-diff: rebuild each legacy slot from the raw
+        // partials and compare against the frozen oracle. Each tensor is
+        // indexed with its OWN dims (legacy interleaved vs stencil block).
         double cbErr = 0.0;
+        ComplexD sig = (pc & 1) ? ComplexD(-1.0) : ComplexD(1.0);
         for (int t = 0; t < Nt; t++)
-          for (int i = 0; i < mode.outL * nl; i++)
-            for (int j = 0; j < mode.outR * nr; j++) {
-              ComplexD lv = mf_leg(0, 0, t, i, j);
-              ComplexD sv = mf_stn(0, 0, t, i, j);
-              auto mag = [](ComplexD z) {
-                return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
-              };
-              double denom = std::max(mag(lv), mag(sv));
-              double e = (denom > 0.0) ? mag(lv - sv) / denom : mag(lv - sv);
-              cbErr = std::max(cbErr, e);
+          for (int l = 0; l < nl; l++)
+            for (int r = 0; r < nr; r++) {
+              ComplexD M0 = mf_stn(0, 0, t, l, r);
+              ComplexD M1 = mf_stn(0, 0, t, nl + l, r);
+              for (int lc = 0; lc < mode.legL; lc++)
+                for (int rc = 0; rc < mode.legR; rc++) {
+                  int iLeg = (mode.legL == 2) ? 2 * l + lc : l;
+                  int jLeg = (mode.legR == 2) ? 2 * r + rc : r;
+                  ComplexD lv = mf_leg(0, 0, t, iLeg, jLeg);
+                  ComplexD sv =
+                      reconstructLegacySlot(mode.ct, lc, rc, M0, M1, sig);
+                  auto mag = [](ComplexD z) {
+                    return std::sqrt(z.real() * z.real() +
+                                     z.imag() * z.imag());
+                  };
+                  double denom = std::max(mag(lv), mag(sv));
+                  double e = (denom > 0.0) ? mag(lv - sv) / denom
+                                           : mag(lv - sv);
+                  cbErr = std::max(cbErr, e);
+                }
             }
         cbMaxErrAll = std::max(cbMaxErrAll, cbErr);
         if (cbErr > 1e-10) {
@@ -479,45 +537,51 @@ int main(int argc, char **argv) {
                     << std::endl;
         }
 
-        // Physics consistency: the BothHalf (2l, 2r) block equals the Full
-        // contraction of the packed objects (M0+M1 over all sites) --
-        // oracle-independent check of the diagonal slot form.
-        if (mode.ct == ContractType::BothHalf) {
-          Eigen::Tensor<ComplexD, 5> mf_full(1, 1, Nt, nl, nr);
+        // Physics consistency (oracle-independent): the raw parity partials
+        // of ANY CB mode must sum to the Full contraction of that mode's
+        // inputs -- M0 + M1 covers even+odd source sites, i.e. all sites.
+        // BothHalf: Full(lhsPack, rhsPack); LeftHalf: Full(lhsPack, vecs);
+        // RightHalf: Full(vecs, rhsPack). This is the independent brake on
+        // the reconstruction: if the kernel output and reconstructLegacySlot
+        // shared one wrongly-derived sign table, the differential above
+        // would self-confirm; this check cannot. Reuses the per-gamma
+        // worker (address cache: same input arrays as the CB call above;
+        // grow-only mat cache: Full (nl,nr) fits in the (2nl,nr) slot).
+        {
+          // RowMajor: matches mf_stn/mf_leg — operator() reads land on
+          // the worker's flat row-major slots.
+          Eigen::Tensor<ComplexD, 5, Eigen::RowMajor> mf_full(1, 1, Nt, nl, nr);
           mf_full.setZero();
-          {
-            A2AWorkerSpinTasteStencil<FImpl> sw(grid, emptyMom, oneGamma, &U,
-                                                orthogDir);
+          if (mode.ct == ContractType::BothHalf) {
             sw.StagMesonField(mf_full, lhsPack.data(), rhsPack.data(), nl, nr);
+          } else if (mode.ct == ContractType::LeftHalf) {
+            sw.StagMesonField(mf_full, lhsPack.data(), vecs.data(), nl, nr);
+          } else {
+            sw.StagMesonField(mf_full, vecs.data(), rhsPack.data(), nl, nr);
           }
-          // Compare via flat data(): the workers write row-major
-          // (gt*matL*matR + l*matR + r) but Eigen::Tensor is ColMajor; the
-          // stride mismatch cancels in same-shape differentials only.
-          double eeErr = 0.0;
+          double physErr = 0.0;
           for (int t = 0; t < Nt; t++)
-            for (int i = 0; i < nl; i++)
-              for (int j = 0; j < nr; j++) {
-                ComplexD a =
-                    mf_full.data()[(size_t)t * nl * nr + (size_t)i * nr + j];
-                ComplexD b = mf_stn.data()[(size_t)t * (2 * nl) * (2 * nr) +
-                                           (size_t)(2 * i) * (2 * nr) + 2 * j];
+            for (int l = 0; l < nl; l++)
+              for (int r = 0; r < nr; r++) {
+                ComplexD a = mf_full(0, 0, t, l, r);
+                ComplexD b = mf_stn(0, 0, t, l, r) +
+                             mf_stn(0, 0, t, nl + l, r); // M0 + M1
                 auto mag = [](ComplexD z) {
                   return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
                 };
                 double denom = std::max(mag(a), mag(b));
                 double e = (denom > 0.0) ? mag(a - b) / denom : mag(a - b);
-                eeErr = std::max(eeErr, e);
+                physErr = std::max(physErr, e);
               }
-          if (eeErr > 1e-10) {
-            std::cerr << "    CB BothHalf ee-block FAIL gamma "
+          if (physErr > 1e-10) {
+            std::cerr << "    CB " << mode.name << " physics FAIL gamma "
                       << StagGamma::GetName(gamma)
-                      << " maxRelErr=" << eeErr << std::endl;
+                      << " maxRelErr=" << physErr << std::endl;
             nCbFail++;
           } else {
-            std::cout << GridLogMessage
-                      << "    CB BothHalf ee-block OK gamma "
-                      << StagGamma::GetName(gamma)
-                      << " maxRelErr=" << eeErr << std::endl;
+            std::cout << GridLogMessage << "    CB " << mode.name
+                      << " physics OK gamma " << StagGamma::GetName(gamma)
+                      << " maxRelErr=" << physErr << std::endl;
           }
         }
       }

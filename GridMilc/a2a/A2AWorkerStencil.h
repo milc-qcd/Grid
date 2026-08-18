@@ -6,10 +6,11 @@
 /* output-mat device cache (via the A2ACache DOD facility), an L/R address     */
 /* cache, and the stencil task by concrete pointer. The public entry is        */
 /* StagMesonField(mat, lhs, rhs, sizeL, sizeR, ct): full-grid LHS/RHS arrays   */
-/* plus an explicit ContractType flag. For the half/mixed CB modes            */
-/* (LeftHalf/RightHalf/BothHalf) each CB-side array entry packs two copies in */
+/* plus an explicit ContractType flag. For the half/mixed CB modes             */
+/* (LeftHalf/RightHalf/BothHalf) each CB-side array entry packs two copies in  */
 /* one full object (E values on even sites, O on odd -- the setCheckerboard   */
-/* convention) and the output doubles that side's dims.                       */
+/* convention) and the output is one uniform block layout: always (2L, R)      */
+/* with rows [0,L) the <e|.> partials and rows [L,2L) the <o|.> partials.      */
 /*                                                                            */
 /* Part of GridMilc (https://github.com/paboyle/Grid).                       */
 /******************************************************************************/
@@ -97,24 +98,26 @@ public:
   // arrays; ct states the checkerboard/contraction mode explicitly (never
   // probed from the lattice). For the CB modes each CB-side array entry
   // packs two copies in one full object (E values on even sites, O on odd
-  // -- the setCheckerboard convention) and the output doubles that side's
-  // dims with interleaved 2*l+lc / 2*r+rc slots.
+  // -- the setCheckerboard convention) and the output uses one uniform
+  // block layout: always (2L, R), rows [0,L) = <e|.> partials (even source
+  // sites), rows [L,2L) = <o|.> partials (odd source sites). The ct
+  // Left/Right bits document which side's arrays are packed; they do not
+  // change the output shape.
   template <typename TensorType>
   void StagMesonField(TensorType &mat, const FermionField *lhs,
                       const FermionField *rhs, int sizeL, int sizeR,
                       ContractType ct = ContractType::Full) {
-    // Contract/dims consistency: sizeL/sizeR are array entry counts; the
-    // output dims are doubled on CB-flagged sides.
+    // Contract/dims consistency: sizeL/sizeR are array entry counts; CB
+    // modes double dim 3 (the row block split), dim 4 is never doubled.
     {
-      int cbL = ((int)ct & (int)ContractType::LeftHalf) ? 2 : 1;
-      int cbR = ((int)ct & (int)ContractType::RightHalf) ? 2 : 1;
+      int rowMult = (ct == ContractType::Full) ? 1 : 2;
       if (ct == ContractType::undef ||
-          (int)mat.dimension(3) != cbL * sizeL ||
-          (int)mat.dimension(4) != cbR * sizeR) {
+          (int)mat.dimension(3) != rowMult * sizeL ||
+          (int)mat.dimension(4) != sizeR) {
         std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: mat dims ("
                   << mat.dimension(3) << "," << mat.dimension(4)
-                  << ") inconsistent with sizes (" << cbL * sizeL << ","
-                  << cbR * sizeR << ") for ContractType " << (int)ct
+                  << ") inconsistent with sizes (" << rowMult * sizeL << ","
+                  << sizeR << ") for ContractType " << (int)ct
                   << std::endl;
         GridAbort();
       }

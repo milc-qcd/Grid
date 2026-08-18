@@ -1,8 +1,8 @@
 /******************************************************************************/
 /* A2ATaskStencil.h -- 5D stencil spin-taste meson-field task + its file-scope */
 /* helpers, split off the legacy task machinery.                             */
-/* Self-contained (T1): depends on no legacy a2a worker/task header. The task  */
-/* owns its state directly (no base-class inheritance).                        */
+/* Self-contained (T1): depends on no legacy a2a worker/task header. The task */
+/* owns its state directly (no base-class inheritance). */
 /*                                                                             */
 /* Part of GridMilc (https://github.com/paboyle/Grid).                        */
 /******************************************************************************/
@@ -157,9 +157,9 @@ spinTasteGaugeChainUnphasedForward(const LatticeGaugeField *U,
         int dir = dirs[perm[i]];
         int sign = s[dir];
         if (sign > 0) {
-          chain = Udir4d[dir] * Cshift(chain, dir, +1);       // CovShiftForward
+          chain = Udir4d[dir] * Cshift(chain, dir, +1); // CovShiftForward
         } else {
-          chain = Cshift(adj(Udir4d[dir]) * chain, dir, -1);  // CovShiftBackward
+          chain = Cshift(adj(Udir4d[dir]) * chain, dir, -1); // CovShiftBackward
         }
       }
       accumChain = accumChain + chain;
@@ -248,7 +248,7 @@ protected:
   LatticeGaugeField *_U;
   GridCartesian *_fullGrid; // 4D full grid (E/O joined, non-owning: caller owns)
   std::unique_ptr<GridCartesian> _grid5d; // 5D grid (simd={1,1,1,1,Nsimd})
-  int _orthog_dir;          // orthogonal direction (only ex-base member)
+  int _orthog_dir; // orthogonal direction (only ex-base member)
   ContractType _contract_type = ContractType::undef;
 
   std::unique_ptr<PaddedCell> _cell5d;
@@ -256,8 +256,8 @@ protected:
 
   // Flattened per-(gamma,ep,osite) padded offset (deviceVector).
   deviceVector<int> _allOffsets;
-  deviceVector<int> _nEpDev;    // nEndpoints per gamma
-  deviceVector<int> _epStartDev;// cumulative global endpoint start per gamma
+  deviceVector<int> _nEpDev;     // nEndpoints per gamma
+  deviceVector<int> _epStartDev; // cumulative global endpoint start per gamma
   int _nEpTotal;
   int _osites; // 5D spatial oSites (== grid5d oSites)
 
@@ -296,10 +296,10 @@ protected:
   std::unique_ptr<Lattice<ColourMatrix>> _wScalarGrid; // on _paddedGridW
   int _nFwdEpTotal = 0;  // dim-5 size (total forward endpoints)
   int _paddedOsites = 0; // padded spatial oSites (== paddedGrid5d oSites)
-  deviceVector<int> _forwardRepDev;     // [epTotal] global forward-field index
-  deviceVector<int> _isForwardDev;      // [epTotal] 0/1
+  deviceVector<int> _forwardRepDev; // [epTotal] global forward-field index
+  deviceVector<int> _isForwardDev;  // [epTotal] 0/1
   deviceVector<int> _interiorOffsetDev; // [osites] shift-0 padded interior oSite
-  std::vector<ComplexField> _phaseFields;         // [nGamma] grid5d phase
+  std::vector<ComplexField> _phaseFields; // [nGamma] grid5d phase
   std::shared_ptr<A2AFieldView<cobj>> _phaseView;
 
 public:
@@ -592,7 +592,9 @@ public:
   // execute (ContractType dispatch). Full: one unfiltered vectorSum5d pass
   // + circulant scatter. Half/mixed (LeftHalf/RightHalf/BothHalf): two
   // parity-filtered passes (even/odd source sites) into a parity-split
-  // scratch, then assembleMat applies the placement table.
+  // scratch, then assembleMat scatters the RAW parity partials (M0 = even
+  // source-site sum, M1 = odd) into separate row blocks of a uniform
+  // (2L, R) output.
   //....................................................................
   void execute(scalar_type *result_p,
                ContractType contract_type = ContractType::Full) {
@@ -622,8 +624,8 @@ public:
     // source sites) writes into shm_p + p * nGamma * gammaStride.
     int gammaStride = _nBatchesL * _nBatchesR * localOrthogDimSize * _Nsimd;
 
-    cobj *shm_p = static_cast<cobj *>(acceleratorAllocDevice(
-        gammaStride * nGamma * nParity * sizeof(cobj)));
+    cobj *shm_p = static_cast<cobj *>(
+        acceleratorAllocDevice(gammaStride * nGamma * nParity * sizeof(cobj)));
     {
       GRID_TRACE("A2AStencil/ZeroScratch");
       accelerator_for(idx, gammaStride * nGamma * nParity, 1,
@@ -656,55 +658,45 @@ public:
   // serial loop inside (no per-mu accumulator state to chunk, unlike
   // vectorSum5d's MF_SUM_ARRAY_MAX blocking).
   //
-  // CB output-placement: the even/odd placement
-  // truth tables for the doubled output slots, keyed on
-  // (cbEven x oddShifts); expressed per parity (M0 = even source-site sum;
-  // M1 = odd; sigma = -1 for odd popcount, else +1):
+  // CB output-placement: RAW parity partials, one BLOCK layout uniform for
+  // all three CB modes -- the output is always (2L, R): rows [0, L) hold
+  // the M0 = <e|.> partials (even source sites), rows [L, 2L) hold the
+  // M1 = <o|.> partials (odd source sites; SOURCE-site parity). The
+  // ContractType Left/Right bits no longer shape the output; they only say
+  // which side's arrays carry packed CB data:
+  //   LeftHalf  (L side packed): (2L, R)
+  //   RightHalf (R side packed): (2L, R)
+  //   BothHalf  (both packed):   (2L, R)
+  // The legacy combined e+-o slots (signed M0/sigma*M1 combinations with
+  // sigma = -1 for odd popcount) are NO LONGER formed here; callers/tests
+  // reconstruct them from the raw partials (Test_a2a_stencil.cc
+  // reconstructLegacySlot).
   //
-  //   BothHalf  slots (row 2l+lc, col 2r+rc):
-  //     (0,0): M0+M1          (0,1): sigma*(M0-M1)
-  //     (1,0): M0-M1          (1,1): sigma*(M0+M1)
-  //   LeftHalf  slots (row 2l+lc, col r):
-  //     (0): M0+M1            (1): M0-M1
-  //   RightHalf slots (row l, col 2r+rc):
-  //     (0): M0+M1            (1): sigma*(M0-M1)
-  //
-  // Derivation: every endpoint of a gamma displaces by popcount hops, so
-  // parity(x+s) = parity(x) ^ (pc%2); with CB copies packed into full
-  // objects, the even-site pass pairs L_E with R_E (even pc) or R_O
-  // (odd pc). Reducing the cbEven/oddShifts sign tables modulo that
-  // routing yields the slot forms above.
+  // Derivation (why M0/M1 are the natural split): every endpoint of a gamma
+  // displaces by popcount hops, so parity(x+s) = parity(x) ^ (pc%2); with
+  // CB copies packed into full objects, the even-site pass pairs L_E with
+  // R_E (even pc) or R_O (odd pc) -- M0/M1 are exactly the legacy even/odd
+  // CB task temps.
   //....................................................................
   void assembleMat(scalar_type *result_p, cobj *shm_p, ContractType ct,
                    int nGamma, int gammaStride, int localOrthogDimSize,
                    int pc, int Nt) {
-    bool cbL = ((int)ct & (int)ContractType::LeftHalf) != 0;
-    bool cbR = ((int)ct & (int)ContractType::RightHalf) != 0;
     bool cbSplit = (ct != ContractType::Full);
-    int nLC = cbL ? 2 : 1;   // l-slot multiplicity (packed pairs doubled)
-    int nRC = cbR ? 2 : 1;   // r-slot multiplicity
-    int matL = _sizeL * nLC; // output rows
-    int matR = _sizeR * nRC; // output cols
+    int matL = _sizeL * (cbSplit ? 2 : 1);   // CB: rows [0,L) = M0, [L,2L) = M1
+    int matR = _sizeR;                       // columns never doubled
     int parityStride = nGamma * gammaStride; // even slice | odd slice
 
-    // Copy members to locals: the GPU lambda captures a CPU `this`.
-    auto shm_p_a = shm_p;
-    auto result_p_a = result_p;
-    int sizeL_a = _sizeL;
-    int sizeR_a = _sizeR;
-    int nBatchesL_a = _nBatchesL;
-    int nBatchesR_a = _nBatchesR;
+    // Copy members to locals: the GPU lambda cannot capture a CPU `this`.
+    // Plain params/locals (shm_p, result_p, matL, matR, parityStride,
+    // cbSplit, ...) are captured directly, as in vectorSum5d.
+    int sizeL = _sizeL;
+    int sizeR = _sizeR;
+    int nBatchesL = _nBatchesL;
+    int nBatchesR = _nBatchesR;
     int Nsimd = _Nsimd;
-    int matL_a = matL;
-    int matR_a = matR;
-    int nLC_a = nLC;
-    int nRC_a = nRC;
-    int parityStride_a = parityStride;
-    bool cbSplit_a = cbSplit;
-    auto nEp_p = _nEpDev.data();
     {
       GRID_TRACE("A2AStencil/Assemble");
-      accelerator_for2d(l_batch, nBatchesL_a, r_batch, nBatchesR_a, Nsimd, {
+      accelerator_for2d(l_batch, nBatchesL, r_batch, nBatchesR, Nsimd, {
 #ifdef GRID_SIMT
         {
           int j = acceleratorSIMTlane(Nsimd);
@@ -712,66 +704,27 @@ public:
         for (int j = 0; j < Nsimd; j++) {
 #endif
           int r = r_batch * Nsimd + j;
-          if (r < sizeR_a) {
+          if (r < sizeR) {
             for (int mu = 0; mu < nGamma; mu++) {
-              // sigma = -1 for odd popcount: nEp = 2^popcount, so
-              // nEp in {2, 8} <=> popcount in {1, 3}.
-              scalar_type sig =
-                  (nEp_p[mu] == 2 || nEp_p[mu] == 8) ? scalar_type(-1.0)
-                                                     : scalar_type(1.0);
               for (int rt = 0; rt < localOrthogDimSize; rt++) {
                 int gt = rt + pc * localOrthogDimSize; // T simd=1
                 for (int i = 0; i < Nsimd; i++) {
                   int l = l_batch * Nsimd + i;
-                  if (l < sizeL_a) {
+                  if (l < sizeL) {
                     int s = ((i - j) % Nsimd + Nsimd) % Nsimd;
                     int shm_idx =
                         rt +
                         localOrthogDimSize *
-                            (s + Nsimd * (l_batch + nBatchesL_a * r_batch)) +
+                            (s + Nsimd * (l_batch + nBatchesL * r_batch)) +
                         mu * gammaStride;
-                    auto M0 = TensorRemove(extractLane(j, shm_p_a[shm_idx]));
-                    if (!cbSplit_a) {
-                      // Full: one slot per (l, r), single parity slice, each
-                      // slot written exactly once (plain assignment keeps
-                      // execute() free of a pre-zeroed-result dependency).
-                      int64_t mat_idx = (int64_t)mu * matL_a * matR_a * Nt +
-                                         r + matR_a * (l + matL_a * gt);
-                      result_p_a[mat_idx] = M0;
-                    } else {
-                      auto M1 = TensorRemove(extractLane(
-                          j, shm_p_a[shm_idx + parityStride_a]));
-                      for (int lc = 0; lc < nLC_a; lc++) {
-                        for (int rc = 0; rc < nRC_a; rc++) {
-                          scalar_type sA, sB; // slot = sA*M0 + sB*M1
-                          if (cbL && cbR) { // BothHalf
-                            sA = (rc == 1) ? sig : scalar_type(1.0);
-                            if (lc == 0 && rc == 0)
-                              sB = scalar_type(1.0);
-                            else if (lc == 0 && rc == 1)
-                              sB = -sig;
-                            else if (lc == 1 && rc == 0)
-                              sB = scalar_type(-1.0);
-                            else
-                              sB = sig;
-                          } else if (cbL) { // LeftHalf
-                            sA = scalar_type(1.0);
-                            sB = (lc == 0) ? scalar_type(1.0)
-                                           : scalar_type(-1.0);
-                          } else { // RightHalf
-                            sA = (rc == 0) ? scalar_type(1.0) : sig;
-                            sB = (rc == 0) ? scalar_type(1.0) : -sig;
-                          }
-                          // int64_t: BothHalf quadruples the flattened
-                          // output; int would overflow the mu stride at
-                          // 4x smaller sizes than Full (silent wrong slots).
-                          int64_t mat_idx =
-                              (int64_t)mu * matL_a * matR_a * Nt +
-                              nRC_a * r + rc +
-                              matR_a * (nLC_a * l + lc + matL_a * gt);
-                          result_p_a[mat_idx] += sA * M0 + sB * M1;
-                        }
-                      }
+                    auto M0 = TensorRemove(extractLane(j, shm_p[shm_idx]));
+                    int64_t mat_idx = (int64_t)mu * matL * matR * Nt + r +
+                                      matR * (l + matL * gt);
+                    result_p[mat_idx] = M0;
+                    if (cbSplit) {
+                      auto M1 = TensorRemove(
+                          extractLane(j, shm_p[shm_idx + parityStride]));
+                      result_p[mat_idx + (int64_t)matR * sizeL] = M1;
                     }
                   }
                 }
@@ -820,22 +773,23 @@ public:
     // first (else *_wScalarGrid.View(mode) binds .View to the unique_ptr).
     Lattice<ColourMatrix> &wScalar = *_wScalarGrid;
     autoView(wsGrid_v, wScalar, AcceleratorRead);
-    ColourMatrix *wsScalar_p = &wsGrid_v[0];         // [globalFwdEp][paddedOsites]
-    FermView *lhsView_p = _lhsView->getView();       // [l_batch][ss]
+    ColourMatrix *wsScalar_p = &wsGrid_v[0];   // [globalFwdEp][paddedOsites]
+    FermView *lhsView_p = _lhsView->getView(); // [l_batch][ss]
     FermView *rhsView_p = _paddedRhsView->getView(); // [r_batch][paddedSS]
     ComplexView *phaseView_p = _phaseView->getView() + mu_offset; // [mu][ss]
 
-    auto offsets_p = _allOffsets.data();        // [(epStart+ep)*osites + ss]
+    auto offsets_p = _allOffsets.data(); // [(epStart+ep)*osites + ss]
     auto nEp_p = _nEpDev.data();
     auto epStart_p = _epStartDev.data();
-    auto forwardRep_p = _forwardRepDev.data();  // [globalEp] -> global fwd-field idx
-    auto isForward_p = _isForwardDev.data();    // [globalEp] 0/1
+    auto forwardRep_p =
+        _forwardRepDev.data(); // [globalEp] -> global fwd-field idx
+    auto isForward_p = _isForwardDev.data();           // [globalEp] 0/1
     auto interiorOffset_p = _interiorOffsetDev.data(); // [ss]
 
     int nBatchesLT = nBatchesL * localOrthogDimSize;
     accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, Nsimd, {
       int l_batch = lt_batch / localOrthogDimSize;
-      int rt      = lt_batch % localOrthogDimSize;
+      int rt = lt_batch % localOrthogDimSize;
 
       calcScalar sum[vobj::Nsimd()][MF_SUM_ARRAY_MAX];
       for (int s = 0; s < Nsimd; s++)
@@ -847,8 +801,8 @@ public:
         int nEp = nEp_p[g];
         int epStart = epStart_p[g];
         for (int ep = 0; ep < nEp; ep++) {
-          int ge = epStart + ep;           // global endpoint index
-          int fwdEp = forwardRep_p[ge];    // global forward-field index
+          int ge = epStart + ep;        // global endpoint index
+          int fwdEp = forwardRep_p[ge]; // global forward-field index
           bool isFwd = isForward_p[ge] != 0;
           for (int so = 0; so < localSpatialVolume; so++) {
             int ss = rt * localSpatialVolume + so;
@@ -860,7 +814,8 @@ public:
             // W read site: forward -> source x (interiorOffset, local);
             // backward -> x-s (paddedSS, halo) + adj. W is UNPHASED C_s.
             int wSS = isFwd ? interiorOffset_p[ss] : paddedSS;
-            auto W = promoteColourMatrix(wsScalar_p[(size_t)fwdEp * paddedOsites + wSS]);
+            auto W = promoteColourMatrix(
+                wsScalar_p[(size_t)fwdEp * paddedOsites + wSS]);
             if (!isFwd)
               W = adj(W);
             auto Wpsi = W * psi;
@@ -887,7 +842,6 @@ public:
         }
     });
   }
-
 };
 
 NAMESPACE_END(Grid);
