@@ -31,7 +31,10 @@ NAMESPACE_BEGIN(Grid);
 // to the 5D grid. For the CB half/mixed contract modes each CB-side array
 // entry packs two copies in one full object (E values on even sites, O on odd
 // -- the setCheckerboard convention); the task splits the source-site sum by
-// parity internally. Mirrors the A2AWorkerLocal/Onelink lifecycle:
+// parity internally. Any ContractType != Full (including ParityBisect, which
+// claims no packed side) requests the parity-split output; the Left/Right
+// bits only document which side's arrays are packed. U may be null iff every
+// gamma has zero displacement. Mirrors the A2AWorkerLocal/Onelink lifecycle:
 // setLeft/setRight re-run only when the input address changes (address-cache
 // via _l_addr/_r_addr), so a worker kept alive across many calls skips
 // redundant 5D re-promotion.
@@ -102,7 +105,10 @@ public:
   // block layout: always (2L, R), rows [0,L) = <e|.> partials (even source
   // sites), rows [L,2L) = <o|.> partials (odd source sites). The ct
   // Left/Right bits document which side's arrays are packed; they do not
-  // change the output shape.
+  // change the output shape. ParityBisect requests the same split output
+  // when neither side's arrays are packed (the parity source-site filter is
+  // well-defined on any full-grid data); Full alone produces the unsplit
+  // (L, R) layout.
   template <typename TensorType>
   void StagMesonField(TensorType &mat, const FermionField *lhs,
                       const FermionField *rhs, int sizeL, int sizeR,

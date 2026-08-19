@@ -120,6 +120,8 @@ inline void classifySpinTasteEndpoints(const std::vector<Coordinate> &endpoints,
 // phase field, so the pairing hermiticity C_{-s}(x)=adj(C_s(x-s)) is
 // exact (corr always +1). Returns grid4d chains (no promoteField5d here -- the
 // task ctor promotes/pads/unpacks to the scalar store). One-time setup cost.
+// U may be null when the spin-taste has zero displacement (nActive == 0):
+// no links are read and each chain is the identity.
 ///////////////////////////////////////////////////////////////////////////////
 inline std::vector<LatticeColourMatrix>
 spinTasteGaugeChainUnphasedForward(const LatticeGaugeField *U,
@@ -135,11 +137,20 @@ spinTasteGaugeChainUnphasedForward(const LatticeGaugeField *U,
     if (static_cast<int>(StagGamma::gmu[j]) & shift)
       dirs[nActive++] = j;
 
+  // Null-U tolerance: a zero-displacement spin-taste (nActive == 0) reads no
+  // gauge links -- its covariant chain is identically the identity -- so the
+  // Udir4d peek loop below is skipped and U may be null for all-local gamma
+  // sets. Any displacing gamma still dereferences U; assert the caller did
+  // not pass null there.
+  assert((nActive == 0) || (U != nullptr));
+
   std::vector<LatticeColourMatrix> Udir4d;
-  Udir4d.reserve(Nd);
-  for (int mu = 0; mu < Nd; mu++) {
-    Udir4d.emplace_back(grid4d);
-    Udir4d[mu] = PeekIndex<LorentzIndex>(*U, mu);
+  if (nActive > 0) {
+    Udir4d.reserve(Nd);
+    for (int mu = 0; mu < Nd; mu++) {
+      Udir4d.emplace_back(grid4d);
+      Udir4d[mu] = PeekIndex<LorentzIndex>(*U, mu);
+    }
   }
 
   LatticeColourMatrix accumChain(grid4d), chain(grid4d);
