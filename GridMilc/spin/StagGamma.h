@@ -71,53 +71,121 @@ public:
   typedef std::pair<StagAlgebra, StagAlgebra> SpinTastePair;
 
 public:
-  StagGamma() : _spin(0), _taste(0) {}
+  // Default ctor now delegates: _scaling becomes well-defined (calculatePhase
+  // sets 1.0 for popcount 0) instead of uninitialized.
+  StagGamma() : StagGamma(StagAlgebra::G1, StagAlgebra::G1) {}
 
-  StagGamma(StagAlgebra spin, StagAlgebra taste) {
+  StagGamma(StagAlgebra spin, StagAlgebra taste) : _label(spin, taste) {
     _spin = spin;
     _taste = taste;
     calculatePhase();
   }
 
-  StagGamma(SpinTastePair initg) { StagGamma(initg.first, initg.second); }
+  StagGamma(SpinTastePair initg) : StagGamma(initg.first, initg.second) {}
 
   void setGaugeField(LatticeGaugeField &U_) { U = &U_; }
 
   inline void setSpin(StagAlgebra g) {
     _spin = g;
+    _label.first = g;
     calculatePhase();
   }
 
   inline void setTaste(StagAlgebra g) {
     _taste = g;
+    _label.second = g;
     calculatePhase();
   }
 
   inline void setSpinTaste(StagAlgebra spin, StagAlgebra taste) {
     _spin = spin;
     _taste = taste;
+    _label = SpinTastePair(spin, taste);
     calculatePhase();
   }
 
   inline void setSpinTaste(SpinTastePair g) { setSpinTaste(g.first, g.second); }
 
+  // Fold eps(x) = (-1)^(x+y+z+t) onto this operator as a LEFT composition:
+  // after this call the object represents (eps o O_this)(f) = eps * O_this(f).
+  //
+  // Identity (handoff-staggamma-applyg5-check.py, "formula holds: 80"; the
+  // extension to multi-link is exact because eps is a pure post-shift
+  // phase): with P = (spin ^ G5, taste ^ G5),
+  //   osc(P) = osc(this) ^ 1111  == eps's own per-site phase,
+  //   shift, _scaling, popcount, hop directions, CB landing parity are
+  //   bitwise invariant under the fold,
+  // hence  eps o O_Gamma == O_P with _negated = neg(Gamma).  This routine
+  // implements exactly that: save neg, XOR G5 into both components, re-run
+  // calculatePhase() (sets _scaling/_oscillateDirs for P and resets
+  // _negated), then restore the saved negation.  It never touches
+  // operator*.
+  //
+  // The raw label is preserved: naming follows the label (getLabelName),
+  // physics follows the (P) pair.
+  //
+  // WARNING: after this call _negated is NOT self-derived from the stored
+  // (P) pair. setSpin/setTaste/setSpinTaste re-run calculatePhase() and
+  // destroy it. Objects carrying an eps fold must be treated as immutable:
+  // consume through const& (applyGamma/applyCoeffsAndPhase/oneLink/
+  // operator() are const; setGaugeField only writes the U pointer).
+  void applyG5Left() {
+    bool savedNegated = _negated;
+    _spin = _spin ^ StagAlgebra::G5;
+    _taste = _taste ^ StagAlgebra::G5;
+    calculatePhase();
+    _negated = savedNegated;
+  }
+
+  // NAMING / SERIALIZATION BOUNDARY ONLY.
+  //
+  // Returns the P pairs (spin ^ G5, taste ^ G5) when applyG5=true. A bare
+  // SpinTastePair CANNOT represent eps∘Γ: the eps-folded operator needs the
+  // non-self-derived _negated = neg(raw pair) that only a StagGamma object
+  // carries. Rebuilding an operator from these pairs via setSpinTaste()
+  // yields O_P with neg(P) -- WRONG wherever neg(raw) != neg(P) (exactly
+  // the 32 Y/T-shift one-link pairs of the handoff enumeration, and any
+  // multi-link pair whose negation parities differ).
+  //
+  // Use MakeSpinTasteOps() below for operator objects. Kept unchanged in
+  // signature/return for downstream (HadronsMILC / grid-lma) string
+  // handling; zero in-tree callers.
   static std::vector<StagGamma::SpinTastePair>
   ParseSpinTasteString(std::string str, bool applyG5 = false) {
     auto gammas = strToVec<StagGamma::SpinTastePair>(str);
 
     if (applyG5) {
-      StagGamma st;
-      StagGamma g5(StagGamma::StagAlgebra::G5, StagGamma::StagAlgebra::G5);
-
       for (auto &g : gammas) {
-        st.setSpinTaste(g);
-        st = st * g5;
-        g.first = st._spin;
-        g.second = st._taste;
+        g.first = g.first ^ StagAlgebra::G5;
+        g.second = g.second ^ StagAlgebra::G5;
       }
     }
 
     return gammas;
+  }
+
+  // The ONLY operator-producing entry point for string-specified spin-taste
+  // lists. applyG5=true returns eps∘Γ objects (see applyG5Left). U is bound
+  // at construction on every object (null U is legal iff every operator has
+  // zero displacement -- applyGamma asserts U != nullptr only when
+  // shift != 0). The returned objects are immutable for life: pass them as
+  // const std::vector<StagGamma>& end-to-end.
+  static std::vector<StagGamma>
+  MakeSpinTasteOps(const std::string &str, bool applyG5 = false,
+                   LatticeGaugeField *U = nullptr) {
+    auto gammas = strToVec<StagGamma::SpinTastePair>(str);
+    std::vector<StagGamma> ops;
+    ops.reserve(gammas.size());
+    for (auto &g : gammas) {
+      ops.emplace_back(g);
+      if (U != nullptr) {
+        ops.back().setGaugeField(*U);
+      }
+      if (applyG5) {
+        ops.back().applyG5Left();
+      }
+    }
+    return ops;
   }
   static std::string GetName(StagAlgebra spin, StagAlgebra taste) {
 
@@ -131,7 +199,14 @@ public:
     return StagGamma::GetName(g.first, g.second);
   }
 
-  std::string getName() const { return StagGamma::GetName(_spin, _taste); }
+  std::string getName() const { return GetName(_label); }
+
+  // Raw-pair label: the (spin, taste) the object was last set from, BEFORE
+  // any eps fold. After applyG5Left(), _spin/_taste hold the P pair but
+  // naming must follow the raw pair (naming follows the label, physics
+  // follows the pair).
+  SpinTastePair getLabel() const { return _label; }
+  std::string getLabelName() const { return GetName(_label); }
 
   template <typename obj>
   void applyGamma(Lattice<obj> &lhs, const Lattice<obj> &rhs) const;
@@ -206,7 +281,9 @@ public:
 private:
   StagAlgebra _oscillateDirs = 0;
   bool _negated = false;
-  RealD _scaling;
+  RealD _scaling = 1.0; // NSDMI: default-ctor objects are well-defined even
+                        // before a setSpinTaste call (was: uninitialized).
+  SpinTastePair _label = SpinTastePair(StagAlgebra::G1, StagAlgebra::G1);
 };
 
 inline StagGamma::StagAlgebra StagGamma::LessThan(StagAlgebra g) {
@@ -534,7 +611,42 @@ void StagGamma::applyCoeffsAndPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) 
   lhs = std::move(temp);
 }
 
+// g1 * g2 == O_{g2} o O_{g1}: apply g1 FIRST, then g2. This is operator
+// COMPOSITION on the staggered field, not Clifford-algebra multiplication
+// of the underlying gamma matrices (the old Follana-A4 sign answered the
+// latter and disagreed with actual composition on 128/256 eps-related
+// pairs -- free-field matrix verification at design time).
+//
+// Sign (validated on 13,308 free-field cases, 0 failures; see design
+// artifact D2): with B2 = shift directions of g2 and osc1 = oscillateDirs
+// of g1,
+//   _negated(g1*g2) = neg1 ^ neg2 ^ par(osc1 & B2)
+// The correction par(osc1 & B2) is the sign picked up pulling g1's
+// position-dependent phase through g2's hops (each active direction of g2
+// landing on an odd coordinate of osc1).
+//
+// Exactness domain: ALWAYS exact when either operand is local (popcount 0)
+// -- in particular eps∘Γ == Γobj * epsObj for every Γ, which is exactly the
+// applyG5Left() fold (both give the P pair with _negated = neg(Γ)). For
+// displacing operands the composition is exact when the shift directions
+// are DISJOINT on free fields (and its sign is exact generally; the
+// covariant transport ordering differs on dynamical gauge backgrounds).
+// Overlapping shift directions are NOT expressible as a single
+// spin-taste pair (±2-hop displacements appear) -- asserted.
 inline StagGamma operator*(const StagGamma &g1, const StagGamma &g2) {
+
+  // Composition is representable only for disjoint hop directions
+  // (overlapping shifts give ±2-hop displacements -- not any single
+  // pair). Fail LOUD rather than via assert: an NDEBUG release build must
+  // not silently return a wrong operator (A2A popcount-guard pattern).
+  int shift1 = g1._spin ^ g1._taste;
+  int shift2 = g2._spin ^ g2._taste;
+  if (shift1 & shift2) {
+    std::cerr << "StagGamma operator*: overlapping shift directions ("
+              << shift1 << " & " << shift2 << ") -- composition not "
+              << "expressible as a single spin-taste pair" << std::endl;
+    GridAbort();
+  }
 
   StagGamma ret(g1._spin ^ g2._spin, g1._taste ^ g2._taste);
 
@@ -543,16 +655,12 @@ inline StagGamma operator*(const StagGamma &g1, const StagGamma &g2) {
     ret.setGaugeField(*(g1.U));
   }
 
-  if (g1._negated != g2._negated) {
-    ret.toggleNegation();
-  }
-
-  // Following eqn. A4 of Follana (2007)
-  uint8_t negate = ((g1._spin & StagGamma::LessThan(g2._spin)) ^
-                    (g1._taste & StagGamma::LessThan(g2._taste)));
-
+  // Composition sign: neg1 ^ neg2 ^ par(osc1 & B2). The two-arg ctor set
+  // _negated = neg(product pair); overwrite with the composition sign.
+  ret._negated = (g1._negated != g2._negated); // neg1 ^ neg2
+  uint8_t cross = g1._oscillateDirs & shift2;  // osc1 & B2
   for (auto &dir : StagGamma::gmu) {
-    if (dir & negate) {
+    if (dir & cross) {
       ret.toggleNegation();
     }
   }
