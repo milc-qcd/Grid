@@ -46,6 +46,27 @@ typedef FImpl::FermionField FermionField;
 typedef FImpl::ComplexField ComplexField;
 typedef ImprovedStaggeredFermion<FImpl> StagOp;
 
+// ---- Explicit-eps helpers (verbatim from Test_staggamma.cc:168-186) ----
+// parity(x) = (x+y+z+t) % 2 and f *= eps(x): the EXPLICIT-eps side of the
+// applyG5 cross-check.
+static void makeParityField(Lattice<iScalar<vInteger>> &parity) {
+  GridBase *grid = parity.Grid();
+  Lattice<iScalar<vInteger>> coor(grid);
+  parity = Zero();
+  for (int mu = 0; mu < Nd; mu++) {
+    LatticeCoordinate(coor, mu);
+    parity = parity + coor;
+  }
+}
+
+template <class obj>
+static void applyEpsilon(Lattice<obj> &f,
+                         const Lattice<iScalar<vInteger>> &parity) {
+  Lattice<obj> neg(f.Grid());
+  neg = -f;
+  f = where(mod(parity, 2) == (Integer)1, neg, f);
+}
+
 // ---- Representative spin-taste pairs, one per popcount 0-4 ----
 // StagAlgebra is a GRID_SERIALIZABLE_ENUM (a class wrapping int with an
 // int ctor), so we construct each element explicitly via StagAlgebra(int).
@@ -152,6 +173,10 @@ int main(int argc, char **argv) {
   }
   std::cout << GridLogMessage << "Gauge fields read" << std::endl;
 
+  // Parity field for the explicit-eps brute-force reference.
+  Lattice<iScalar<vInteger>> parity(grid);
+  makeParityField(parity);
+
   // ---- ImprovedStaggeredFermion (HISQ) for Even-partner generation ----
   // Follow Test_staggamma.cc pattern: MILC constructor, ImportGaugeSimple.
   RealD mass = 0.0;
@@ -235,7 +260,16 @@ int main(int argc, char **argv) {
               << "=== gamma " << StagGamma::GetName(gamma)
               << " (popcount " << pc << ") ===" << std::endl;
 
-    std::vector<StagGamma::SpinTastePair> oneGamma = {gamma};
+    // applyG5-folded single-gamma operator set: exercises the folded sign
+    // through the whole legacy A2A path (SpinTaste/Local/Onelink workers).
+    std::vector<StagGamma> oneGamma;
+    {
+      StagGamma st;
+      st.setGaugeField(U);
+      st.setSpinTaste(gamma);
+      st.applyG5Left();
+      oneGamma.push_back(st);
+    }
 
     // ---- Build full-grid vectors (combine Even/Odd CB partners) ----
     std::vector<FermionField> w_full(nevec, grid), v_full(nevec, grid);
@@ -263,8 +297,9 @@ int main(int argc, char **argv) {
                             v_full.data(), v_full.data());
     }
 
-    // ---- Brute-force reference (full grid) ----
-    // applyGamma on full-grid right vectors.
+    // ---- Brute-force reference (full grid): EXPLICIT eps composition (eps
+    // AFTER applyGamma) -- independent of the folded _negated the workers
+    // carry, so the multiset comparison below cannot self-confirm.
     std::vector<FermionField> psi_full(nevec, grid);
     {
       StagGamma st;
@@ -272,6 +307,7 @@ int main(int argc, char **argv) {
       st.setSpinTaste(gamma);
       for (int k = 0; k < nevec; k++) {
         st.applyGamma(psi_full[k], v_full[k]);
+        applyEpsilon(psi_full[k], parity);
       }
     }
 
@@ -363,7 +399,17 @@ int main(int argc, char **argv) {
   // ---- Cross-check: popcount 0 vs Local, popcount 1 vs Onelink ----
   for (int gi = 0; gi < 2; gi++) {
     auto &gamma = gammas[gi];
-    std::vector<StagGamma::SpinTastePair> oneGamma = {gamma};
+    // applyG5-folded single-gamma operator set (same construction as the
+    // main loop: like-for-like across the SpinTaste/Local/Onelink workers,
+    // all carrying the folded sign).
+    std::vector<StagGamma> oneGamma;
+    {
+      StagGamma st;
+      st.setGaugeField(U);
+      st.setSpinTaste(gamma);
+      st.applyG5Left();
+      oneGamma.push_back(st);
+    }
     std::vector<ComplexField> emptyMom;
 
     Eigen::Tensor<ComplexD, 5> mf_st(1, 1, Nt, 2 * nevec, 2 * nevec);

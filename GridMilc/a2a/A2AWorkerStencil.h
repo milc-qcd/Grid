@@ -70,7 +70,7 @@ public:
   A2AWorkerSpinTasteStencil() = delete;
   A2AWorkerSpinTasteStencil(GridCartesian *grid,
                             const std::vector<ComplexField> &mom,
-                            const std::vector<StagGamma::SpinTastePair> &gammas,
+                            const std::vector<StagGamma> &gammas,
                             LatticeGaugeField *U, int orthogDir)
       : _grid(grid) {
     // Momentum projection is not implemented for the stencil path (same as the

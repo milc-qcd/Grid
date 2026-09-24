@@ -494,20 +494,20 @@ public:
   A2A_TYPEDEFS;
 
 protected:
-  std::vector<StagGamma::SpinTastePair> _gammas;
+  std::vector<StagGamma> _gammas; // was: bare pair vector
   std::vector<ComplexField> _phase;
   std::shared_ptr<A2AFieldView<cobj>> _phase_view;
 
 public:
   A2ATaskLocal(GridBase *grid, int orthogDir, A2ATaskLocal<FImpl> &other,
-               const std::vector<StagGamma::SpinTastePair> &gammas = {},
+               const std::vector<StagGamma> &gammas = {},
                int cb = Even)
       : A2ATaskBase<FImpl>(grid, orthogDir, cb), _gammas(gammas) {
     _phase_view = other.getPhaseView();
   }
 
   A2ATaskLocal(GridBase *grid, int orthogDir,
-               const std::vector<StagGamma::SpinTastePair> &gammas,
+               const std::vector<StagGamma> &gammas,
                int cb = Even)
       : A2ATaskBase<FImpl>(grid, orthogDir, cb), _gammas(gammas) {
 
@@ -517,16 +517,15 @@ public:
 
     ComplexField temp(this->_full_grid);
     temp = 1.0;
-    StagGamma spinTaste;
 
     _phase_view = std::make_shared<A2AFieldView<cobj>>();
     _phase_view->reserve(nGamma);
 
     for (int mu = 0; mu < nGamma; mu++) {
-
-      spinTaste.setSpinTaste(_gammas[mu]);
-
-      spinTaste.applyCoeffsAndPhase(_phase[mu], temp); // store spin-taste phase
+      // SIGN-CRITICAL: the STORED object's _negated (applyG5-folded when
+      // constructed that way) is what gets baked into _phase[mu]. No
+      // scratch setSpinTaste rebuild -- that would reset the sign.
+      _gammas[mu].applyCoeffsAndPhase(_phase[mu], temp); // store spin-taste phase
     }
     _phase_view->openViews(_phase.data(), nGamma);
   }
@@ -712,7 +711,10 @@ public:
   A2A_TYPEDEFS;
 
 protected:
-  const std::vector<StagGamma::SpinTastePair> &_gammas = {};
+  std::vector<StagGamma> _gammas; // was: const-ref bare pair vector member
+  // By value: the const-reference member had a dangling-temporary hazard
+  // (default `= {}` binds a temporary) AND a bare pair cannot carry the
+  // applyG5 sign. StagGamma is trivially copyable (raw U pointer shared).
   std::vector<int> _shift_dirs, _shift_displacements;
   LatticeGaugeField *_U;
 
@@ -722,31 +724,24 @@ protected:
 
 public:
   A2ATaskOnelink(GridBase *grid, int orthogDir,
-                 const std::vector<StagGamma::SpinTastePair> &gammas,
+                 const std::vector<StagGamma> &gammas,
                  int cb = Even)
       : A2ATaskBase<FImpl>(grid, orthogDir, cb), _gammas(gammas) {
 
     this->_odd_shifts = true;
 
-    StagGamma spinTaste;
-
     for (int i = 0; i < _gammas.size(); i++) {
-
-      spinTaste.setSpinTaste(_gammas[i]);
-
-      // Harden: A2ATaskOnelink is correct ONLY for popcount==1 (a single
-      // covariant hop). The original code silently truncated popcount>=2
-      // gammas to their first active direction (the break below), producing
-      // wrong results with no error. Route popcount>=2 to A2ATaskSpinTaste.
-      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      // popcount/shift are P-invariant under the eps fold: direct reads of
+      // the stored (P) pair are identical to the raw pair's.
+      int pc = StagGamma::popcountShift(_gammas[i]._spin, _gammas[i]._taste);
       if (pc != 1) {
         std::cerr << "A2ATaskOnelink requires popcount(spin^taste)==1, got "
-                  << pc << " for gamma " << StagGamma::GetName(_gammas[i])
+                  << pc << " for gamma " << _gammas[i].getLabelName()
                   << "; use A2ATaskSpinTaste for popcount>=2" << std::endl;
         GridAbort();
       }
 
-      int shift = (spinTaste._spin ^ spinTaste._taste);
+      int shift = (_gammas[i]._spin ^ _gammas[i]._taste);
       // Assume 1-link for now -- break loop when you find a shift direction
       for (int j = 0; j < StagGamma::gmu.size(); j++) {
         if (StagGamma::gmu[j] & shift) {
@@ -761,7 +756,7 @@ public:
   }
 
   A2ATaskOnelink(GridBase *grid, int orthogDir, A2ATaskOnelink<FImpl> &other,
-                 const std::vector<StagGamma::SpinTastePair> &gammas,
+                 const std::vector<StagGamma> &gammas,
                  LatticeGaugeField *U, int cb = Even)
       : A2ATaskOnelink<FImpl>(grid, orthogDir, gammas, cb) {
     _U = U;
@@ -770,7 +765,7 @@ public:
   }
 
   A2ATaskOnelink(GridBase *grid, int orthogDir,
-                 const std::vector<StagGamma::SpinTastePair> &gammas,
+                 const std::vector<StagGamma> &gammas,
                  LatticeGaugeField *U, int cb = Even)
       : A2ATaskOnelink<FImpl>(grid, orthogDir, gammas, cb) {
 
@@ -783,11 +778,7 @@ public:
     _link.resize(nGamma, _U->Grid());
     _link_shifted.resize(nGamma, _U->Grid());
 
-    StagGamma spinTaste;
-
     for (int i = 0; i < nGamma; i++) {
-
-      spinTaste.setSpinTaste(_gammas[i]);
 
       _link[i] = PeekIndex<LorentzIndex>(
           *_U,
@@ -795,8 +786,11 @@ public:
 
       _link_shifted[i] = Cshift(_link[i], _shift_dirs[2 * i], -1);
 
-      spinTaste.applyCoeffsAndPhase(_link[i], _link[i]); // store spin-taste phase
-      spinTaste.applyCoeffsAndPhase(_link_shifted[i],
+      // SIGN-CRITICAL (the origin of the 32 Y/T one-link sign flips): the
+      // STORED object's _negated phases the links; a scratch rebuild would
+      // reset it and reproduce the old wrong sign.
+      _gammas[i].applyCoeffsAndPhase(_link[i], _link[i]); // store spin-taste phase
+      _gammas[i].applyCoeffsAndPhase(_link_shifted[i],
                            _link_shifted[i]); // store spin-taste phase
     }
     _link_view = std::make_shared<A2AFieldView<vColourMatrix>>();
@@ -1166,16 +1160,31 @@ public:
   A2A_TYPEDEFS;
 
 protected:
-  std::vector<StagGamma::SpinTastePair> _gammas;
+  std::vector<StagGamma> _gammas; // was: bare pair vector
   LatticeGaugeField *_U;
   std::vector<FermionField> _transformed;
   std::shared_ptr<A2AFieldView<vobj>> _transformed_view;
 
 public:
   A2ATaskSpinTaste(GridBase *grid, int orthogDir,
-                   const std::vector<StagGamma::SpinTastePair> &gammas,
+                   const std::vector<StagGamma> &gammas,
                    LatticeGaugeField *U, int cb = Even)
       : A2ATaskBase<FImpl>(grid, orthogDir, cb), _gammas(gammas), _U(U) {
+
+    // U-consistency (plan review): setRight's applyGamma reads each stored
+    // object's OWN U (the task-level _U guard is a construction check, not
+    // the transform's field). Bind null-U objects from _U; abort on a
+    // mismatch (Ufat vs Uthin mixing would otherwise be silent).
+    for (auto &g : _gammas) {
+      if (g.U == nullptr && _U != nullptr) {
+        g.setGaugeField(*_U);
+      } else if (g.U != nullptr && g.U != _U) {
+        std::cerr << "A2ATaskSpinTaste: gamma object bound to a different "
+                     "gauge field than the task U"
+                  << std::endl;
+        GridAbort();
+      }
+    }
 
     // Validate uniform popcount. A2ATaskSpinTaste is a GENERAL primitive:
     // applyGamma + local inner product is correct for every popcount 0-4
@@ -1189,14 +1198,12 @@ public:
     // E/O right-vector routing is governed by the WORKER's _odd_shifts
     // (A2AWorkerSpinTaste). It is retained here for COMMON_VARS parity and
     // because its value is correct if a future kernel reads it.
+    // popcount is P-invariant: direct reads of the stored objects.
     if (!_gammas.empty()) {
-      StagGamma spinTaste;
-      spinTaste.setSpinTaste(_gammas[0]);
-      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      int pc = StagGamma::popcountShift(_gammas[0]._spin, _gammas[0]._taste);
       this->_odd_shifts = (pc % 2 == 1);
       for (int i = 1; i < (int)_gammas.size(); i++) {
-        spinTaste.setSpinTaste(_gammas[i]);
-        int pci = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+        int pci = StagGamma::popcountShift(_gammas[i]._spin, _gammas[i]._taste);
         if (pci != pc) {
           std::cerr
               << "A2ATaskSpinTaste requires uniform popcount; gamma 0 has "
@@ -1294,12 +1301,12 @@ public:
                 << std::endl;
       GridAbort();
     }
-    StagGamma spinTaste;
-    spinTaste.setGaugeField(*_U);
+    // SIGN-CRITICAL: applyGamma reads the STORED object's own U and folded
+    // _negated (the task-level _U guard above is a construction-consistency
+    // check). No scratch rebuild -- it would reset the sign.
     for (int mu = 0; mu < nGamma; mu++) {
-      spinTaste.setSpinTaste(_gammas[mu]);
       for (int j = 0; j < size; j++) {
-        spinTaste.applyGamma(_transformed[mu * size + j], right[j]);
+        _gammas[mu].applyGamma(_transformed[mu * size + j], right[j]);
       }
     }
 

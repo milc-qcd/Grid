@@ -82,7 +82,7 @@ public:
 public:
   A2AWorkerLocal() = delete;
   A2AWorkerLocal(GridBase *grid, const std::vector<ComplexField> &mom,
-                 const std::vector<StagGamma::SpinTastePair> &gammas,
+                 const std::vector<StagGamma> &gammas,
                  int orthogDir)
       : A2AWorkerBase<FImpl>(grid) {
     this->_odd_shifts = false;
@@ -120,7 +120,7 @@ public:
 public:
   A2AWorkerOnelink() = delete;
   A2AWorkerOnelink(GridBase *grid, const std::vector<ComplexField> &mom,
-                   const std::vector<StagGamma::SpinTastePair> &gammas,
+                   const std::vector<StagGamma> &gammas,
                    LatticeGaugeField *U, int orthogDir)
       : A2AWorkerBase<FImpl>(grid) {
     this->_odd_shifts = true;
@@ -164,7 +164,7 @@ public:
 public:
   A2AWorkerSpinTaste() = delete;
   A2AWorkerSpinTaste(GridBase *grid, const std::vector<ComplexField> &mom,
-                     const std::vector<StagGamma::SpinTastePair> &gammas,
+                     const std::vector<StagGamma> &gammas,
                      LatticeGaugeField *U, int orthogDir)
       : A2AWorkerBase<FImpl>(grid) {
     if (mom.size()) {
@@ -176,14 +176,12 @@ public:
     // uniformity check must live HERE (where the live consumer is), not rely
     // on the task ctor firing first. A2ATaskSpinTaste ctor also checks, but
     // duplicating here makes the worker self-validating.
+    // popcount is P-invariant: direct reads of the stored objects.
     if (!gammas.empty()) {
-      StagGamma spinTaste;
-      spinTaste.setSpinTaste(gammas[0]);
-      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+      int pc = StagGamma::popcountShift(gammas[0]._spin, gammas[0]._taste);
       this->_odd_shifts = (pc % 2 == 1);
       for (int i = 1; i < (int)gammas.size(); i++) {
-        spinTaste.setSpinTaste(gammas[i]);
-        int pci = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+        int pci = StagGamma::popcountShift(gammas[i]._spin, gammas[i]._taste);
         if (pci != pc) {
           std::cerr
               << "A2AWorkerSpinTaste requires uniform popcount; gamma 0 has "

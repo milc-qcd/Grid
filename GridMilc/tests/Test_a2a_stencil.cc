@@ -87,6 +87,27 @@ static std::vector<StagGamma::SpinTastePair> testGammas() {
   };
 }
 
+// ---- Explicit-eps helpers (verbatim from Test_staggamma.cc:168-186) ----
+// parity(x) = (x+y+z+t) % 2 and f *= eps(x): the EXPLICIT-eps side of the
+// applyG5 cross-check below.
+static void makeParityField(Lattice<iScalar<vInteger>> &parity) {
+  GridBase *grid = parity.Grid();
+  Lattice<iScalar<vInteger>> coor(grid);
+  parity = Zero();
+  for (int mu = 0; mu < Nd; mu++) {
+    LatticeCoordinate(coor, mu);
+    parity = parity + coor;
+  }
+}
+
+template <class obj>
+static void applyEpsilon(Lattice<obj> &f,
+                         const Lattice<iScalar<vInteger>> &parity) {
+  Lattice<obj> neg(f.Grid());
+  neg = -f;
+  f = where(mod(parity, 2) == (Integer)1, neg, f);
+}
+
 // Reconstruction of the legacy combined CB slots from the raw parity
 // partials M0 (even source sites) / M1 (odd) emitted by the stencil worker.
 // This table is the exact algebraic image of the sign branches the stencil
@@ -277,6 +298,10 @@ int main(int argc, char **argv) {
     }
   }
 
+  // Parity field for the explicit-eps side of the applyG5 cross-check.
+  Lattice<iScalar<vInteger>> parity(grid);
+  makeParityField(parity);
+
   // ---- Random fermion vectors (full grid) ----
   std::vector<FermionField> vecs(nevec, grid);
   {
@@ -306,7 +331,15 @@ int main(int argc, char **argv) {
               << "=== gamma " << StagGamma::GetName(gamma)
               << " (popcount " << pc << ") ===" << std::endl;
 
-    std::vector<StagGamma::SpinTastePair> oneGamma = {gamma};
+    // Plain (unfolded) single-gamma operator set: the main/CB equality
+    // checks compare like-for-like (both workers on the same objects).
+    std::vector<StagGamma> oneGamma;
+    {
+      StagGamma st;
+      st.setGaugeField(U);
+      st.setSpinTaste(gamma);
+      oneGamma.push_back(st);
+    }
     std::vector<ComplexField> emptyMom;
 
     // ---- Cshift oracle (A2AWorkerSpinTaste) on the full grid ----
@@ -444,7 +477,14 @@ int main(int argc, char **argv) {
       StagGamma spinTaste;
       spinTaste.setSpinTaste(gamma);
       int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
-      std::vector<StagGamma::SpinTastePair> oneGamma = {gamma};
+      // Plain (unfolded) single-gamma operator set (like-for-like).
+      std::vector<StagGamma> oneGamma;
+      {
+        StagGamma st;
+        st.setGaugeField(U);
+        st.setSpinTaste(gamma);
+        oneGamma.push_back(st);
+      }
 
       // Stencil worker: one per gamma (kept alive across modes).
       A2AWorkerSpinTasteStencil<FImpl> sw(grid, emptyMom, oneGamma, &U,
@@ -597,9 +637,106 @@ int main(int argc, char **argv) {
   std::cout << GridLogMessage << "testStencilCbVsLegacy: ALL PASSED"
             << " (maxRelErr=" << cbMaxErrAll << ")" << std::endl;
 
+  // ---- applyG5 cross-check: stencil worker on eps-folded objects vs
+  // legacy worker on plain objects with EXPLICIT eps on the LEFT vectors.
+  // eps is real-diagonal: <eps*L, Gamma*R> == <L, (eps∘Gamma)*R>, so the
+  // two sides derive eps from different constructions (folded _negated vs
+  // explicit where() multiply) and cannot self-confirm (handoff §3; the
+  // identity is exact only on the LEFT side -- Γ∘eps != eps∘Γ under
+  // displacement).
+  int nEpsFail = 0;
+  double epsMaxErrAll = 0.0;
+  {
+    // Explicit-eps left vectors (full grid).
+    std::vector<FermionField> vecsEps(nevec, grid);
+    for (int k = 0; k < nevec; k++) {
+      vecsEps[k] = vecs[k];
+      applyEpsilon(vecsEps[k], parity);
+    }
+
+    for (int gi = 0; gi < (int)gammas.size(); gi++) {
+      auto &gamma = gammas[gi];
+      StagGamma spinTaste;
+      spinTaste.setSpinTaste(gamma);
+      int pc = StagGamma::popcountShift(spinTaste._spin, spinTaste._taste);
+
+      std::cout << GridLogMessage << "=== applyG5 cross-check gamma "
+                << StagGamma::GetName(gamma) << " (popcount " << pc
+                << ") ===" << std::endl;
+
+      // eps-folded stencil worker (the production applyG5 path).
+      std::vector<StagGamma> oneGammaFolded;
+      {
+        StagGamma st;
+        st.setGaugeField(U);
+        st.setSpinTaste(gamma);
+        st.applyG5Left();
+        oneGammaFolded.push_back(st);
+      }
+      Eigen::Tensor<ComplexD, 5> mf_eps(1, 1, Nt, nevec, nevec);
+      mf_eps.setZero();
+      {
+        std::vector<ComplexField> emptyMom;
+        A2AWorkerSpinTasteStencil<FImpl> sw(grid, emptyMom, oneGammaFolded,
+                                            &U, orthogDir);
+        sw.StagMesonField(mf_eps, vecs.data(), vecs.data(), nevec, nevec);
+      }
+
+      // Explicit-eps oracle: legacy worker, plain Gamma, eps-multiplied left.
+      Eigen::Tensor<ComplexD, 5> mf_ref(1, 1, Nt, nevec, nevec);
+      mf_ref.setZero();
+      {
+        std::vector<StagGamma> oneGammaPlain;
+        {
+          StagGamma st;
+          st.setGaugeField(U);
+          st.setSpinTaste(gamma);
+          oneGammaPlain.push_back(st);
+        }
+        std::vector<ComplexField> emptyMom;
+        A2AWorkerSpinTaste<FImpl> w(grid, emptyMom, oneGammaPlain, &U,
+                                    orthogDir);
+        w.StagMesonField(mf_ref, vecsEps.data(), vecsEps.data(),
+                         vecs.data(), vecs.data());
+      }
+
+      double epsErr = 0.0;
+      for (int t = 0; t < Nt; t++)
+        for (int i = 0; i < nevec; i++)
+          for (int j = 0; j < nevec; j++) {
+            ComplexD ev = mf_eps(0, 0, t, i, j);
+            ComplexD rv = mf_ref(0, 0, t, i, j);
+            auto mag = [](ComplexD z) {
+              return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
+            };
+            double denom = std::max(mag(ev), mag(rv));
+            double e = (denom > 0.0) ? mag(ev - rv) / denom : mag(ev - rv);
+            epsErr = std::max(epsErr, e);
+          }
+      epsMaxErrAll = std::max(epsMaxErrAll, epsErr);
+      if (epsErr > 1e-10) {
+        std::cerr << "    applyG5 cross-check FAIL gamma "
+                  << StagGamma::GetName(gamma) << " (popcount " << pc
+                  << ") maxRelErr=" << epsErr << std::endl;
+        nEpsFail++;
+      } else {
+        std::cout << GridLogMessage << "    applyG5 cross-check OK gamma "
+                  << StagGamma::GetName(gamma) << " (popcount " << pc
+                  << ") maxRelErr=" << epsErr << std::endl;
+      }
+    }
+  }
+  if (nEpsFail > 0) {
+    std::cerr << "testApplyG5CrossCheck: " << nEpsFail << " failures!"
+              << std::endl;
+    GridAbort();
+  }
+  std::cout << GridLogMessage << "testApplyG5CrossCheck: ALL PASSED"
+            << " (maxRelErr=" << epsMaxErrAll << ")" << std::endl;
+
   // ---- Result ----
   std::cout << GridLogMessage << "=== Test_a2a_stencil complete ===" << std::endl;
-  bool ok = (nStencilFail == 0 && nCbFail == 0);
+  bool ok = (nStencilFail == 0 && nCbFail == 0 && nEpsFail == 0);
   if (ok) {
     std::cout << GridLogMessage << "PASS" << std::endl;
   } else {

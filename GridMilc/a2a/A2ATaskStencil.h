@@ -255,7 +255,7 @@ public:
   typedef LatticeView<cobj> ComplexView;
 
 protected:
-  std::vector<StagGamma::SpinTastePair> _gammas;
+  std::vector<StagGamma> _gammas; // was: bare pair vector
   LatticeGaugeField *_U;
   GridCartesian *_fullGrid; // 4D full grid (E/O joined, non-owning: caller owns)
   std::unique_ptr<GridCartesian> _grid5d; // 5D grid (simd={1,1,1,1,Nsimd})
@@ -315,7 +315,7 @@ protected:
 
 public:
   A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
-                          const std::vector<StagGamma::SpinTastePair> &gammas,
+                          const std::vector<StagGamma> &gammas,
                           LatticeGaugeField *U)
       : _gammas(gammas), _U(U), _fullGrid(fullGrid), _orthog_dir(orthogDir) {
 
@@ -335,12 +335,9 @@ public:
     std::vector<int> nEpHost, epStartHost;
     _nEpTotal = 0;
     int epCum = 0;
-    StagGamma spinTaste;
 
     for (int g = 0; g < (int)gammas.size(); g++) {
-      spinTaste.setSpinTaste(gammas[g]);
-
-      std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
+      std::vector<Coordinate> endpoints = spinTasteEndpoints(gammas[g]);
 
       nEpHost.push_back((int)endpoints.size());
       epStartHost.push_back(epCum);
@@ -404,13 +401,15 @@ public:
     {
       ComplexField ones5d(_grid5d.get());
       ones5d = 1.0;
-      StagGamma spinTaste;
       _phaseFields.reserve(gammas.size());
       for (int g = 0; g < (int)gammas.size(); g++)
         _phaseFields.emplace_back(_grid5d.get());
       for (int g = 0; g < (int)gammas.size(); g++) {
-        spinTaste.setSpinTaste(gammas[g]);
-        spinTaste.applyCoeffsAndPhase(_phaseFields[g], ones5d);
+        // SIGN-CRITICAL: the STORED object's _negated (applyG5-folded when
+        // constructed that way) is baked into _phaseFields. The double-phase
+        // trap comment above (W reaching the kernel must be unphased) still
+        // applies: the phase is baked exactly once, here.
+        gammas[g].applyCoeffsAndPhase(_phaseFields[g], ones5d);
       }
       _phaseView = std::make_shared<A2AFieldView<cobj>>();
       _phaseView->openViews(_phaseFields.data(), (int)gammas.size());
@@ -421,13 +420,11 @@ public:
     std::vector<int> forwardRepHost, isForwardHost;
     _nFwdEpTotal = 0;
     {
-      StagGamma spinTaste;
       int epBase = 0;   // running global endpoint index (== epCum above)
       int fwdEpCum = 0; // running global forward-field index
       for (int g = 0; g < (int)gammas.size(); g++) {
-        spinTaste.setSpinTaste(gammas[g]);
-        std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
-        int shift = spinTaste._spin ^ spinTaste._taste;
+        std::vector<Coordinate> endpoints = spinTasteEndpoints(gammas[g]);
+        int shift = gammas[g]._spin ^ gammas[g]._taste;
         std::array<int, 4> dirs;
         int nActive = 0;
         for (int j = 0; j < 4; j++)
@@ -470,11 +467,9 @@ public:
       Lattice<ColourMatrix> &wScalar = *_wScalarGrid;
       autoView(wsGrid_v, wScalar, AcceleratorWrite);
       int fwdEpCum = 0;
-      StagGamma spinTaste;
       for (int g = 0; g < (int)gammas.size(); g++) {
-        spinTaste.setSpinTaste(gammas[g]);
-        std::vector<Coordinate> endpoints = spinTasteEndpoints(spinTaste);
-        int shift = spinTaste._spin ^ spinTaste._taste;
+        std::vector<Coordinate> endpoints = spinTasteEndpoints(gammas[g]);
+        int shift = gammas[g]._spin ^ gammas[g]._taste;
         std::array<int, 4> dirs;
         int nActive = 0;
         for (int j = 0; j < 4; j++)
@@ -487,7 +482,7 @@ public:
                                    isFwdLocal);
 
         std::vector<LatticeColourMatrix> fwdChains =
-            spinTasteGaugeChainUnphasedForward(_U, spinTaste, fullGrid, fwd);
+            spinTasteGaugeChainUnphasedForward(_U, gammas[g], fullGrid, fwd);
         for (int fp = 0; fp < (int)fwdChains.size(); fp++) {
           LatticeColourMatrix chain5d(_grid5d.get());
           promoteField5d(chain5d, fwdChains[fp], fullGrid, _grid5d.get());

@@ -165,14 +165,26 @@ int main(int argc, char **argv) {
   struct GammaBatch {
     std::string label;
     int popcount;
-    std::vector<StagGamma::SpinTastePair> gammas;
+    std::vector<StagGamma> gammas; // was: bare pair vector
+  };
+  // PLAIN objects (throughput semantics unchanged; no applyG5 fold).
+  auto mkGammas = [&](std::vector<std::pair<StagGamma::StagAlgebra,
+                                             StagGamma::StagAlgebra>> pairs) {
+    std::vector<StagGamma> out;
+    out.reserve(pairs.size());
+    for (auto &p : pairs) {
+      StagGamma st(p.first, p.second);
+      st.setGaugeField(U);
+      out.push_back(st);
+    }
+    return out;
   };
   std::vector<GammaBatch> allBatches = {
-    {"pc=0", 0, {{A::G1,  A::G1},  {A::GX,  A::GX},  {A::GY,  A::GY},  {A::GZ,  A::GZ}}},
-    {"pc=1", 1, {{A::GX,  A::G1},  {A::GY,  A::G1},  {A::GZ,  A::G1},  {A::GT,  A::G1}}},
-    {"pc=2", 2, {{A::GXY, A::G1},  {A::GZX, A::G1},  {A::GYZ, A::G1},  {A::GXT, A::G1}}},
-    {"pc=3", 3, {{A::G5T, A::G1},  {A::G5X, A::G1},  {A::G5Y, A::G1},  {A::G5Z, A::G1}}},
-    {"pc=4", 4, {{A::G5,  A::G1},  {A::GX,  A::G5X}, {A::GY,  A::G5Y}, {A::GZ,  A::G5Z}}},
+    {"pc=0", 0, mkGammas({{A::G1,  A::G1},  {A::GX,  A::GX},  {A::GY,  A::GY},  {A::GZ,  A::GZ}})},
+    {"pc=1", 1, mkGammas({{A::GX,  A::G1},  {A::GY,  A::G1},  {A::GZ,  A::G1},  {A::GT,  A::G1}})},
+    {"pc=2", 2, mkGammas({{A::GXY, A::G1},  {A::GZX, A::G1},  {A::GYZ, A::G1},  {A::GXT, A::G1}})},
+    {"pc=3", 3, mkGammas({{A::G5T, A::G1},  {A::G5X, A::G1},  {A::G5Y, A::G1},  {A::G5Z, A::G1}})},
+    {"pc=4", 4, mkGammas({{A::G5,  A::G1},  {A::GX,  A::G5X}, {A::GY,  A::G5Y}, {A::GZ,  A::G5Z}})},
   };
   std::vector<GammaBatch> batches;
   for (auto &b : allBatches)
