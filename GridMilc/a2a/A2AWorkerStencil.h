@@ -62,6 +62,13 @@ public:
   const FermionField *_l_addr = nullptr;
   const FermionField *_r_addr = nullptr;
 
+  // 5D-form siblings of the L/R address caches: first element's raw pointer
+  // (mirrors the 4D array-base semantics). Each set cross-invalidates its 4D
+  // sibling so 4D<->5D alternation on one worker always re-sets the task
+  // (a stale sibling would leave the previous form's views active).
+  const FermionField *_l5d_addr = nullptr;
+  const FermionField *_r5d_addr = nullptr;
+
   // The stencil task (RAII-owned). Public: benchmarks read task->getFlops()
   // directly (Benchmark_a2a_spin_taste.cc reaches in via
   // worker._stencil_task->getFlops(), which works via unique_ptr::operator->).
@@ -71,7 +78,8 @@ public:
   A2AWorkerSpinTasteStencil(GridCartesian *grid,
                             const std::vector<ComplexField> &mom,
                             const std::vector<StagGamma> &gammas,
-                            LatticeGaugeField *U, int orthogDir)
+                            LatticeGaugeField *U, int orthogDir,
+                            std::shared_ptr<GridCartesian> grid5d = nullptr)
       : _grid(grid) {
     // Momentum projection is not implemented for the stencil path (same as the
     // sibling A2AWorkerSpinTaste). MesonField passes `ph` unconditionally, so
@@ -81,7 +89,7 @@ public:
       assert(0 && "A2AWorkerSpinTasteStencil: momentum projection not implemented");
     }
     _stencil_task = std::make_unique<A2ATaskSpinTasteStencil<FImpl>>(
-        grid, orthogDir, gammas, U);
+        grid, orthogDir, gammas, U, grid5d);
   }
 
   // Owns both the task and the cache (freeMatCache is a safe no-op on an
@@ -92,41 +100,35 @@ public:
     freeMatCache(_matCache);
   }
 
-  void resetCache() { _l_addr = nullptr; _r_addr = nullptr; }
+  void resetCache() {
+    _l_addr = nullptr;
+    _r_addr = nullptr;
+    _l5d_addr = nullptr;
+    _r5d_addr = nullptr;
+  }
 
   void setFlops(double flops) { _flops = flops; }
   double getFlops() const { return _flops; }
 
-  // Canonical full-array meson-field entry. lhs/rhs are full-grid vector
-  // arrays; ct states the checkerboard/contraction mode explicitly (never
-  // probed from the lattice). For the CB modes each CB-side array entry
-  // packs two copies in one full object (E values on even sites, O on odd
-  // -- the setCheckerboard convention) and the output uses one uniform
-  // block layout: always (2L, R), rows [0,L) = <e|.> partials (even source
-  // sites), rows [L,2L) = <o|.> partials (odd source sites). The ct
-  // Left/Right bits document which side's arrays are packed; they do not
-  // change the output shape. ParityBisect requests the same split output
-  // when neither side's arrays are packed (the parity source-site filter is
-  // well-defined on any full-grid data); Full alone produces the unsplit
-  // (L, R) layout.
+private:
+  // Output-prep head shared by all StagMesonField overloads: dims gate,
+  // output-mat device cache, zero. Runs BEFORE the task input sets,
+  // preserving the original 4D entry's call order exactly.
   template <typename TensorType>
-  void StagMesonField(TensorType &mat, const FermionField *lhs,
-                      const FermionField *rhs, int sizeL, int sizeR,
-                      ContractType ct = ContractType::Full) {
+  scalar_type *prepMatOutput(TensorType &mat, int sizeL, int sizeR,
+                             ContractType ct) {
     // Contract/dims consistency: sizeL/sizeR are array entry counts; CB
     // modes double dim 3 (the row block split), dim 4 is never doubled.
-    {
-      int rowMult = (ct == ContractType::Full) ? 1 : 2;
-      if (ct == ContractType::undef ||
-          (int)mat.dimension(3) != rowMult * sizeL ||
-          (int)mat.dimension(4) != sizeR) {
-        std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: mat dims ("
-                  << mat.dimension(3) << "," << mat.dimension(4)
-                  << ") inconsistent with sizes (" << rowMult * sizeL << ","
-                  << sizeR << ") for ContractType " << (int)ct
-                  << std::endl;
-        GridAbort();
-      }
+    int rowMult = (ct == ContractType::Full) ? 1 : 2;
+    if (ct == ContractType::undef ||
+        (int)mat.dimension(3) != rowMult * sizeL ||
+        (int)mat.dimension(4) != sizeR) {
+      std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: mat dims ("
+                << mat.dimension(3) << "," << mat.dimension(4)
+                << ") inconsistent with sizes (" << rowMult * sizeL << ","
+                << sizeR << ") for ContractType " << (int)ct
+                << std::endl;
+      GridAbort();
     }
     // Output-mat device cache + zero (A2ACache facility).
     scalar_type *matDevice =
@@ -135,19 +137,15 @@ public:
       GRID_TRACE("A2AStencil/ZeroInit");
       zeroMatCache(matDevice, mat.size());
     }
+    return matDevice;
+  }
 
-    // Address cache: re-run the 5D promotion only when the input pointer
-    // changes; a worker kept alive across many calls skips redundant packing.
-    if (_l_addr != lhs) {
-      _l_addr = lhs;
-      GRID_TRACE("A2AStencil/SetLeft");
-      _stencil_task->setLeft(lhs, sizeL);
-    }
-    if (_r_addr != rhs) {
-      _r_addr = rhs;
-      GRID_TRACE("A2AStencil/SetRight");
-      _stencil_task->setRight(rhs, sizeR);
-    }
+  // Result tail shared by all StagMesonField overloads: flops, execute,
+  // copy-back, GlobalSum. Runs AFTER the task input sets (the address-cache
+  // gating lives in the public entries).
+  template <typename TensorType>
+  void finishMatOutput(TensorType &mat, scalar_type *matDevice,
+                       ContractType ct) {
     _flops = _stencil_task->getFlops();
     _t_kernel = -usecond();
     {
@@ -167,6 +165,139 @@ public:
       globalSumMat(_grid, mat.data(), mat.size());
     }
     _t_gsum += usecond();
+  }
+
+public:
+  // Canonical full-array meson-field entry. lhs/rhs are full-grid vector
+  // arrays; ct states the checkerboard/contraction mode explicitly (never
+  // probed from the lattice). For the CB modes each CB-side array entry
+  // packs two copies in one full object (E values on even sites, O on odd
+  // -- the setCheckerboard convention) and the output uses one uniform
+  // block layout: always (2L, R), rows [0,L) = <e|.> partials (even source
+  // sites), rows [L,2L) = <o|.> partials (odd source sites). The ct
+  // Left/Right bits document which side's arrays are packed; they do not
+  // change the output shape. ParityBisect requests the same split output
+  // when neither side's arrays are packed (the parity source-site filter is
+  // well-defined on any full-grid data); Full alone produces the unsplit
+  // (L, R) layout.
+  template <typename TensorType>
+  void StagMesonField(TensorType &mat, const FermionField *lhs,
+                      const FermionField *rhs, int sizeL, int sizeR,
+                      ContractType ct = ContractType::Full) {
+    scalar_type *matDevice = prepMatOutput(mat, sizeL, sizeR, ct);
+    // Address cache: re-run the 5D promotion only when the input pointer
+    // changes; a worker kept alive across many calls skips redundant packing.
+    if (_l_addr != lhs) {
+      _l_addr = lhs;
+      _l5d_addr = nullptr; // cross-invalidate: force re-set on 4D<->5D switch
+      GRID_TRACE("A2AStencil/SetLeft");
+      _stencil_task->setLeft(lhs, sizeL);
+    }
+    if (_r_addr != rhs) {
+      _r_addr = rhs;
+      _r5d_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetRight");
+      _stencil_task->setRight(rhs, sizeR);
+    }
+    finishMatOutput(mat, matDevice, ct);
+  }
+
+  // 5D zero-copy lhs (borrowed; the task retains shared_ptrs) + 4D rhs.
+  // lhs must satisfy the task's 5D contract: every element on the
+  // worker-adopted grid5d (construct this worker with the producer's
+  // shared_ptr grid5d), .size() == ceil(sizeL/Nsimd), partial-batch lanes
+  // zeroed by the caller, contents immutable while the first element's
+  // address stays cached (resetCache() to force re-set).
+  template <typename TensorType>
+  void StagMesonField(TensorType &mat,
+                      const std::vector<std::shared_ptr<FermionField>> &lhs,
+                      const FermionField *rhs, int sizeL, int sizeR,
+                      ContractType ct = ContractType::Full) {
+    scalar_type *matDevice = prepMatOutput(mat, sizeL, sizeR, ct);
+    if (lhs.empty() && sizeL > 0) {
+      std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: empty 5D lhs "
+                   "with sizeL=" << sizeL << std::endl;
+      GridAbort();
+    }
+    const FermionField *l5 = lhs.empty() ? nullptr : lhs[0].get();
+    if (_l5d_addr != l5) {
+      _l5d_addr = l5;
+      _l_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetLeft5d");
+      _stencil_task->setLeft(lhs, sizeL);
+    }
+    if (_r_addr != rhs) {
+      _r_addr = rhs;
+      _r5d_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetRight");
+      _stencil_task->setRight(rhs, sizeR);
+    }
+    finishMatOutput(mat, matDevice, ct);
+  }
+
+  // 4D lhs + 5D pack-skip rhs (Exchange copies into task-owned padded
+  // buffers; rhs is not borrowed past the setRight call -- the caller may
+  // mutate or free it immediately after the call returns).
+  template <typename TensorType>
+  void StagMesonField(TensorType &mat, const FermionField *lhs,
+                      const std::vector<std::shared_ptr<FermionField>> &rhs,
+                      int sizeL, int sizeR,
+                      ContractType ct = ContractType::Full) {
+    scalar_type *matDevice = prepMatOutput(mat, sizeL, sizeR, ct);
+    if (rhs.empty() && sizeR > 0) {
+      std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: empty 5D rhs "
+                   "with sizeR=" << sizeR << std::endl;
+      GridAbort();
+    }
+    if (_l_addr != lhs) {
+      _l_addr = lhs;
+      _l5d_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetLeft");
+      _stencil_task->setLeft(lhs, sizeL);
+    }
+    const FermionField *r5 = rhs.empty() ? nullptr : rhs[0].get();
+    if (_r5d_addr != r5) {
+      _r5d_addr = r5;
+      _r_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetRight5d");
+      _stencil_task->setRight(rhs, sizeR);
+    }
+    finishMatOutput(mat, matDevice, ct);
+  }
+
+  // 5D lhs + 5D rhs (both per-side contracts above apply).
+  template <typename TensorType>
+  void StagMesonField(TensorType &mat,
+                      const std::vector<std::shared_ptr<FermionField>> &lhs,
+                      const std::vector<std::shared_ptr<FermionField>> &rhs,
+                      int sizeL, int sizeR,
+                      ContractType ct = ContractType::Full) {
+    scalar_type *matDevice = prepMatOutput(mat, sizeL, sizeR, ct);
+    if (lhs.empty() && sizeL > 0) {
+      std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: empty 5D lhs "
+                   "with sizeL=" << sizeL << std::endl;
+      GridAbort();
+    }
+    if (rhs.empty() && sizeR > 0) {
+      std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: empty 5D rhs "
+                   "with sizeR=" << sizeR << std::endl;
+      GridAbort();
+    }
+    const FermionField *l5 = lhs.empty() ? nullptr : lhs[0].get();
+    if (_l5d_addr != l5) {
+      _l5d_addr = l5;
+      _l_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetLeft5d");
+      _stencil_task->setLeft(lhs, sizeL);
+    }
+    const FermionField *r5 = rhs.empty() ? nullptr : rhs[0].get();
+    if (_r5d_addr != r5) {
+      _r5d_addr = r5;
+      _r_addr = nullptr; // cross-invalidate
+      GRID_TRACE("A2AStencil/SetRight5d");
+      _stencil_task->setRight(rhs, sizeR);
+    }
+    finishMatOutput(mat, matDevice, ct);
   }
 };
 

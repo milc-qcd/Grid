@@ -14,6 +14,7 @@
 #pragma once
 
 #include <Grid/GridCore.h>
+#include <memory>
 
 NAMESPACE_BEGIN(Grid);
 
@@ -70,6 +71,17 @@ public:
     for (int i = 0; i < size; i++) {
       this->_view.push_back(fields[i].View(AcceleratorRead));
     }
+    this->copyToDevice();
+  }
+
+  // shared_ptr-vector form: identical view lifecycle to the raw-array
+  // openViews, for caller-owned fields whose lifetime the callee co-owns.
+  // The task keeps its copy of the vector alive while the views are open;
+  // closeViews() (inherited, idempotent) is unchanged.
+  void openViews(const std::vector<std::shared_ptr<Lattice<obj>>> &fields) {
+    this->reserve((int)fields.size());
+    for (const auto &f : fields)
+      this->_view.push_back(f->View(AcceleratorRead));
     this->copyToDevice();
   }
 };

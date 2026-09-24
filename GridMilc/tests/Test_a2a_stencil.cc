@@ -251,6 +251,238 @@ void testStencilGather5d(void) {
   std::cout << GridLogMessage << "testStencilGather5d: ALL PASSED" << std::endl;
 }
 
+// =============================================================================
+// testZeroCopy5dInputs: validates the shared_ptr 5D input path -- zero-copy
+// LHS borrow (setLeft 5D: no Zero/pack5d, direct read-only views on caller
+// lattices) and the RHS pack-skip (setRight 5D: Exchange without pack) --
+// against the 4D pack path on identical input bytes. A simulated 5D producer
+// (pack5d into caller-owned shared_ptr lattices on a createGrid5d grid)
+// feeds a worker constructed with that grid ADOPTED; results must match the
+// 4D path element-for-element (the kernel and its inputs are bit-identical,
+// so any difference is an input-layout bug). Also covers: partial-batch
+// sizeL (caller-zeroed lanes -- the documented contract), a CB contract
+// mode (LeftHalf), both-sides 5D, worker address-cache cross-invalidation
+// on 4D->5D->4D alternation, and grid5dCompatible (positive + negative).
+// =============================================================================
+static int testZeroCopy5dInputs(GridCartesian *grid, LatticeGaugeField *Up,
+                                int nevec) {
+  int nFail = 0;
+  int Nsimd = grid->Nsimd();
+  int Nt = grid->_fdimensions[Tdir];
+  int orthogDir = Tdir;
+
+  std::cout << GridLogMessage << "=== testZeroCopy5dInputs ===" << std::endl;
+
+  // ---- grid5dCompatible: positive (independent grids) + negative ----
+  {
+    std::shared_ptr<GridCartesian> g5a = createGrid5d(grid);
+    std::shared_ptr<GridCartesian> g5b = createGrid5d(grid);
+    if (!grid5dCompatible(grid, g5a.get()) ||
+        !grid5dCompatible(grid, g5b.get())) {
+      std::cerr << "    FAIL grid5dCompatible: independent createGrid5d "
+                   "grids must be compatible" << std::endl;
+      nFail++;
+    }
+    if (grid5dCompatible(grid, grid)) { // 4D grid: Nd mismatch
+      std::cerr << "    FAIL grid5dCompatible: 4D grid must be incompatible"
+                << std::endl;
+      nFail++;
+    }
+    Coordinate fdim = grid->_fdimensions;
+    Coordinate procs = grid->_processors;
+    // Legal 5D grid with the WRONG dim-5 extent (2*Nsimd): constructible,
+    // must be rejected by the compatibility check.
+    Coordinate gdimBad(std::vector<int>(
+        {fdim[0], fdim[1], fdim[2], fdim[3], 2 * Nsimd}));
+    Coordinate simdBad(std::vector<int>({1, 1, 1, 1, Nsimd}));
+    Coordinate procsBad(std::vector<int>(
+        {procs[0], procs[1], procs[2], procs[3], 1}));
+    std::shared_ptr<GridCartesian> g5bad =
+        std::make_shared<GridCartesian>(gdimBad, simdBad, procsBad);
+    if (grid5dCompatible(grid, g5bad.get())) {
+      std::cerr << "    FAIL grid5dCompatible: wrong dim-5 extent must be "
+                   "incompatible" << std::endl;
+      nFail++;
+    }
+    // Wrong simd_layout with CORRECT fdim: isolates the _simd_layout term
+    // of the compatibility check (dim-5 extent stays Nsimd; the lane split
+    // deviates to Nsimd/2). Requires Nsimd >= 2; on Nsimd == 1
+    // (scalar/GPU builds) the only legal dim-5 simd split is 1, so the
+    // deviation is not constructible and the case is vacuous.
+    if (Nsimd >= 2) {
+      Coordinate gdimSim(std::vector<int>(
+          {fdim[0], fdim[1], fdim[2], fdim[3], Nsimd}));
+      Coordinate simdSimBad(std::vector<int>({1, 1, 1, 1, Nsimd / 2}));
+      std::shared_ptr<GridCartesian> g5simBad =
+          std::make_shared<GridCartesian>(gdimSim, simdSimBad, procsBad);
+      if (grid5dCompatible(grid, g5simBad.get())) {
+        std::cerr << "    FAIL grid5dCompatible: wrong simd_layout must be "
+                     "incompatible" << std::endl;
+        nFail++;
+      }
+    }
+  }
+
+  // ---- equality loop: two consecutive sizes so at least one is a partial
+  //      batch (sizeL % Nsimd != 0) unless Nsimd == 1 (scalar/GPU builds,
+  //      where every batch is full and the partial contract is vacuous) ----
+  std::vector<StagGamma> oneGamma;
+  {
+    StagGamma st;
+    st.setGaugeField(*Up);
+    st.setSpinTaste(testGammas()[1]); // (GX, G1): popcount 1
+    oneGamma.push_back(st);
+  }
+  std::vector<ComplexField> emptyMom;
+
+  auto compare = [&](const Eigen::Tensor<ComplexD, 5> &a,
+                     const Eigen::Tensor<ComplexD, 5> &b, const char *what) {
+    double err = 0.0;
+    for (int t = 0; t < Nt; t++)
+      for (int i = 0; i < (int)a.dimension(3); i++)
+        for (int j = 0; j < (int)a.dimension(4); j++) {
+          ComplexD x = a(0, 0, t, i, j);
+          ComplexD y = b(0, 0, t, i, j);
+          auto mag = [](ComplexD z) {
+            return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
+          };
+          double denom = std::max(mag(x), mag(y));
+          double e = (denom > 0.0) ? mag(x - y) / denom : mag(x - y);
+          err = std::max(err, e);
+        }
+    if (err > 1e-14) {
+      std::cerr << "    FAIL " << what << " maxRelErr=" << err << std::endl;
+      return 1;
+    }
+    std::cout << GridLogMessage << "    OK " << what
+              << " (maxRelErr=" << err << ")" << std::endl;
+    return 0;
+  };
+
+  for (int sizeL : {nevec, nevec + 1}) {
+    int nB = (sizeL + Nsimd - 1) / Nsimd;
+
+    // Shared random inputs (4D).
+    std::vector<FermionField> vecsL(sizeL, grid), vecsR(sizeL, grid);
+    {
+      GridParallelRNG rng(grid);
+      std::vector<int> seed = {7, 8, 9, 10};
+      rng.SeedFixedIntegers(seed);
+      for (auto &v : vecsL) { v = Zero(); random(rng, v); }
+      for (auto &v : vecsR) { v = Zero(); random(rng, v); }
+    }
+
+    // Simulated 5D producer: pack ONCE into caller-owned shared_ptr
+    // lattices on its own createGrid5d grid. Zero() before pack5d honours
+    // the caller-side partial-batch zeroing contract.
+    std::shared_ptr<GridCartesian> g5 = createGrid5d(grid);
+    std::vector<std::shared_ptr<FermionField>> lhs5(nB), rhs5(nB);
+    for (int b = 0; b < nB; b++) {
+      int nVec = std::min(Nsimd, sizeL - b * Nsimd);
+      lhs5[b] = std::make_shared<FermionField>(g5.get());
+      rhs5[b] = std::make_shared<FermionField>(g5.get());
+      (*lhs5[b]) = Zero();
+      (*rhs5[b]) = Zero();
+      pack5d(*lhs5[b], vecsL.data() + b * Nsimd, nVec, grid, g5.get());
+      pack5d(*rhs5[b], vecsR.data() + b * Nsimd, nVec, grid, g5.get());
+    }
+
+    // Reference: 4D pack path (worker without adopted grid).
+    Eigen::Tensor<ComplexD, 5> mf4(1, 1, Nt, sizeL, sizeL);
+    mf4.setZero();
+    {
+      A2AWorkerSpinTasteStencil<FImpl> w4(grid, emptyMom, oneGamma, Up,
+                                          orthogDir);
+      w4.StagMesonField(mf4, vecsL.data(), vecsR.data(), sizeL, sizeL);
+    }
+
+    // Zero-copy LHS (5D lhs + 4D rhs): worker adopts the producer's grid.
+    Eigen::Tensor<ComplexD, 5> mf5L(1, 1, Nt, sizeL, sizeL);
+    mf5L.setZero();
+    {
+      A2AWorkerSpinTasteStencil<FImpl> w5(grid, emptyMom, oneGamma, Up,
+                                          orthogDir, g5);
+      w5.StagMesonField(mf5L, lhs5, vecsR.data(), sizeL, sizeL);
+    }
+    nFail += compare(mf5L, mf4, "5D lhs zero-copy == 4D pack");
+
+    // Both sides 5D (RHS pack-skip, Exchange kept).
+    Eigen::Tensor<ComplexD, 5> mf5LR(1, 1, Nt, sizeL, sizeL);
+    mf5LR.setZero();
+    {
+      A2AWorkerSpinTasteStencil<FImpl> w5b(grid, emptyMom, oneGamma, Up,
+                                           orthogDir, g5);
+      w5b.StagMesonField(mf5LR, lhs5, rhs5, sizeL, sizeL);
+    }
+    nFail += compare(mf5LR, mf4, "5D lhs+rhs == 4D pack");
+
+    // CB mode (LeftHalf) through the 5D path vs the 4D path: raw (2L, L)
+    // parity-split output, plain full-grid arrays on both sides (the task
+    // never probes packing; the parity source-site filter is well-defined
+    // on any full-grid data).
+    Eigen::Tensor<ComplexD, 5> mf4cb(1, 1, Nt, 2 * sizeL, sizeL);
+    mf4cb.setZero();
+    {
+      A2AWorkerSpinTasteStencil<FImpl> w4c(grid, emptyMom, oneGamma, Up,
+                                           orthogDir);
+      w4c.StagMesonField(mf4cb, vecsL.data(), vecsR.data(), sizeL, sizeL,
+                         ContractType::LeftHalf);
+    }
+    Eigen::Tensor<ComplexD, 5> mf5cb(1, 1, Nt, 2 * sizeL, sizeL);
+    mf5cb.setZero();
+    {
+      A2AWorkerSpinTasteStencil<FImpl> w5c(grid, emptyMom, oneGamma, Up,
+                                           orthogDir, g5);
+      w5c.StagMesonField(mf5cb, lhs5, vecsR.data(), sizeL, sizeL,
+                         ContractType::LeftHalf);
+    }
+    nFail += compare(mf5cb, mf4cb, "5D lhs LeftHalf == 4D LeftHalf");
+
+    // Address-cache cross-invalidation (once): ONE adopted-grid worker
+    // serves 4D -> 5D -> 4D(same address) with different L data in the 5D
+    // call. The 5D set must invalidate the cached 4D address: if it did
+    // not, the third call (same vecsL.data() address as the first) would
+    // be skipped by the 4D gate and silently return the STALE 5D-borrowed
+    // result (vecsL2's data) instead of re-packing vecsL.
+    if (sizeL == nevec) {
+      std::vector<FermionField> vecsL2(sizeL, grid);
+      {
+        GridParallelRNG rng(grid);
+        std::vector<int> seed = {11, 12, 13, 14};
+        rng.SeedFixedIntegers(seed);
+        for (auto &v : vecsL2) { v = Zero(); random(rng, v); }
+      }
+      std::vector<std::shared_ptr<FermionField>> lhs5b(nB);
+      for (int b = 0; b < nB; b++) {
+        int nVec = std::min(Nsimd, sizeL - b * Nsimd);
+        lhs5b[b] = std::make_shared<FermionField>(g5.get());
+        (*lhs5b[b]) = Zero();
+        pack5d(*lhs5b[b], vecsL2.data() + b * Nsimd, nVec, grid, g5.get());
+      }
+      Eigen::Tensor<ComplexD, 5> mAlt(1, 1, Nt, sizeL, sizeL);
+      mAlt.setZero();
+      {
+        A2AWorkerSpinTasteStencil<FImpl> w(grid, emptyMom, oneGamma, Up,
+                                           orthogDir, g5);
+        w.StagMesonField(mAlt, vecsL.data(), vecsR.data(), sizeL, sizeL); // 4D #1
+        w.StagMesonField(mAlt, lhs5b, vecsR.data(), sizeL, sizeL);        // 5D
+        w.StagMesonField(mAlt, vecsL.data(), vecsR.data(), sizeL, sizeL); // 4D #2, same addr
+      }
+      // Must equal the vecsL 4D reference (mf4), NOT vecsL2's result.
+      nFail += compare(mAlt, mf4, "4D->5D->4D alternation re-sets inputs");
+    }
+  }
+
+  if (nFail > 0) {
+    std::cerr << "testZeroCopy5dInputs: " << nFail << " failures!"
+              << std::endl;
+    GridAbort();
+  }
+  std::cout << GridLogMessage << "testZeroCopy5dInputs: ALL PASSED"
+            << std::endl;
+  return nFail;
+}
+
 int main(int argc, char **argv) {
   Grid_init(&argc, &argv);
 
@@ -734,9 +966,13 @@ int main(int argc, char **argv) {
   std::cout << GridLogMessage << "testApplyG5CrossCheck: ALL PASSED"
             << " (maxRelErr=" << epsMaxErrAll << ")" << std::endl;
 
+  // ---- Zero-copy 5D input path (shared_ptr borrow + grid adoption) ----
+  int nZcFail = testZeroCopy5dInputs(grid, &U, nevec);
+
   // ---- Result ----
   std::cout << GridLogMessage << "=== Test_a2a_stencil complete ===" << std::endl;
-  bool ok = (nStencilFail == 0 && nCbFail == 0 && nEpsFail == 0);
+  bool ok = (nStencilFail == 0 && nCbFail == 0 && nEpsFail == 0 &&
+             nZcFail == 0);
   if (ok) {
     std::cout << GridLogMessage << "PASS" << std::endl;
   } else {

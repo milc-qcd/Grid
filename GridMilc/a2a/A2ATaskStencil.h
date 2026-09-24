@@ -258,7 +258,12 @@ protected:
   std::vector<StagGamma> _gammas; // was: bare pair vector
   LatticeGaugeField *_U;
   GridCartesian *_fullGrid; // 4D full grid (E/O joined, non-owning: caller owns)
-  std::unique_ptr<GridCartesian> _grid5d; // 5D grid (simd={1,1,1,1,Nsimd})
+  // 5D grid (simd={1,1,1,1,Nsimd}). shared_ptr: either created from fullGrid
+  // (createGrid5d) or the ADOPTED caller grid (co-owned with the producer so
+  // it outlives the task's views; validated in the ctor). Declaration
+  // position unchanged -- the PaddedCell teardown invariant below depends on
+  // member order, and shared_ptr destroys at the same position.
+  std::shared_ptr<GridCartesian> _grid5d;
   int _orthog_dir; // orthogonal direction (only ex-base member)
   ContractType _contract_type = ContractType::undef;
 
@@ -288,6 +293,12 @@ protected:
   int _sizeL;
   int _nBatchesL;
 
+  // Borrowed 5D LHS (zero-copy setLeft): shared_ptr copies pin the caller's
+  // lattices for the lifetime of _lhsView's open views. Empty on the 4D pack
+  // path. RHS needs no counterpart -- setRight's Exchange copies into
+  // task-owned _paddedRight5d, so nothing is borrowed past its return.
+  std::vector<std::shared_ptr<Lattice<vobj>>> _lhsBorrowed;
+
   // Padded RHS 5D batches + view. The RHS batch-count member was renamed to
   // _nBatchesR for symmetry with _nBatchesL (both L and R now batch into
   // Nsimd-lane groups).
@@ -316,10 +327,25 @@ protected:
 public:
   A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
                           const std::vector<StagGamma> &gammas,
-                          LatticeGaugeField *U)
+                          LatticeGaugeField *U,
+                          std::shared_ptr<GridCartesian> grid5d = nullptr)
       : _gammas(gammas), _U(U), _fullGrid(fullGrid), _orthog_dir(orthogDir) {
 
-    _grid5d = createGrid5d(fullGrid);
+    // 5D grid: adopt the caller's (validated) grid when supplied -- the
+    // zero-copy setLeft/setRight overloads require inputs on exactly this
+    // grid object (pointer identity) -- or create the canonical one. The
+    // unique_ptr rvalue converts to shared_ptr implicitly.
+    if (grid5d) {
+      if (!grid5dCompatible(fullGrid, grid5d.get())) {
+        std::cerr << "A2ATaskSpinTasteStencil: supplied grid5d is not "
+                     "layout-compatible with createGrid5d(fullGrid)"
+                  << std::endl;
+        GridAbort();
+      }
+      _grid5d = grid5d;
+    } else {
+      _grid5d = createGrid5d(fullGrid);
+    }
     _Nsimd = fullGrid->Nsimd();
     _osites = _grid5d->oSites();
 
@@ -532,6 +558,7 @@ public:
     // Release the previous view first: it holds open AcceleratorRead locks
     // on the _lhs5d lattices the writes below would conflict with.
     _lhsView = nullptr;
+    _lhsBorrowed.clear(); // release stale borrowed pins (5D -> 4D switch)
 
     // Reallocate only if the batch count changed; steady-state repeat calls
     // (same sizeL) reuse the existing Lattice slots via in-place Zero()+pack5d
@@ -589,6 +616,98 @@ public:
         GRID_TRACE("A2AStencil/HaloExchange");
         _paddedRight5d[b] = _cell5d->Exchange(rhs5d); // assign in place, no emplace_back
       }
+    }
+    _paddedRhsView = std::make_shared<A2AFieldView<vobj>>();
+    _paddedRhsView->openViews(_paddedRight5d.data(), _nBatchesR);
+  }
+
+  // setLeft (5D zero-copy form): borrow caller-owned, already 5D-batched L
+  // (dim-5 lane = vector index) directly -- no Zero, no pack5d, no _lhs5d
+  // storage. CONTRACT:
+  //  - every element must live on EXACTLY this task's _grid5d object
+  //    (pointer identity -- construct the task with the same shared_ptr
+  //    grid5d the producer built its lattices on);
+  //  - left5d.size() == ceil(size/Nsimd);
+  //  - the partial last batch's unused lanes (>= size - b*Nsimd) must be
+  //    ZERO by the caller before handoff (borrowed memory is opened
+  //    AcceleratorRead; the kernel's l<sizeL discard guard makes finite
+  //    garbage harmless, but uninitialised device memory may be NaN/Inf);
+  //  - contents are immutable while borrowed (through execute()); mutate
+  //    only after a fresh setLeft/setRight call or task destruction. The
+  //    worker's address cache (A2AWorkerStencil) gates on the first
+  //    element's pointer: same vector + mutation = stale results unless
+  //    resetCache().
+  // The task retains the shared_ptr vector, so the caller may drop its own
+  // references immediately -- destruction cannot dangle the open views.
+  void setLeft(const std::vector<std::shared_ptr<Lattice<vobj>>> &left5d,
+               int size) {
+    _sizeL = size;
+    _nBatchesL = (size + _Nsimd - 1) / _Nsimd;
+    if ((int)left5d.size() != _nBatchesL) {
+      std::cerr << "A2ATaskSpinTasteStencil::setLeft(5d): left5d.size()="
+                << left5d.size() << " != nBatches=" << _nBatchesL
+                << " for size=" << size << std::endl;
+      GridAbort();
+    }
+    for (int b = 0; b < _nBatchesL; b++)
+      if ((*left5d[b]).Grid() != _grid5d.get()) {
+        std::cerr << "A2ATaskSpinTasteStencil::setLeft(5d): left5d[" << b
+                  << "] is not on this task's _grid5d (pointer identity "
+                     "required -- construct the task with the producer's "
+                     "grid5d)" << std::endl;
+        GridAbort();
+      }
+    // Release the previous view FIRST (0069a57d ordering): it may hold open
+    // AcceleratorRead locks on _lhs5d or previously borrowed lattices.
+    _lhsView = nullptr;
+    // Free the owned packed batches -- part of the win (sizeL*V of device
+    // memory); a later 4D setLeft reallocates through its existing branch.
+    _lhs5d.clear();
+    // Pin the caller's lattices for the views' lifetime.
+    _lhsBorrowed = left5d;
+    _lhsView = std::make_shared<A2AFieldView<vobj>>();
+    _lhsView->openViews(_lhsBorrowed);
+  }
+
+  // setRight (5D pack-skip form): RHS already 5D-batched -- skip Zero+pack5d,
+  // but the halo Exchange into task-owned _paddedRight5d is structurally
+  // mandatory (the kernel gathers RHS at displaced offsets). Unlike setLeft
+  // (5d), NOTHING is borrowed past the return: Exchange copies into padded
+  // storage, so the caller may mutate or free right5d immediately after
+  // this call returns. Same grid/batch-count contract as setLeft (5d)
+  // (pointer identity to _grid5d; partial-batch lanes zeroed by caller --
+  // pack5d's lane contract, StencilGather5d.h:122, applies verbatim).
+  void setRight(const std::vector<std::shared_ptr<Lattice<vobj>>> &right5d,
+                int size) {
+    _sizeR = size;
+    _nBatchesR = (size + _Nsimd - 1) / _Nsimd;
+    if ((int)right5d.size() != _nBatchesR) {
+      std::cerr << "A2ATaskSpinTasteStencil::setRight(5d): right5d.size()="
+                << right5d.size() << " != nBatches=" << _nBatchesR
+                << " for size=" << size << std::endl;
+      GridAbort();
+    }
+    for (int b = 0; b < _nBatchesR; b++)
+      if ((*right5d[b]).Grid() != _grid5d.get()) {
+        std::cerr << "A2ATaskSpinTasteStencil::setRight(5d): right5d[" << b
+                  << "] is not on this task's _grid5d" << std::endl;
+        GridAbort();
+      }
+
+    // Release the previous view first (same hazard as the 4D form).
+    _paddedRhsView = nullptr;
+
+    // Reallocate only if the batch count changed (mirrors the 4D form).
+    if ((int)_paddedRight5d.size() != _nBatchesR) {
+      _paddedRight5d.clear();
+      _paddedRight5d.reserve(_nBatchesR);
+      for (int b = 0; b < _nBatchesR; b++)
+        _paddedRight5d.emplace_back(_paddedGrid5d);
+    }
+
+    for (int b = 0; b < _nBatchesR; b++) {
+      GRID_TRACE("A2AStencil/HaloExchange");
+      _paddedRight5d[b] = _cell5d->Exchange(*right5d[b]); // no Zero/pack5d
     }
     _paddedRhsView = std::make_shared<A2AFieldView<vobj>>();
     _paddedRhsView->openViews(_paddedRight5d.data(), _nBatchesR);

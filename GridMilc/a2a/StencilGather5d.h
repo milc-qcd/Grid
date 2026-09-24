@@ -36,6 +36,35 @@ inline std::unique_ptr<GridCartesian> createGrid5d(GridCartesian *grid4d) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// grid5dCompatible: true iff grid5d is layout-identical to what createGrid5d
+// (above) would build from grid4d -- the check a task ctor uses before
+// ADOPTING a caller-supplied 5D grid as its own. Compares the
+// constructor-determining extents element-wise (Nd, _fdimensions,
+// _simd_layout, _processors; Coordinate's operator== is element-wise,
+// Grid/util/Coordinate.h); every derived quantity the kernels index by
+// (_ldimensions/_rdimensions/_ostride/_istride/oSites/Nsimd) follows
+// deterministically from these (CartesianImplementation::Init). Grids are
+// compared by layout value, never pointer identity (grids are not interned
+// -- two createGrid5d calls on the same 4D grid are distinct objects with
+// identical layouts). Host-only.
+///////////////////////////////////////////////////////////////////////////////
+inline bool grid5dCompatible(GridCartesian *grid4d, GridCartesian *grid5d) {
+  if (grid4d->Nd() != 4)
+    return false; // swapped/non-4D first argument: the fdim/procs reads below
+                  // index [0..3]; reject cleanly instead of reading OOB
+  int Nsimd = grid4d->Nsimd();
+  Coordinate fdim4d = grid4d->_fdimensions;
+  Coordinate procs4d = grid4d->_processors;
+  Coordinate fdimExp(std::vector<int>(
+      {fdim4d[0], fdim4d[1], fdim4d[2], fdim4d[3], Nsimd}));
+  Coordinate simdExp(std::vector<int>({1, 1, 1, 1, Nsimd}));
+  Coordinate procsExp(std::vector<int>(
+      {procs4d[0], procs4d[1], procs4d[2], procs4d[3], 1}));
+  return grid5d->Nd() == 5 && grid5d->_fdimensions == fdimExp &&
+         grid5d->_simd_layout == simdExp && grid5d->_processors == procsExp;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // buildPaddedOffset5d: per-(endpoint, original oSite) padded-grid oSite.
 // Because every spatial dim has simd=1, the offset is a genuine per-site
 // scalar (no lane term). For procs[d]>1 dims, the interior sits at
