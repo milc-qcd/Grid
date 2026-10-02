@@ -61,7 +61,7 @@ inline void sliceSumReduction_cub_small(const vobj *Data,
 #elif defined(GRID_HIP)
   #define GRID_CUB_SUM_OP ::hipcub::Sum()
 #else
-  #define GRID_CUB_SUM_OP ::cub::Sum()
+  #define GRID_CUB_SUM_OP ::gpucub::Sum()
 #endif
   
   gpuError_t gpuErr = gpucub::DeviceSegmentedReduce::Reduce(temp_storage_array, temp_storage_bytes, rb_p,d_out, rd, d_offsets, d_offsets+1, GRID_CUB_SUM_OP, zero_init, computeStream);
