@@ -51,8 +51,8 @@ directory
 #endif
 #ifdef __x86_64__
 #ifdef GRID_CUDA
-accelerator_inline uint64_t __rdtsc(void) { return 0; }
-accelerator_inline uint64_t __rdpmc(int) { return 0; }
+accelerator_inline uint64_t __rdtsc(void) {  return 0; }
+accelerator_inline uint64_t __rdpmc(int ) {  return 0; }
 #else
 #include <x86intrin.h>
 #endif
@@ -87,9 +87,8 @@ inline uint64_t cyclecount(void) {
   return tmp;
 }
 #elif defined __x86_64__
-inline uint64_t cyclecount(void) {
-  uint64_t ret = __rdtsc();
-  return (uint64_t)ret;
+inline uint64_t cyclecount(void){ 
+  return (uint64_t)0;
 }
 #else
 

@@ -872,6 +872,8 @@ void CartesianCommunicator::StencilSendToRecvFromComplete(std::vector<CommsReque
 void CartesianCommunicator::StencilBarrier(void)
 {
   FlightRecorder::StepLog("NodeBarrier");
+  // Only orders the device-to-device PUT/GET into a peer's window; not needed under --shm-mpi 1.
+  if ( Stencil_force_mpi && !Stencil_force_barrier ) return;
   MPI_Barrier  (ShmComm);
 }
 //void CartesianCommunicator::SendToRecvFromComplete(std::vector<CommsRequest_t> &list)
@@ -943,6 +945,61 @@ void CartesianCommunicator::AllToAll(void  *in,void *out,uint64_t words,uint64_t
   MPI_Type_contiguous(ibytes,MPI_BYTE,&object);
   MPI_Type_commit(&object);
   MPI_Alltoall(in,iwords,object,out,iwords,object,communicator);
+  MPI_Type_free(&object);
+}
+void CartesianCommunicator::AllToAllV(void *in ,const std::vector<int> &sendcounts,const std::vector<int> &senddispls,
+                                      void *out,const std::vector<int> &recvcounts,const std::vector<int> &recvdispls,
+                                      uint64_t bytes)
+{
+  FlightRecorder::StepLog("AllToAllV");
+  GRID_ASSERT(sendcounts.size()==(size_t)_Nprocessors);
+  GRID_ASSERT(senddispls.size()==(size_t)_Nprocessors);
+  GRID_ASSERT(recvcounts.size()==(size_t)_Nprocessors);
+  GRID_ASSERT(recvdispls.size()==(size_t)_Nprocessors);
+  // MPI counts are "int"; the caller sizes the word to keep them in range
+  int ibytes = bytes;
+  GRID_ASSERT(bytes == (uint64_t)ibytes);
+  MPI_Datatype object;
+  MPI_Type_contiguous(ibytes,MPI_BYTE,&object);
+  MPI_Type_commit(&object);
+  int ierr = MPI_Alltoallv(in ,(int *)&sendcounts[0],(int *)&senddispls[0],object,
+                           out,(int *)&recvcounts[0],(int *)&recvdispls[0],object,communicator);
+  GRID_ASSERT(ierr==0);
+  MPI_Type_free(&object);
+}
+
+void CartesianCommunicator::AllGatherV(void *in ,int sendcount,
+                                       void *out,const std::vector<int> &recvcounts,const std::vector<int> &recvdispls,
+                                       uint64_t bytes)
+{
+  FlightRecorder::StepLog("AllGatherV");
+  GRID_ASSERT(recvcounts.size()==(size_t)_Nprocessors);
+  GRID_ASSERT(recvdispls.size()==(size_t)_Nprocessors);
+  GRID_ASSERT(recvcounts[_processor]==sendcount);
+  // MPI counts are "int"; the caller sizes the word to keep them in range
+  int ibytes = bytes;
+  GRID_ASSERT(bytes == (uint64_t)ibytes);
+  MPI_Datatype object;
+  MPI_Type_contiguous(ibytes,MPI_BYTE,&object);
+  MPI_Type_commit(&object);
+  int ierr = MPI_Allgatherv(in ,sendcount,object,
+                            out,(int *)&recvcounts[0],(int *)&recvdispls[0],object,communicator);
+  GRID_ASSERT(ierr==0);
+  MPI_Type_free(&object);
+}
+
+void CartesianCommunicator::AllGather(void *in,void *out,uint64_t words,uint64_t bytes)
+{
+  FlightRecorder::StepLog("AllGather");
+  int iwords = words;
+  int ibytes = bytes;
+  GRID_ASSERT(words == (uint64_t)iwords);
+  GRID_ASSERT(bytes == (uint64_t)ibytes);
+  MPI_Datatype object;
+  MPI_Type_contiguous(ibytes,MPI_BYTE,&object);
+  MPI_Type_commit(&object);
+  int ierr = MPI_Allgather(in,iwords,object,out,iwords,object,communicator);
+  GRID_ASSERT(ierr==0);
   MPI_Type_free(&object);
 }
 

@@ -1,19 +1,23 @@
-/*
- * GridMilc/a2a/A2AWorker.h — part of GridMilc (https://github.com/paboyle/Grid)
- *
- * All-to-all staggered meson-field worker: top-level StagMesonField entry
- * point driving the local / one-link tasks. Header-only; lifted from
- * HadronsMILC. Self-contained via Grid's QCD core umbrella + Eigen Tensor.
- *
- * GridMilc is free software; you can redistribute it and/or modify it under
- * the terms of the GNU General Public License version 2 (or, at your option,
- * any later version). See COPYING/LICENSE in the top-level distribution.
- */
+/******************************************************************************/
+/* A2AWorker.h -- legacy all-to-all meson-field worker facade.               */
+/*                                                                            */
+/* Legacy worker base (A2AWorkerBase) and concrete legacy workers: Local,     */
+/* OneLink, SpinTaste. The production stencil worker (A2AWorkerSpinTasteStencil)*/
+/* was split off to A2AWorkerStencil.h. The base StagMesonField entry here    */
+/* is the legacy 4-CB-arg signature used by the deprecated worker family.     */
+/*                                                                            */
+/* Part of GridMilc (https://github.com/paboyle/Grid).                       */
+/*                                                                            */
+/* GridMilc is free software; you can redistribute it and/or modify it under  */
+/* the terms of the GNU General Public License version 2 (or, at your option, */
+/* any later version). See COPYING/LICENSE in the top-level distribution.    */
+/******************************************************************************/
 #pragma once
 
 #include <Grid/GridQCDcore.h>
 #include <Grid/Grid_Eigen_Tensor.h>
 #include <GridMilc/a2a/A2ATask.h>
+#include <GridMilc/a2a/A2ACache.h>
 #include <GridMilc/spin/StagGamma.h>
 
 NAMESPACE_BEGIN(Grid);
@@ -26,7 +30,7 @@ public:
   typedef typename vobj::scalar_type scalar_type;
 
 public:
-  GridBase *_grid, *_cb_grid;
+  GridBase *_grid;
 
   double _flops, _t_kernel, _t_gsum;
 
@@ -44,12 +48,16 @@ public:
   A2AWorkerBase(GridBase *grid)
       : _grid(grid), _l_addr(nullptr), _r_addr(nullptr) {}
 
+  void resetCache() { _l_addr = nullptr; _r_addr = nullptr; }
+
   virtual ~A2AWorkerBase() {
     if (_cache_bytes != 0) {
       acceleratorFreeDevice(_cache_device);
     }
-    delete _task_e;
+    // _task_o first: mixed modes share _task_e's views (setLeft/Right(*_task_e)),
+    // so it must release them before _task_e frees the underlying lattices.
     delete _task_o;
+    delete _task_e;
   }
 
 public:
@@ -74,7 +82,7 @@ public:
 public:
   A2AWorkerLocal() = delete;
   A2AWorkerLocal(GridBase *grid, const std::vector<ComplexField> &mom,
-                 const std::vector<StagGamma::SpinTastePair> &gammas,
+                 const std::vector<StagGamma> &gammas,
                  int orthogDir)
       : A2AWorkerBase<FImpl>(grid) {
     this->_odd_shifts = false;
@@ -112,7 +120,7 @@ public:
 public:
   A2AWorkerOnelink() = delete;
   A2AWorkerOnelink(GridBase *grid, const std::vector<ComplexField> &mom,
-                   const std::vector<StagGamma::SpinTastePair> &gammas,
+                   const std::vector<StagGamma> &gammas,
                    LatticeGaugeField *U, int orthogDir)
       : A2AWorkerBase<FImpl>(grid) {
     this->_odd_shifts = true;
@@ -145,6 +153,53 @@ public:
   }
 };
 
+template <typename FImpl>
+class A2AWorkerSpinTaste : public A2AWorkerBase<FImpl> {
+public:
+  typedef typename FImpl::ComplexField ComplexField;
+  typedef typename FImpl::FermionField FermionField;
+  typedef typename FImpl::SiteSpinor vobj;
+  typedef typename vobj::scalar_type scalar_type;
+
+public:
+  A2AWorkerSpinTaste() = delete;
+  A2AWorkerSpinTaste(GridBase *grid, const std::vector<ComplexField> &mom,
+                     const std::vector<StagGamma> &gammas,
+                     LatticeGaugeField *U, int orthogDir)
+      : A2AWorkerBase<FImpl>(grid) {
+    if (mom.size()) {
+      assert(0); // momentum projection not implemented (same as Onelink)
+    }
+
+    // Uniform-popcount validation + _odd_shifts. _odd_shifts is the LIVE
+    // Even/Odd right-vector routing flag (used in StagMesonField), so the
+    // uniformity check must live HERE (where the live consumer is), not rely
+    // on the task ctor firing first. A2ATaskSpinTaste ctor also checks, but
+    // duplicating here makes the worker self-validating.
+    // popcount is P-invariant: direct reads of the stored objects.
+    if (!gammas.empty()) {
+      int pc = StagGamma::popcountShift(gammas[0]._spin, gammas[0]._taste);
+      this->_odd_shifts = (pc % 2 == 1);
+      for (int i = 1; i < (int)gammas.size(); i++) {
+        int pci = StagGamma::popcountShift(gammas[i]._spin, gammas[i]._taste);
+        if (pci != pc) {
+          std::cerr
+              << "A2AWorkerSpinTaste requires uniform popcount; gamma 0 has "
+                 "popcount "
+              << pc << " but gamma " << i << " has popcount " << pci
+              << std::endl;
+          GridAbort();
+        }
+      }
+    }
+
+    this->_task_e =
+        new A2ATaskSpinTaste<FImpl>(grid, orthogDir, gammas, U, Even);
+    this->_task_o =
+        new A2ATaskSpinTaste<FImpl>(grid, orthogDir, gammas, U, Odd);
+  }
+};
+
 template <class FImpl>
 template <typename TensorType>
 void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
@@ -157,11 +212,10 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
       acceleratorFreeDevice(_cache_device);
     }
     _cache_bytes = mat.size() * sizeof(scalar_type);
-    std::cout << GridLogPerformance << "cache bytes: " << _cache_bytes
-              << std::endl;
-    _cache_device = (scalar_type *)acceleratorAllocDevice(_cache_bytes);
+    _cache_device = static_cast<scalar_type*>(acceleratorAllocDevice(_cache_bytes));
   }
   scalar_type *matDevice = _cache_device;
+  GRID_TRACE("A2A/ZeroInit");
   accelerator_for(idx, mat.size(), 1, { matDevice[idx] = 0.0; });
 
   int sizeL = mat.dimension(3);
@@ -178,7 +232,7 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
 
   if (_l_addr != lhs_wi_E) {
     _l_addr = lhs_wi_E;
-
+    GRID_TRACE("A2A/SetLeft");
     _task_e->setLeft(lhs_wi_E, sizeL);
     if (checkerL)
       _task_o->setLeft(lhs_wi_O, sizeL);
@@ -188,7 +242,7 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
 
   if (_r_addr != rhs_vj_E) {
     _r_addr = rhs_vj_E;
-
+    GRID_TRACE("A2A/SetRight");
     if (checkerR) {
       if (_odd_shifts) {
         _task_e->setRight(rhs_vj_O, sizeR);
@@ -206,11 +260,14 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
   }
 
   _t_kernel = -usecond();
-  if (!(checkerL || checkerR)) {
-    _task_e->execute(matDevice);
-  } else {
-    _task_e->execute(matDevice);
-    _task_o->execute(matDevice);
+  {
+    GRID_TRACE("A2A/Execute");
+    if (!(checkerL || checkerR)) {
+      _task_e->execute(matDevice);
+    } else {
+      _task_e->execute(matDevice);
+      _task_o->execute(matDevice);
+    }
   }
 
   setFlops(_task_e->getFlops());
@@ -221,10 +278,16 @@ void A2AWorkerBase<FImpl>::StagMesonField(TensorType &mat,
 
   scalar_type *matHost = mat.data();
   size_t matBytes = mat.size() * sizeof(scalar_type);
-  acceleratorCopyFromDevice(matDevice, matHost, matBytes);
+  {
+    GRID_TRACE("A2A/CopyFromDevice");
+    acceleratorCopyFromDevice(matDevice, matHost, matBytes);
+  }
 
   _t_gsum = -usecond();
-  this->_grid->GlobalSumVector(matHost, nGamma * resultStride);
+  {
+    GRID_TRACE("A2A/GlobalSum");
+    this->_grid->GlobalSumVector(matHost, nGamma * resultStride);
+  }
   _t_gsum += usecond();
 }
 
