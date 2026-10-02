@@ -321,7 +321,12 @@ extern sycl::queue *theCopyAccelerator;
 
 accelerator_inline int acceleratorSIMTlane(int Nsimd) {
 #ifdef GRID_SIMT
+#if defined(__INTEL_LLVM_COMPILER) && (__INTEL_LLVM_COMPILER >= 20260000)
+ // oneAPI 2026.x renamed the internal SPIR-V helpers (initX -> initBuiltInX)
+ return __spirv::initBuiltInLocalInvocationId<3, sycl::id<3>>()[2];
+#else
  return __spirv::initLocalInvocationId<3, sycl::id<3>>()[2]; 
+#endif
 #else
  return 0;
 #endif
