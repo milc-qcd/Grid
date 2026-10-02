@@ -66,9 +66,11 @@ using namespace Grid;
 
 template<class T> T Fill(uint64_t i,int rank){ return T(0.5*std::sin(0.01*i+0.7*rank)+1.0e-3*rank); }
 
+#ifdef GRID_COMMS_MPI3
 template<class T> MPI_Datatype MpiType(void);
 template<> MPI_Datatype MpiType<RealF>(void){ return MPI_FLOAT; }
 template<> MPI_Datatype MpiType<RealD>(void){ return MPI_DOUBLE; }
+#endif
 template<class T> void BareAllreduce(GridCartesian *grid, T *buf, uint64_t n)
 {
 #ifdef GRID_COMMS_MPI3
