@@ -173,7 +173,7 @@ inline void pack5d(Lattice<vobj> &rhs5d, const Lattice<vobj> *rhs4d, int nVec,
 
   autoView(dst_v, rhs5d, AcceleratorWrite);
 
-  accelerator_for(ss, dstOsites, Nsimd, {
+  accelerator_for(ss, dstOsites, static_cast<size_t>(Nsimd), {
     int srcOSite, srcLane;
     src4dSiteFrom5d(srcOSite, srcLane, ss, nd5d, rdim5d, rdim, ostride, istride);
 #ifdef GRID_SIMT

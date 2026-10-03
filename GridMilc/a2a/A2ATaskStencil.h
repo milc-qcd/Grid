@@ -821,7 +821,7 @@ public:
     int Nsimd = _Nsimd;
     {
       GRID_TRACE("A2AStencil/Assemble");
-      accelerator_for2d(l_batch, nBatchesL, r_batch, nBatchesR, Nsimd, {
+      accelerator_for2d(l_batch, nBatchesL, r_batch, nBatchesR, static_cast<size_t>(Nsimd), {
 #ifdef GRID_SIMT
         {
           int j = acceleratorSIMTlane(Nsimd);
@@ -912,7 +912,7 @@ public:
     auto interiorOffset_p = _interiorOffsetDev.data(); // [ss]
 
     int nBatchesLT = nBatchesL * localOrthogDimSize;
-    accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, Nsimd, {
+    accelerator_for2d(lt_batch, nBatchesLT, r_batch, nBatchesR, static_cast<size_t>(Nsimd), {
       int l_batch = lt_batch / localOrthogDimSize;
       int rt = lt_batch % localOrthogDimSize;
 
