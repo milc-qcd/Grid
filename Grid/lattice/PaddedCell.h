@@ -542,7 +542,7 @@ public:
     }
     for ( int d=0;d < depth ; d ++ ) {
       t=usecond();
-      GatherSlice(send_buf,from,ld-depth+d,dimension,plane*buffer_size); plane++;
+      GatherSlice(send_buf,from,hi_base+d,dimension,plane*buffer_size); plane++;
       t_gather+= usecond() - t;
     }
     accelerator_barrier();
@@ -565,11 +565,6 @@ public:
     }
     for ( int d=0;d < depth ; d ++ ) {
       int tag = d*1024 + dimension*2+1;
-
-      t=usecond();
-      GatherSlice(send_buf,from,hi_base+d,dimension,plane*buffer_size); plane++;
-      t_gather+= usecond() - t;
-
       t=usecond();
       if (d==0) bwd_trace = traceStart("PaddedCellBwdMPI");
 #ifdef ACCELERATOR_AWARE_MPI
