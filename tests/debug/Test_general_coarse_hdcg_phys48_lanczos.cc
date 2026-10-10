@@ -156,21 +156,6 @@ void LoadEigenvectors(std::vector<RealD>            &eval,
 #endif
 }
 
-// Want Op in CoarsenOp to call MatPcDagMatPc
-template<class Field>
-class HermOpAdaptor : public LinearOperatorBase<Field>
-{
-  LinearOperatorBase<Field> & wrapped;
-public:
-  HermOpAdaptor(LinearOperatorBase<Field> &wrapme) : wrapped(wrapme)  {};
-  void Op     (const Field &in, Field &out)   { wrapped.HermOp(in,out);  }
-  void HermOp(const Field &in, Field &out)    { wrapped.HermOp(in,out); }
-  void AdjOp     (const Field &in, Field &out){ wrapped.HermOp(in,out);  }
-  void OpDiag (const Field &in, Field &out)                  {    GRID_ASSERT(0);  }
-  void OpDir  (const Field &in, Field &out,int dir,int disp) {    GRID_ASSERT(0);  }
-  void OpDirAll  (const Field &in, std::vector<Field> &out)  {    GRID_ASSERT(0);  };
-  void HermOpAndNorm(const Field &in, Field &out,RealD &n1,RealD &n2){    GRID_ASSERT(0);  }
-};
 
 template<class Field> class FixedCGPolynomial : public LinearFunction<Field>
 {
@@ -267,86 +252,9 @@ public:
   }
   
 };
-template<class Field> class CGSmoother : public LinearFunction<Field>
-{
-public:
-  using LinearFunction<Field>::operator();
-  typedef LinearOperatorBase<Field> FineOperator;
-  FineOperator   & _SmootherOperator;
-  int iters;
-  CGSmoother(int _iters, FineOperator &SmootherOperator) :
-    _SmootherOperator(SmootherOperator),
-    iters(_iters)
-  {
-    std::cout << GridLogMessage<<" Mirs smoother order "<<iters<<std::endl;
-  };
-  void operator() (const Field &in, Field &out) 
-  {
-    ConjugateGradient<Field>  CG(0.0,iters,false); // non-converge is just fine in a smoother
-
-    out=Zero();
-
-    CG(_SmootherOperator,in,out);
-  }
-};
 
 
-RealD InverseApproximation(RealD x){
-  return 1.0/x;
-}
-template<class Field> class ChebyshevSmoother : public LinearFunction<Field>
-{
-public:
-  using LinearFunction<Field>::operator();
-  typedef LinearOperatorBase<Field> FineOperator;
-  FineOperator   & _SmootherOperator;
-  Chebyshev<Field> Cheby;
-  ChebyshevSmoother(RealD _lo,RealD _hi,int _ord, FineOperator &SmootherOperator) :
-    _SmootherOperator(SmootherOperator),
-    Cheby(_lo,_hi,_ord,InverseApproximation)
-  {
-    std::cout << GridLogMessage<<" Chebyshev smoother order "<<_ord<<" ["<<_lo<<","<<_hi<<"]"<<std::endl;
-  };
-  void operator() (const Field &in, Field &out) 
-  {
-    //    Field r(out.Grid());
-    Cheby(_SmootherOperator,in,out);
-    //    _SmootherOperator.HermOp(out,r);
-    //    r=r-in;
-    //    RealD rr=norm2(r);
-    //    RealD ss=norm2(in);
-    //    std::cout << GridLogMessage<<" Chebyshev smoother resid "<<::sqrt(rr/ss)<<std::endl;
-  }
-};
 
-template<class Field> class ChebyshevInverter : public LinearFunction<Field>
-{
-public:
-  using LinearFunction<Field>::operator();
-  typedef LinearOperatorBase<Field> FineOperator;
-  FineOperator   & _Operator;
-  Chebyshev<Field> Cheby;
-  ChebyshevInverter(RealD _lo,RealD _hi,int _ord, FineOperator &Operator) :
-    _Operator(Operator),
-    Cheby(_lo,_hi,_ord,InverseApproximation)
-  {
-    std::cout << GridLogMessage<<" Chebyshev Inverter order "<<_ord<<" ["<<_lo<<","<<_hi<<"]"<<std::endl;
-  };
-  void operator() (const Field &in, Field &out) 
-  {
-    Field r(in.Grid());
-    Field AinvR(in.Grid());
-    _Operator.HermOp(out,r);
-    r = in - r; // b - A x
-    Cheby(_Operator,r,AinvR); // A^{-1} ( b - A x ) ~ A^{-1} b - x
-    out = out + AinvR;
-    _Operator.HermOp(out,r);
-    r = in - r; // b - A x
-    RealD rr = norm2(r);
-    RealD ss = norm2(in);
-    std::cout << "ChebshevInverse resid " <<::sqrt(rr/ss)<<std::endl;
-  }
-};
 
 
 
@@ -498,7 +406,7 @@ int main (int argc, char ** argv)
   ////////////////////////////////////////////////////////////
   ///////////// Coarse basis and Little Dirac Operator ///////
   ////////////////////////////////////////////////////////////
-  typedef GeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> LittleDiracOperator;
+  typedef DeprecatedGeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> LittleDiracOperator;
   typedef LittleDiracOperator::CoarseVector CoarseVector;
 
   NextToNextToNextToNearestStencilGeometry5D geom(Coarse5d);
@@ -547,7 +455,7 @@ int main (int argc, char ** argv)
   Coordinate rhSimd({vComplex::Nsimd(),1, 1,1,1,1});
     
   GridCartesian *CoarseMrhs = new GridCartesian(rhLatt,rhSimd,rhMpi); 
-  typedef MultiGeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> MultiGeneralCoarsenedMatrix_t;
+  typedef DeprecatedMultiGeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> MultiGeneralCoarsenedMatrix_t;
   MultiGeneralCoarsenedMatrix_t mrhs(geom,CoarseMrhs);
 
   std::cout << "**************************************"<<std::endl;
@@ -669,15 +577,9 @@ int main (int argc, char ** argv)
   std::cout << "**************************************"<<std::endl;
   std::cout << "Calling mRHS HDCG"<<std::endl;
   std::cout << "**************************************"<<std::endl;
-  TwoLevelADEF2mrhs<LatticeFermion,CoarseVector>
-    HDCGmrhs(1.0e-8, 300,
-	     FineHermOp,
-	     CGsmooth,
-	     HPDSolveMrhs,    // Used in M1
-	     HPDSolveMrhs,          // Used in Vstart
-	     MrhsProjector,
-	     MrhsGuesser,
-	     CoarseMrhs);
+  MrhsADEF2Preconditioner<LatticeFermion,CoarseVector>
+    HDCGmrhs_ADEF2(FineHermOp, CGsmooth, HPDSolveMrhs, HPDSolveMrhs, MrhsProjector, MrhsGuesser, CoarseMrhs);
+  TwoLevelCGmrhs<LatticeFermion> HDCGmrhs(1.0e-8, 300, FineHermOp, HDCGmrhs_ADEF2, MrhsProjector.fine_grid);
     
   std::vector<LatticeFermionD> src_mrhs(nrhs,FrbGrid);
   std::vector<LatticeFermionD> res_mrhs(nrhs,FrbGrid);
@@ -702,15 +604,9 @@ int main (int argc, char ** argv)
 
   for(auto tol : tols) {
     
-    TwoLevelADEF2mrhs<LatticeFermion,CoarseVector>
-      HDCGmrhsSloppy(tol, 500,
-		     FineHermOp,
-		     CGsmooth,
-		     HPDSolveMrhs,    // Used in M1
-		     HPDSolveMrhs,    // Used in Vstart
-		     MrhsProjector,
-		     MrhsGuesser,
-		     CoarseMrhs);
+    MrhsADEF2Preconditioner<LatticeFermion,CoarseVector>
+    HDCGmrhsSloppy_ADEF2(FineHermOp, CGsmooth, HPDSolveMrhs, HPDSolveMrhs, MrhsProjector, MrhsGuesser, CoarseMrhs);
+  TwoLevelCGmrhs<LatticeFermion> HDCGmrhsSloppy(tol, 500, FineHermOp, HDCGmrhsSloppy_ADEF2, MrhsProjector.fine_grid);
   
     //  Solve again to 10^-5
     for(int r=0;r<nrhs;r++){

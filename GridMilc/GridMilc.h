@@ -19,7 +19,9 @@
 #include <GridMilc/spin/StagGamma.h>
 #include <GridMilc/a2a/A2AView.h>
 #include <GridMilc/a2a/A2ATask.h>
+#include <GridMilc/a2a/A2ATaskStencil.h>   // Phase 3 (L1.2-05/L1.2-01): relocated stencil task
 #include <GridMilc/a2a/A2AWorker.h>
+#include <GridMilc/a2a/A2AWorkerStencil.h>   // Phase 3 (L0-01): split stencil worker
 #include <GridMilc/io/MilcIO.h>
 
 #endif // GRIDMILC_H

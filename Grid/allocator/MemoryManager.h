@@ -108,12 +108,12 @@ private:
   /////////////////////////////////////////////////
   // Free pool
   /////////////////////////////////////////////////
-  static void *Insert(void *ptr,size_t bytes,int type) ;
+  static void *Insert(void *ptr,size_t bytes,int type,size_t *freed=nullptr) ;
   static void *Lookup(size_t bytes,int type) ;
-  static void *Insert(void *ptr,size_t bytes,AllocationCacheEntry *entries,int ncache,int &victim,uint64_t &cbytes) ;
+  static void *Insert(void *ptr,size_t bytes,AllocationCacheEntry *entries,int ncache,int &victim,uint64_t &cbytes,size_t *freed=nullptr) ;
   static void *Lookup(size_t bytes,AllocationCacheEntry *entries,int ncache,uint64_t &cbytes) ;
 
- public:
+public:  
   static void PrintBytes(void);
   static void Audit(std::string s);
   static void Init(void);
@@ -137,7 +137,19 @@ private:
   static uint64_t     DeviceToHostXfer;
   static uint64_t     DeviceEvictions;
   static uint64_t     DeviceDestroy;
-  
+  // Calls that actually reach the runtime, as distinct from the Evict/Clone traffic above:
+  // a free only reaches acceleratorFreeDevice when displaced from the allocation ring cache,
+  // and an allocate only reaches acceleratorAllocDevice on a ring miss.
+  static uint64_t     DeviceAllocCalls;
+  static uint64_t     DeviceFreeCalls;
+  static uint64_t     DeviceAllocBytes;
+  static uint64_t     DeviceFreeBytes;
+  static uint64_t     DeviceCacheHits;
+  static void         PrintAllocCounts(void);
+  // Labelled snapshot: allocator counts + footprint + device free/total.  Silent unless
+  // --log Memory is on, so it can be left in hot code.
+  static void         Snapshot(const std::string &where);
+
   static uint64_t     DeviceCacheBytes();
   static uint64_t     HostCacheBytes();
 
@@ -215,6 +227,8 @@ private:
   static void NotifyDeletion(void * CpuPtr);
   static void Print(void);
   static void PrintAll(void);
+  static void EvictAll(void);
+  static void DropCache(void);
   static void PrintState( void* CpuPtr);
   static int   isOpen   (void* CpuPtr);
   static void  ViewClose(void* CpuPtr,ViewMode mode);

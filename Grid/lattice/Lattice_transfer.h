@@ -191,6 +191,15 @@ accelerator_inline void convertType(vComplexD & out, const ComplexD & in) {
 accelerator_inline void convertType(vComplexD2 & out, const ComplexD & in) {
   ((ComplexD*)&out)[acceleratorSIMTlane(vComplexD::Nsimd()*2)] = in;
 }
+// Lex chart: one lane, so there is no lane to select. Needed because the
+// coalesced accessor hands the kernel a scalar object while the destination
+// is still the vector type.
+accelerator_inline void convertType(sComplexF & out, const ComplexF & in) {
+  out.v = in;
+}
+accelerator_inline void convertType(sComplexD & out, const ComplexD & in) {
+  out.v = in;
+}
 #endif
 
 accelerator_inline void convertType(vComplexF & out, const vComplexD2 & in) {
@@ -200,6 +209,14 @@ accelerator_inline void convertType(vComplexF & out, const vComplexD2 & in) {
 accelerator_inline void convertType(vComplexD2 & out, const vComplexF & in) {
   precisionChange(out,in);
 }
+
+// Precision change in the lex (unvectorised) chart: one lane, so a plain
+// scalar conversion.  Reached by the block operations on an fp32 coarse
+// space, whose inner products accumulate in double and convert back.
+accelerator_inline void convertType(sComplexF & out, const sComplexD & in) { out.v = ComplexF(in.v); }
+accelerator_inline void convertType(sComplexD & out, const sComplexF & in) { out.v = ComplexD(in.v); }
+accelerator_inline void convertType(sRealF    & out, const sRealD    & in) { out.v = RealF(in.v); }
+accelerator_inline void convertType(sRealD    & out, const sRealF    & in) { out.v = RealD(in.v); }
 
 template<typename T1,typename T2>
 accelerator_inline void convertType(iScalar<T1> & out, const iScalar<T2> & in) {
@@ -783,6 +800,39 @@ void localCopyRegion(const Lattice<vobj> &From,Lattice<vobj> & To,Coordinate Fro
   autoView(from_v,From,AcceleratorRead);
   autoView(to_v,To,AcceleratorWrite);
 
+  if constexpr ( vobj::Nsimd() == 1 ) {
+
+    // Unvectorised: there is one lane, so the lane indices are identically zero
+    // and the internal word index is free to carry the thread.  Threading over
+    // (site,word) with the word fastest makes consecutive threads read and write
+    // consecutive elements; one thread per site instead leaves them `words`
+    // apart, which is what made this uncoalesced.  The site count and the word
+    // count are folded into one range so the large product lands on the only
+    // block dimension that can hold it.
+    accelerator_for(ss,nsite*words,1,{
+
+        int      w   = ss % words;
+        uint64_t idx = ss / words;
+
+        Coordinate from_coor, to_coor, base;
+        Lexicographic::CoorFromIndex(base,idx,RegionSize);
+        for(int i=0;i<nd;i++){
+          from_coor[i] = base[i] + FromLowerLeft[i];
+          to_coor[i] = base[i] + ToLowerLeft[i];
+        }
+        // rdimensions == ldimensions when unvectorised and the region is local,
+        // so the oSite sums need no modulo and there is no lane term.
+        int from_oidx = 0; for(int d=0;d<nd;d++) from_oidx+=f_ostride[d]*from_coor[d];
+        int to_oidx   = 0; for(int d=0;d<nd;d++) to_oidx  +=t_ostride[d]*to_coor[d];
+
+        const vector_type* from = (const vector_type *)&from_v[from_oidx];
+        vector_type* to = (vector_type *)&to_v[to_oidx];
+
+        to[w] = from[w];
+    });
+
+  } else {
+
   accelerator_for(idx,nsite,1,{
 
       Coordinate from_coor, to_coor, base;
@@ -798,13 +848,15 @@ void localCopyRegion(const Lattice<vobj> &From,Lattice<vobj> & To,Coordinate Fro
 
       const vector_type* from = (const vector_type *)&from_v[from_oidx];
       vector_type* to = (vector_type *)&to_v[to_oidx];
-      
+
       scalar_type stmp;
       for(int w=0;w<words;w++){
 	stmp = getlane(from[w], from_lane);
 	putlane(to[w], stmp, to_lane);
       }
   });
+
+  }
 }
 
 template<class vobj>
