@@ -9,8 +9,10 @@
 /* plus an explicit ContractType flag. For the half/mixed CB modes             */
 /* (LeftHalf/RightHalf/BothHalf) each CB-side array entry packs two copies in  */
 /* one full object (E values on even sites, O on odd -- the setCheckerboard   */
-/* convention) and the output is one uniform block layout: always (2L, R)      */
-/* with rows [0,L) the <e|.> partials and rows [L,2L) the <o|.> partials.      */
+/* convention) and the task writes the legacy interleaved (M, M-dagger) slot   */
+/* layout directly (sigma applied on device at the assembleMat store sites):   */
+/* BothHalf (2L, 2R), LeftHalf (2L, R), RightHalf (L, 2R); ParityBisect still  */
+/* emits raw (2L, R).                                                          */
 /*                                                                            */
 /* Part of GridMilc (https://github.com/paboyle/Grid).                       */
 /******************************************************************************/
@@ -31,7 +33,9 @@ NAMESPACE_BEGIN(Grid);
 // to the 5D grid. For the CB half/mixed contract modes each CB-side array
 // entry packs two copies in one full object (E values on even sites, O on odd
 // -- the setCheckerboard convention); the task splits the source-site sum by
-// parity internally. Any ContractType != Full (including ParityBisect, which
+// parity internally and writes the legacy interleaved (M, M-dagger) slot
+// layout directly (sigma applied on device); ParityBisect still emits raw
+// (2L, R). Any ContractType != Full (including ParityBisect, which
 // claims no packed side) requests the parity-split output; the Left/Right
 // bits only document which side's arrays are packed. U may be null iff every
 // gamma has zero displacement. Mirrors the A2AWorkerLocal/Onelink lifecycle:
@@ -117,16 +121,28 @@ private:
   template <typename TensorType>
   scalar_type *prepMatOutput(TensorType &mat, int sizeL, int sizeR,
                              ContractType ct) {
-    // Contract/dims consistency: sizeL/sizeR are array entry counts; CB
-    // modes double dim 3 (the row block split), dim 4 is never doubled.
-    int rowMult = (ct == ContractType::Full) ? 1 : 2;
+    // Contract/dims consistency: sizeL/sizeR are array entry counts. The
+    // three CB contract modes emit the LEGACY INTERLEAVED (M, M-dagger)
+    // slot layout directly (fused at the task's assembleMat store sites):
+    //   BothHalf (2L, 2R), LeftHalf (2L, R), RightHalf (L, 2R).
+    // ParityBisect keeps the raw (2L, R) parity-split output (the
+    // documented raw-partials escape hatch; no callers today).
+    int rowMult, colMult;
+    switch (ct) {
+    case ContractType::Full:         rowMult = 1; colMult = 1; break;
+    case ContractType::BothHalf:     rowMult = 2; colMult = 2; break;
+    case ContractType::LeftHalf:     rowMult = 2; colMult = 1; break;
+    case ContractType::RightHalf:    rowMult = 1; colMult = 2; break;
+    case ContractType::ParityBisect: rowMult = 2; colMult = 1; break;
+    default:                         rowMult = 0; colMult = 0; break;
+    }
     if (ct == ContractType::undef ||
         (int)mat.dimension(3) != rowMult * sizeL ||
-        (int)mat.dimension(4) != sizeR) {
+        (int)mat.dimension(4) != colMult * sizeR) {
       std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: mat dims ("
                 << mat.dimension(3) << "," << mat.dimension(4)
                 << ") inconsistent with sizes (" << rowMult * sizeL << ","
-                << sizeR << ") for ContractType " << (int)ct
+                << colMult * sizeR << ") for ContractType " << (int)ct
                 << std::endl;
       GridAbort();
     }
@@ -172,9 +188,11 @@ public:
   // arrays; ct states the checkerboard/contraction mode explicitly (never
   // probed from the lattice). For the CB modes each CB-side array entry
   // packs two copies in one full object (E values on even sites, O on odd
-  // -- the setCheckerboard convention) and the output uses one uniform
-  // block layout: always (2L, R), rows [0,L) = <e|.> partials (even source
-  // sites), rows [L,2L) = <o|.> partials (odd source sites). The ct
+  // -- the setCheckerboard convention) and the output uses the legacy
+  // interleaved (M, M-dagger) slot layout written directly by the task
+  // (sigma applied on device): BothHalf (2L, 2R), LeftHalf (2L, R),
+  // RightHalf (L, 2R); ParityBisect still emits the raw (2L, R) split.
+  // The ct
   // Left/Right bits document which side's arrays are packed; they do not
   // change the output shape. ParityBisect requests the same split output
   // when neither side's arrays are packed (the parity source-site filter is

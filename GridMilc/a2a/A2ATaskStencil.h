@@ -286,6 +286,13 @@ protected:
   // by Full.
   deviceVector<int> _siteParity;
 
+  // Per-gamma sigma sign (+1/-1) for the CB interleaved-slot assembly:
+  // sigma = -1 for odd popcount(spin^taste) -- the frozen legacy
+  // simdSumHalf/simdSumMixed convention (mirrors the host-side table the
+  // HadronsMILC kernel used to build, MesonField.hpp setWorkerStencil).
+  // Device copy consumed by assembleMat's fused stores.
+  deviceVector<int> _sigmaDev;
+
   // LHS packed into Nsimd-lane batches + view. Each _lhs5d[b] holds
   // Nsimd distinct L vectors in its dim-5 lanes (was: one replicated L per l).
   std::vector<Lattice<vobj>> _lhs5d;
@@ -406,6 +413,17 @@ public:
         parityHost[ss] = (ocoor[0] + ocoor[1] + ocoor[2] + ocoor[3]) & 1;
       }
       _siteParity = upload(parityHost);
+    }
+
+    // sigma table for the CB fused-slot stores (see assembleMat).
+    {
+      std::vector<int> sigmaHost(gammas.size());
+      for (int g = 0; g < (int)gammas.size(); g++)
+        sigmaHost[g] =
+            (StagGamma::popcountShift(gammas[g]._spin, gammas[g]._taste) & 1)
+                ? -1
+                : +1;
+      _sigmaDev = upload(sigmaHost);
     }
 
     // === Scalar W store + phase + pairing maps ============
@@ -717,9 +735,9 @@ public:
   // execute (ContractType dispatch). Full: one unfiltered vectorSum5d pass
   // + circulant scatter. Half/mixed (LeftHalf/RightHalf/BothHalf): two
   // parity-filtered passes (even/odd source sites) into a parity-split
-  // scratch, then assembleMat scatters the RAW parity partials (M0 = even
-  // source-site sum, M1 = odd) into separate row blocks of a uniform
-  // (2L, R) output.
+  // scratch, then assembleMat scatters the sigma-combined legacy
+  // interleaved (M, M-dagger) slots directly (ParityBisect keeps the raw
+  // (2L, R) parity partials).
   //....................................................................
   void execute(scalar_type *result_p,
                ContractType contract_type = ContractType::Full) {
@@ -770,7 +788,7 @@ public:
     }
 
     assembleMat(result_p, shm_p, contract_type, nGamma, gammaStride,
-                localOrthogDimSize, pc, Nt);
+                localOrthogDimSize, pc, Nt, _sigmaDev.data());
 
     acceleratorFreeDevice(shm_p);
   }
@@ -780,40 +798,47 @@ public:
   // pairing (l_i, r_j) lives at rotation s=(i-j) mod Nsimd, lane j. Per-lane
   // scalar work -> portable acceleratorSIMTlane pattern (matches pack5d).
   // Launched as (l_batch, r_batch), Nsimd (accelerator_for2d); mu is a plain
-  // serial loop inside (no per-mu accumulator state to chunk, unlike
-  // vectorSum5d's MF_SUM_ARRAY_MAX blocking).
+  // serial loop inside.
   //
-  // CB output-placement: RAW parity partials, one BLOCK layout uniform for
-  // all three CB modes -- the output is always (2L, R): rows [0, L) hold
-  // the M0 = <e|.> partials (even source sites), rows [L, 2L) hold the
-  // M1 = <o|.> partials (odd source sites; SOURCE-site parity). The
-  // ContractType Left/Right bits no longer shape the output; they only say
-  // which side's arrays carry packed CB data:
-  //   LeftHalf  (L side packed): (2L, R)
-  //   RightHalf (R side packed): (2L, R)
-  //   BothHalf  (both packed):   (2L, R)
-  // The legacy combined e+-o slots (signed M0/sigma*M1 combinations with
-  // sigma = -1 for odd popcount) are NO LONGER formed here; callers/tests
-  // reconstruct them from the raw partials (Test_a2a_stencil.cc
-  // reconstructLegacySlot).
-  //
-  // Derivation (why M0/M1 are the natural split): every endpoint of a gamma
-  // displaces by popcount hops, so parity(x+s) = parity(x) ^ (pc%2); with
-  // CB copies packed into full objects, the even-site pass pairs L_E with
-  // R_E (even pc) or R_O (odd pc) -- M0/M1 are exactly the legacy even/odd
-  // CB task temps.
+  // CB output-placement: the three CB contract modes write the LEGACY
+  // INTERLEAVED (M, M-dagger) slot layout DIRECTLY at these store sites
+  // (the sigma-combination fused on device; the former raw (2L,R) parity
+  // partials + caller-side host reconstruction are gone):
+  //   BothHalf  (2L, 2R): (2l,2r)=M0+M1   (2l,2r+1)=sig*(M0-M1)
+  //                        (2l+1,2r)=M0-M1 (2l+1,2r+1)=sig*(M0+M1)
+  //   LeftHalf  (2L, R) : (2l,r)=M0+M1    (2l+1,r)=M0-M1   (sig-free)
+  //   RightHalf (L, 2R) : (l,2r)=M0+M1    (l,2r+1)=sig*(M0-M1)
+  // with sig = -1 for odd popcount(spin^taste), M0/M1 the even/odd
+  // source-site partial sums. ParityBisect keeps the RAW (2L, R)
+  // parity-split output (rows [0,L)=M0, [L,2L)=M1) as the documented
+  // raw-partials escape hatch. Arithmetic: M0+-M1 bare add/sub,
+  // sig*(M0-M1) mul-after-sub -- no FMA-contraction openings; at a
+  // single MPI rank (gsum = exact identity) the stored values are
+  // bit-identical to the former host reconstruction (multi-rank differs
+  // only by the global-sum rounding order, O(1e-16) relative).
   //....................................................................
   void assembleMat(scalar_type *result_p, cobj *shm_p, ContractType ct,
                    int nGamma, int gammaStride, int localOrthogDimSize,
-                   int pc, int Nt) {
+                   int pc, int Nt, const int *sigma_p) {
     bool cbSplit = (ct != ContractType::Full);
-    int matL = _sizeL * (cbSplit ? 2 : 1);   // CB: rows [0,L) = M0, [L,2L) = M1
-    int matR = _sizeR;                       // columns never doubled
+    bool fused = (ct == ContractType::BothHalf ||
+                  ct == ContractType::LeftHalf ||
+                  ct == ContractType::RightHalf);
+    int matL, matR;
+    if (ct == ContractType::BothHalf) {
+      matL = 2 * _sizeL; matR = 2 * _sizeR;
+    } else if (ct == ContractType::LeftHalf) {
+      matL = 2 * _sizeL; matR = _sizeR;
+    } else if (ct == ContractType::RightHalf) {
+      matL = _sizeL; matR = 2 * _sizeR;
+    } else if (cbSplit) { // ParityBisect: raw parity split
+      matL = 2 * _sizeL; matR = _sizeR;
+    } else {              // Full
+      matL = _sizeL; matR = _sizeR;
+    }
     int parityStride = nGamma * gammaStride; // even slice | odd slice
 
     // Copy members to locals: the GPU lambda cannot capture a CPU `this`.
-    // Plain params/locals (shm_p, result_p, matL, matR, parityStride,
-    // cbSplit, ...) are captured directly, as in vectorSum5d.
     int sizeL = _sizeL;
     int sizeR = _sizeR;
     int nBatchesL = _nBatchesL;
@@ -842,14 +867,34 @@ public:
                         localOrthogDimSize *
                             (s + Nsimd * (l_batch + nBatchesL * r_batch)) +
                         mu * gammaStride;
+                    int64_t matBase = (int64_t)mu * matL * matR * Nt +
+                                      (int64_t)matR * matL * gt;
                     auto M0 = TensorRemove(extractLane(j, shm_p[shm_idx]));
-                    int64_t mat_idx = (int64_t)mu * matL * matR * Nt + r +
-                                      matR * (l + matL * gt);
-                    result_p[mat_idx] = M0;
-                    if (cbSplit) {
+                    if (fused) {
                       auto M1 = TensorRemove(
                           extractLane(j, shm_p[shm_idx + parityStride]));
-                      result_p[mat_idx + (int64_t)matR * sizeL] = M1;
+                      scalar_type sig(sigma_p[mu], 0.0);
+                      if (ct == ContractType::BothHalf) {
+                        result_p[matBase + (int64_t)(2 * r) + matR * (2 * l)] = M0 + M1;
+                        result_p[matBase + (int64_t)(2 * r + 1) + matR * (2 * l)] = sig * (M0 - M1);
+                        result_p[matBase + (int64_t)(2 * r) + matR * (2 * l + 1)] = M0 - M1;
+                        result_p[matBase + (int64_t)(2 * r + 1) + matR * (2 * l + 1)] = sig * (M0 + M1);
+                      } else if (ct == ContractType::LeftHalf) {
+                        result_p[matBase + (int64_t)r + matR * (2 * l)] = M0 + M1;
+                        result_p[matBase + (int64_t)r + matR * (2 * l + 1)] = M0 - M1;
+                      } else { // RightHalf
+                        result_p[matBase + (int64_t)(2 * r) + matR * l] = M0 + M1;
+                        result_p[matBase + (int64_t)(2 * r + 1) + matR * l] = sig * (M0 - M1);
+                      }
+                    } else {
+                      // Full (single store) / ParityBisect (raw split)
+                      int64_t mat_idx = matBase + (int64_t)r + matR * l;
+                      result_p[mat_idx] = M0;
+                      if (cbSplit) {
+                        auto M1 = TensorRemove(
+                            extractLane(j, shm_p[shm_idx + parityStride]));
+                        result_p[mat_idx + (int64_t)matR * sizeL] = M1;
+                      }
                     }
                   }
                 }

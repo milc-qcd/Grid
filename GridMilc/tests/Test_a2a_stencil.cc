@@ -108,41 +108,9 @@ static void applyEpsilon(Lattice<obj> &f,
   f = where(mod(parity, 2) == (Integer)1, neg, f);
 }
 
-// Reconstruction of the legacy combined CB slots from the raw parity
-// partials M0 (even source sites) / M1 (odd) emitted by the stencil worker.
-// This table is the exact algebraic image of the sign branches the stencil
-// kernel applied before the raw-parity redesign and of the frozen legacy
-// oracle's simdSumHalf/simdSumMixed tables (A2ATask.h): slot = sA*M0 +
-// sB*M1 with sigma = -1 for odd popcount. sigma enters RightHalf's rc=1
-// slot and BothHalf's rc=1 column slots -- (0,1) and (1,1) -- while the
-// rc=0 slots and all LeftHalf slots are sigma-free (the legacy
-// LeftHalf-vs-RightHalf asymmetry); a reconstruction that wrongly applies
-// sigma to LeftHalf passes all even-popcount gammas and fails only the
-// popcount-1/3 ones (testGammas spans both).
-//   BothHalf  slot (row 2l+lc, col 2r+rc):
-//     (0,0): M0+M1          (0,1): sigma*(M0-M1)
-//     (1,0): M0-M1          (1,1): sigma*(M0+M1)
-//   LeftHalf  slot (row 2l+lc, col r):   lc=0: M0+M1   lc=1: M0-M1
-//   RightHalf slot (row l, col 2r+rc):   rc=0: M0+M1   rc=1: sigma*(M0-M1)
-// lc/rc select the e/o combination on each CB-flagged side (the legacy
-// interleaved layout); sig = -1 for odd popcount, else +1.
-static ComplexD reconstructLegacySlot(ContractType ct, int lc, int rc,
-                                      ComplexD M0, ComplexD M1,
-                                      ComplexD sig) {
-  if (ct == ContractType::BothHalf) {
-    if (lc == 0 && rc == 0)
-      return M0 + M1;
-    if (lc == 0 && rc == 1)
-      return sig * (M0 - M1);
-    if (lc == 1 && rc == 0)
-      return M0 - M1;
-    return sig * (M0 + M1); // (1,1)
-  } else if (ct == ContractType::LeftHalf) {
-    return (lc == 0) ? (M0 + M1) : (M0 - M1);
-  } else { // RightHalf
-    return (rc == 0) ? (M0 + M1) : (sig * (M0 - M1));
-  }
-}
+// (The task writes the legacy interleaved CB slot layout directly at its
+// fused assembleMat store sites -- no test-side reconstruction exists or
+// is needed.)
 
 // =============================================================================
 // testStencilGather5d: validates the 5D padded gather against Cshift.
@@ -416,10 +384,10 @@ static int testZeroCopy5dInputs(GridCartesian *grid, LatticeGaugeField *Up,
     }
     nFail += compare(mf5LR, mf4, "5D lhs+rhs == 4D pack");
 
-    // CB mode (LeftHalf) through the 5D path vs the 4D path: raw (2L, L)
-    // parity-split output, plain full-grid arrays on both sides (the task
-    // never probes packing; the parity source-site filter is well-defined
-    // on any full-grid data).
+    // CB mode (LeftHalf) through the 5D path vs the 4D path: fused
+    // interleaved (M0+M1 / M0-M1 row pairs) output, plain full-grid arrays on
+    // both sides (the task never probes packing; the parity source-site
+    // filter is well-defined on any full-grid data).
     Eigen::Tensor<ComplexD, 5> mf4cb(1, 1, Nt, 2 * sizeL, sizeL);
     mf4cb.setZero();
     {
@@ -643,11 +611,11 @@ int main(int argc, char **argv) {
             << " (maxRelErr=" << stencilMaxErrAll << ")" << std::endl;
 
   // ---- CB half/mixed differential: stencil (packed full objects + ct) vs
-  // legacy A2AWorkerSpinTaste (CB-grid arrays, 4-arg entry). The stencil
-  // emits RAW parity partials in one uniform block layout -- (2nl, nr)
-  // with rows [0,nl) = M0 = <e|.> and rows [nl,2nl) = M1 = <o|.> -- for
-  // every CB mode; the legacy combined slots are RECONSTRUCTED test-side
-  // via reconstructLegacySlot() and compared value-for-value. Packed
+  // legacy A2AWorkerSpinTaste (CB-grid arrays, 4-arg entry). The task writes
+  // the LEGACY INTERLEAVED (M, M-dagger) slot layout DIRECTLY (sigma
+  // combination fused at the assembleMat store sites), so the stencil tensor
+  // has the SAME dims as the legacy oracle and the comparison is
+  // element-for-element. Packed
   // objects are built with setCheckerboard (E copy on even sites, O copy on
   // odd) -- the same convention Test_a2a uses for w_full.
   int nCbFail = 0;
@@ -697,7 +665,9 @@ int main(int argc, char **argv) {
       const char *name;
       ContractType ct;
       int legL, legR; // LEGACY-oracle output multipliers on (lhs, rhs);
-                      // the stencil output is always (2*nl, nr)
+                      // the stencil output dims match the legacy multipliers
+                      // (legL*nl, legR*nr) -- the task writes the interleaved
+                      // layout directly
     } modes[3] = {
         {"BothHalf", ContractType::BothHalf, 2, 2},
         {"LeftHalf",  ContractType::LeftHalf,  2, 1},
@@ -752,11 +722,15 @@ int main(int argc, char **argv) {
           }
         }
 
-        // Stencil path (packed full objects + explicit ct): uniform raw
-        // block layout (2*nl, nr) for every CB mode. RowMajor so
-        // operator() matches the worker's flat row-major write (see the
-        // mf_leg note above).
-        Eigen::Tensor<ComplexD, 5, Eigen::RowMajor> mf_stn(1, 1, Nt, 2 * nl, nr);
+        // Stencil path (packed full objects + explicit ct): the task now
+        // writes the legacy interleaved (M, M-dagger) slot layout
+        // DIRECTLY (sigma-combination fused at the assembleMat store
+        // sites), so the stencil tensor has the SAME dims as the legacy
+        // oracle and the comparison is element-for-element -- no
+        // test-side reconstruction. RowMajor so operator() matches the
+        // worker's flat row-major write (see the mf_leg note above).
+        Eigen::Tensor<ComplexD, 5, Eigen::RowMajor> mf_stn(
+            1, 1, Nt, mode.legL * nl, mode.legR * nr);
         mf_stn.setZero();
         if (mode.ct == ContractType::BothHalf) {
           sw.StagMesonField(mf_stn, lhsPack.data(), rhsPack.data(), nl, nr,
@@ -769,32 +743,22 @@ int main(int argc, char **argv) {
                             ContractType::RightHalf);
         }
 
-        // Reconstruct-then-diff: rebuild each legacy slot from the raw
-        // partials and compare against the frozen oracle. Each tensor is
-        // indexed with its OWN dims (legacy interleaved vs stencil block).
+        // Direct differential against the frozen legacy oracle: same
+        // shapes, same interleaved layout, sigma baked into both sides.
         double cbErr = 0.0;
-        ComplexD sig = (pc & 1) ? ComplexD(-1.0) : ComplexD(1.0);
         for (int t = 0; t < Nt; t++)
-          for (int l = 0; l < nl; l++)
-            for (int r = 0; r < nr; r++) {
-              ComplexD M0 = mf_stn(0, 0, t, l, r);
-              ComplexD M1 = mf_stn(0, 0, t, nl + l, r);
-              for (int lc = 0; lc < mode.legL; lc++)
-                for (int rc = 0; rc < mode.legR; rc++) {
-                  int iLeg = (mode.legL == 2) ? 2 * l + lc : l;
-                  int jLeg = (mode.legR == 2) ? 2 * r + rc : r;
-                  ComplexD lv = mf_leg(0, 0, t, iLeg, jLeg);
-                  ComplexD sv =
-                      reconstructLegacySlot(mode.ct, lc, rc, M0, M1, sig);
-                  auto mag = [](ComplexD z) {
-                    return std::sqrt(z.real() * z.real() +
-                                     z.imag() * z.imag());
-                  };
-                  double denom = std::max(mag(lv), mag(sv));
-                  double e = (denom > 0.0) ? mag(lv - sv) / denom
-                                           : mag(lv - sv);
-                  cbErr = std::max(cbErr, e);
-                }
+          for (int il = 0; il < mode.legL * nl; il++)
+            for (int ir = 0; ir < mode.legR * nr; ir++) {
+              ComplexD lv = mf_leg(0, 0, t, il, ir);
+              ComplexD sv = mf_stn(0, 0, t, il, ir);
+              auto mag = [](ComplexD z) {
+                return std::sqrt(z.real() * z.real() +
+                                 z.imag() * z.imag());
+              };
+              double denom = std::max(mag(lv), mag(sv));
+              double e = (denom > 0.0) ? mag(lv - sv) / denom
+                                       : mag(lv - sv);
+              cbErr = std::max(cbErr, e);
             }
         cbMaxErrAll = std::max(cbMaxErrAll, cbErr);
         if (cbErr > 1e-10) {
@@ -809,16 +773,15 @@ int main(int argc, char **argv) {
                     << std::endl;
         }
 
-        // Physics consistency (oracle-independent): the raw parity partials
-        // of ANY CB mode must sum to the Full contraction of that mode's
-        // inputs -- M0 + M1 covers even+odd source sites, i.e. all sites.
-        // BothHalf: Full(lhsPack, rhsPack); LeftHalf: Full(lhsPack, vecs);
-        // RightHalf: Full(vecs, rhsPack). This is the independent brake on
-        // the reconstruction: if the kernel output and reconstructLegacySlot
-        // shared one wrongly-derived sign table, the differential above
-        // would self-confirm; this check cannot. Reuses the per-gamma
-        // worker (address cache: same input arrays as the CB call above;
-        // grow-only mat cache: Full (nl,nr) fits in the (2nl,nr) slot).
+        // Physics consistency (oracle-independent): the (lc=0, rc=0)
+        // fused slot is M0+M1 (even+odd source sites = all sites), so it
+        // must equal the Full contraction of that mode's inputs.
+        // BothHalf: Full(lhsPack, rhsPack); LeftHalf: Full(lhsPack,
+        // vecs); RightHalf: Full(vecs, rhsPack). Independent brake on
+        // the fused sign table: the differential above compares against
+        // the legacy oracle; this check cannot self-confirm with it.
+        // Reuses the per-gamma worker (grow-only mat cache: Full
+        // (nl,nr) fits every fused CB slot).
         {
           // RowMajor: matches mf_stn/mf_leg — operator() reads land on
           // the worker's flat row-major slots.
@@ -836,8 +799,9 @@ int main(int argc, char **argv) {
             for (int l = 0; l < nl; l++)
               for (int r = 0; r < nr; r++) {
                 ComplexD a = mf_full(0, 0, t, l, r);
-                ComplexD b = mf_stn(0, 0, t, l, r) +
-                             mf_stn(0, 0, t, nl + l, r); // M0 + M1
+                int il = (mode.legL == 2) ? 2 * l : l; // (lc=0, rc=0)
+                int ir = (mode.legR == 2) ? 2 * r : r; // slot == M0 + M1
+                ComplexD b = mf_stn(0, 0, t, il, ir);
                 auto mag = [](ComplexD z) {
                   return std::sqrt(z.real() * z.real() + z.imag() * z.imag());
                 };
