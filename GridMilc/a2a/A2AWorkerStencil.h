@@ -75,21 +75,51 @@ public:
   std::unique_ptr<A2ATaskSpinTasteStencil<FImpl>> _stencil_task;
 
   A2AWorkerSpinTasteStencil() = delete;
+  // Momentum-aware: mom holds one exp(i p·x) phase field per momentum on
+  // the 4D full grid (pointer-identical to `grid`; the task validates and
+  // promotes). The output mu axis becomes nGamma*nMom, g-major (mu =
+  // g*nMom + p): allocate a RowMajor (nGamma, nMom, Nt, [2]L, R) tensor
+  // and read mf(g, p, t, l, r). Empty mom == zero momentum (previous
+  // behaviour).
   A2AWorkerSpinTasteStencil(GridCartesian *grid,
                             const std::vector<ComplexField> &mom,
                             const std::vector<StagGamma> &gammas,
                             LatticeGaugeField *U, int orthogDir,
                             std::shared_ptr<GridCartesian> grid5d = nullptr)
       : _grid(grid) {
-    // Momentum projection is not implemented for the stencil path (same as the
-    // sibling A2AWorkerSpinTaste). MesonField passes `ph` unconditionally, so
-    // this guards useStencil + non-zero momentum from silently producing
-    // unprojected (wrong) results.
-    if (mom.size()) {
-      assert(0 && "A2AWorkerSpinTasteStencil: momentum projection not implemented");
-    }
     _stencil_task = std::make_unique<A2ATaskSpinTasteStencil<FImpl>>(
-        grid, orthogDir, gammas, U, grid5d);
+        grid, orthogDir, gammas, U, mom, grid5d);
+  }
+
+  // J.A local: Amu fields ARE the per-channel site phase (4D full grid,
+  // pointer-identical to grid; the task validates and promotes). Arbitrary
+  // channel count; no gauge field. Output mu axis nAmu*nMom g-major:
+  // RowMajor (nAmu, nMom, Nt, [2]L, R), mf(a, p, t, l, r). Mirrors the
+  // legacy A2AWorkerLocal(grid, mom, Amu, orthogDir) shape.
+  A2AWorkerSpinTasteStencil(GridCartesian *grid,
+                            const std::vector<ComplexField> &mom,
+                            const std::vector<ComplexField> &Amu,
+                            int orthogDir,
+                            std::shared_ptr<GridCartesian> grid5d = nullptr)
+      : _grid(grid) {
+    _stencil_task = std::make_unique<A2ATaskSpinTasteStencil<FImpl>>(
+        grid, orthogDir, Amu, mom, grid5d);
+  }
+
+  // J.A one-link: exactly Nd (4) photon fields, Amu[k] dressing the
+  // direction-k links (task builds W̃_k = A_k·U_k and bakes the standard
+  // η_k·(1/2) phase). One output channel per component: RowMajor
+  // (4, nMom, Nt, [2]L, R), mf(k, p, t, l, r) = the J_kA_k meson field.
+  // A 3-vector current passes a zero T-component field. Mirrors the legacy
+  // dead signature A2AWorkerOnelink(grid, mom, Amu, U, orthogDir) + grid5d.
+  A2AWorkerSpinTasteStencil(GridCartesian *grid,
+                            const std::vector<ComplexField> &mom,
+                            const std::vector<ComplexField> &Amu,
+                            LatticeGaugeField *U, int orthogDir,
+                            std::shared_ptr<GridCartesian> grid5d = nullptr)
+      : _grid(grid) {
+    _stencil_task = std::make_unique<A2ATaskSpinTasteStencil<FImpl>>(
+        grid, orthogDir, Amu, U, mom, grid5d);
   }
 
   // Owns both the task and the cache (freeMatCache is a safe no-op on an
@@ -119,15 +149,22 @@ private:
                              ContractType ct) {
     // Contract/dims consistency: sizeL/sizeR are array entry counts; CB
     // modes double dim 3 (the row block split), dim 4 is never doubled.
+    // Dims 0/1 jointly carry the flat mu axis (g-major: mu = g*nMom + p,
+    // the task's getNgamma()); their product is now pinned -- momentum
+    // grows the axis, and a mismatched allocation would otherwise scatter
+    // the flat-mu blocks into the wrong tensor slots silently.
     int rowMult = (ct == ContractType::Full) ? 1 : 2;
+    int nMuFlat = _stencil_task->getNgamma();
     if (ct == ContractType::undef ||
         (int)mat.dimension(3) != rowMult * sizeL ||
-        (int)mat.dimension(4) != sizeR) {
+        (int)mat.dimension(4) != sizeR ||
+        (int)(mat.dimension(0) * mat.dimension(1)) != nMuFlat) {
       std::cerr << "A2AWorkerSpinTasteStencil::StagMesonField: mat dims ("
+                << mat.dimension(0) << "x" << mat.dimension(1) << " mu, "
                 << mat.dimension(3) << "," << mat.dimension(4)
-                << ") inconsistent with sizes (" << rowMult * sizeL << ","
-                << sizeR << ") for ContractType " << (int)ct
-                << std::endl;
+                << ") inconsistent with sizes (" << nMuFlat << " mu, "
+                << rowMult * sizeL << "," << sizeR << ") for ContractType "
+                << (int)ct << std::endl;
       GridAbort();
     }
     // Output-mat device cache + zero (A2ACache facility).

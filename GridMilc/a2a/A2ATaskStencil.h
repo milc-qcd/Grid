@@ -230,6 +230,42 @@ accelerator_inline auto promoteColourMatrix(const ColourMatrix &s)
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// J.A local spec set: n zero-displacement spin-tastes (G1,G1). The specs
+// drive the endpoint/pairing/W machinery ONLY (single identity endpoint
+// per channel, W == 1, no gauge field); the per-channel site phase comes
+// from the caller's Amu fields (extPhases), so these objects are never
+// consumed for their phases. Validated here (not in the delegating body)
+// so the check fires BEFORE the canonical ctor builds any state.
+///////////////////////////////////////////////////////////////////////////////
+inline std::vector<StagGamma> jaLocalSpecs(int n) {
+  if (n <= 0) {
+    std::cerr << "A2ATaskSpinTasteStencil: J.A local requires at least one "
+                 "Amu phase field"
+              << std::endl;
+    GridAbort();
+  }
+  std::vector<StagGamma> specs(n);
+  for (int i = 0; i < n; i++)
+    specs[i].setSpinTaste(StagGamma::StagAlgebra::G1,
+                          StagGamma::StagAlgebra::G1);
+  return specs;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// J.A one-link spec set: one pc1 spin-taste (gmu[k], G1) per direction k
+// (X,Y,Z,T order -- gmu[k] activates exactly direction k): endpoints ±ê_k,
+// the standard η_k(x)·(1/2) coefficient baked via the applyCoeffsAndPhase
+// path, and the one-hop chain taken from the A_k-dressed gauge field.
+///////////////////////////////////////////////////////////////////////////////
+inline std::vector<StagGamma> jaOneLinkSpecs() {
+  std::vector<StagGamma> specs;
+  specs.reserve(StagGamma::gmu.size());
+  for (int k = 0; k < (int)StagGamma::gmu.size(); k++)
+    specs.emplace_back(StagGamma::gmu[k], StagGamma::StagAlgebra::G1);
+  return specs;
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // A2ATaskSpinTasteStencil: 5D stencil-based spin-taste meson-field task.
 //
 // SIMD lanes (dim-5) = RHS vectors (batched Nsimd at a time). Spatial dims are
@@ -323,12 +359,42 @@ protected:
   deviceVector<int> _interiorOffsetDev; // [osites] shift-0 padded interior oSite
   std::vector<ComplexField> _phaseFields; // [nGamma] grid5d phase
   std::shared_ptr<A2AFieldView<cobj>> _phaseView;
+  // Momentum phases [nMom] on grid5d (lane-replicated; promoted from the
+  // caller's 4D full-grid fields). Empty == no momentum (_nMom == 1): the
+  // kernel skips the momentum multiply entirely (zero-mom path
+  // arithmetically identical to the pre-momentum kernel). Declaration
+  // order: fields BEFORE view (the PaddedCell/layout teardown invariant
+  // above; mirrors _phaseFields/_phaseView).
+  std::vector<ComplexField> _momFields;
+  std::shared_ptr<A2AFieldView<cobj>> _momView;
+  int _nSpec = 0; // spec gamma count (_gammas.size(); endpoint tables per spec)
+  int _nMom = 1;  // momentum multiplicity of the flat mu axis (>= 1)
 
 public:
+  // Zero-momentum form: unchanged public surface (existing call sites).
   A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
                           const std::vector<StagGamma> &gammas,
                           LatticeGaugeField *U,
                           std::shared_ptr<GridCartesian> grid5d = nullptr)
+      : A2ATaskSpinTasteStencil(fullGrid, orthogDir, gammas, U,
+                                std::vector<ComplexField>(), grid5d) {}
+
+  // Canonical ctor (momentum-aware; extPhases added for the J.A local path,
+  // Slice 3). mom holds one exp(i p·x) phase field per momentum (4D full
+  // grid, pointer-identical to fullGrid). The output mu axis becomes
+  // nGamma*nMom, g-major (mu = g*nMom + p): allocate a RowMajor
+  // (nGamma, nMom, Nt, [2]L, R) tensor and read mf(g, p, t, l, r). The
+  // kernel computes the expensive W*psi*innerProduct once per gamma and
+  // multiply-accumulates each momentum into its own accumulator slot.
+  // extPhases (J.A local): per-spec external phase fields replacing the
+  // applyCoeffsAndPhase bake.
+  A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
+                          const std::vector<StagGamma> &gammas,
+                          LatticeGaugeField *U,
+                          const std::vector<ComplexField> &mom,
+                          std::shared_ptr<GridCartesian> grid5d = nullptr,
+                          const std::vector<ComplexField> *extPhases = nullptr,
+                          const std::vector<ComplexField> *extDress = nullptr)
       : _gammas(gammas), _U(U), _fullGrid(fullGrid), _orthog_dir(orthogDir) {
 
     // 5D grid: adopt the caller's (validated) grid when supplied -- the
@@ -425,20 +491,73 @@ public:
     // here (separate from the unphased W) is what makes the pairing hermiticity
     // exact; the kernel must NOT also receive phased W (double-phase trap).
     {
-      ComplexField ones5d(_grid5d.get());
-      ones5d = 1.0;
-      _phaseFields.reserve(gammas.size());
-      for (int g = 0; g < (int)gammas.size(); g++)
-        _phaseFields.emplace_back(_grid5d.get());
-      for (int g = 0; g < (int)gammas.size(); g++) {
-        // SIGN-CRITICAL: the STORED object's _negated (applyG5-folded when
-        // constructed that way) is baked into _phaseFields. The double-phase
-        // trap comment above (W reaching the kernel must be unphased) still
-        // applies: the phase is baked exactly once, here.
-        gammas[g].applyCoeffsAndPhase(_phaseFields[g], ones5d);
+      // Phase source: the applyCoeffsAndPhase bake (StagGamma paths) or
+      // the caller's external per-spec fields (J.A local). External fields
+      // are validated (4D full grid, pointer-identical) and promoted
+      // lane-replicated onto grid5d -- the caller's fields ARE the phase
+      // (already carrying any coefficient convention; NOTHING is added).
+      if (extPhases) {
+        if ((int)extPhases->size() != (int)gammas.size()) {
+          std::cerr << "A2ATaskSpinTasteStencil: external phase count "
+                    << extPhases->size() << " != spec count "
+                    << gammas.size() << std::endl;
+          GridAbort();
+        }
+        for (int g = 0; g < (int)extPhases->size(); g++)
+          if ((*extPhases)[g].Grid() != fullGrid) {
+            std::cerr << "A2ATaskSpinTasteStencil: external phase [" << g
+                      << "] must live on the task's 4D full grid "
+                         "(pointer identity)"
+                      << std::endl;
+            GridAbort();
+          }
+        _phaseFields.reserve(extPhases->size());
+        for (int g = 0; g < (int)extPhases->size(); g++) {
+          _phaseFields.emplace_back(_grid5d.get());
+          promoteField5d(_phaseFields[g], (*extPhases)[g], fullGrid,
+                         _grid5d.get());
+        }
+      } else {
+        ComplexField ones5d(_grid5d.get());
+        ones5d = 1.0;
+        _phaseFields.reserve(gammas.size());
+        for (int g = 0; g < (int)gammas.size(); g++)
+          _phaseFields.emplace_back(_grid5d.get());
+        for (int g = 0; g < (int)gammas.size(); g++) {
+          // SIGN-CRITICAL: the STORED object's _negated (applyG5-folded when
+          // constructed that way) is baked into _phaseFields. The double-phase
+          // trap comment above (W reaching the kernel must be unphased) still
+          // applies: the phase is baked exactly once, here.
+          gammas[g].applyCoeffsAndPhase(_phaseFields[g], ones5d);
+        }
       }
       _phaseView = std::make_shared<A2AFieldView<cobj>>();
-      _phaseView->openViews(_phaseFields.data(), (int)gammas.size());
+      _phaseView->openViews(_phaseFields.data(), (int)_phaseFields.size());
+    }
+
+    // Momentum phases: promoted from the caller's 4D full-grid fields to
+    // lane-replicated grid5d (same grid/replication contract as the phase
+    // bake above). NOT composed with the per-gamma phases here: the kernel
+    // multiplies them per-source on the hoisted inner product (the
+    // expensive W*psi*innerProduct runs once per gamma regardless of nMom)
+    // -- composing here AND multiplying in the kernel would double-phase.
+    _nSpec = (int)gammas.size();
+    _nMom = mom.empty() ? 1 : (int)mom.size();
+    if (!mom.empty()) {
+      for (int p = 0; p < (int)mom.size(); p++)
+        if (mom[p].Grid() != fullGrid) {
+          std::cerr << "A2ATaskSpinTasteStencil: mom[" << p << "] must live "
+                       "on the task's 4D full grid (pointer identity)"
+                    << std::endl;
+          GridAbort();
+        }
+      _momFields.reserve(mom.size());
+      for (int p = 0; p < (int)mom.size(); p++) {
+        _momFields.emplace_back(_grid5d.get());
+        promoteField5d(_momFields[p], mom[p], fullGrid, _grid5d.get());
+      }
+      _momView = std::make_shared<A2AFieldView<cobj>>();
+      _momView->openViews(_momFields.data(), (int)_momFields.size());
     }
 
     // Pairing maps: classify per gamma; global forward-field index =
@@ -476,6 +595,64 @@ public:
     _forwardRepDev = upload(forwardRepHost);
     _isForwardDev = upload(isForwardHost);
 
+    if (extDress) {
+      if (extPhases) {
+        std::cerr << "A2ATaskSpinTasteStencil: extPhases and extDress are "
+                     "mutually exclusive phase/W sources"
+                  << std::endl;
+        GridAbort();
+      }
+      if ((int)extDress->size() != (int)StagGamma::gmu.size() ||
+          (int)extDress->size() != (int)gammas.size()) {
+        std::cerr << "A2ATaskSpinTasteStencil: link dressing requires "
+                     "exactly Nd="
+                  << StagGamma::gmu.size() << " fields (one per direction, "
+                     "component-indexed) matching the spec count; got "
+                  << extDress->size() << " fields for " << gammas.size()
+                  << " specs" << std::endl;
+        GridAbort();
+      }
+      if (_U == nullptr) {
+        std::cerr << "A2ATaskSpinTasteStencil: link dressing requires a "
+                     "gauge field U (one-link displacement)"
+                  << std::endl;
+        GridAbort();
+      }
+      for (int k = 0; k < (int)extDress->size(); k++) {
+        if ((*extDress)[k].Grid() != fullGrid) {
+          std::cerr << "A2ATaskSpinTasteStencil: link dressing field [" << k
+                    << "] must live on the task's 4D full grid "
+                       "(pointer identity)"
+                    << std::endl;
+          GridAbort();
+        }
+        int pc = StagGamma::popcountShift(gammas[k]._spin, gammas[k]._taste);
+        if (pc != 1) {
+          std::cerr << "A2ATaskSpinTasteStencil: link dressing requires "
+                       "popcount-1 specs; spec "
+                    << k << " has popcount " << pc << std::endl;
+          GridAbort();
+        }
+      }
+    }
+    // J.A one-link (extDress): dress each direction-k gauge link with the
+    // caller's photon field A_k(x) BEFORE the chain/padded store is built
+    // (A_mu lives on the links alongside U_mu -- developer directive). The
+    // pc1 chain for spec k then transports through W̃_k(x) = A_k(x)·U_k(x);
+    // the kernel's backward read adj(W̃)(x-ê_k) yields A*_k(x-ê)U†_k(x-ê)
+    // -- link-symmetric vertex placement with zero kernel changes.
+    LatticeGaugeField UchainDressed(fullGrid);
+    LatticeGaugeField *Uchain = _U;
+    if (extDress) {
+      UchainDressed = *_U;
+      for (int k = 0; k < (int)StagGamma::gmu.size(); k++) {
+        LatticeColourMatrix link = PeekIndex<LorentzIndex>(*_U, k);
+        link = (*extDress)[k] * link; // W̃_k(x) = A_k(x) · U_k(x)
+        PokeIndex<LorentzIndex>(UchainDressed, link, k);
+      }
+      Uchain = &UchainDressed;
+    }
+
     // Scalar W Lattice: gridW is a 5D Nsimd=1 grid whose dim-5 indexes the
     // forward endpoints ("directions"); _wScalarGrid lives on its padded grid
     // (spatial matches paddedGrid5d, so interiorOffset/paddedSS align). Build
@@ -508,7 +685,8 @@ public:
                                    isFwdLocal);
 
         std::vector<LatticeColourMatrix> fwdChains =
-            spinTasteGaugeChainUnphasedForward(_U, gammas[g], fullGrid, fwd);
+            spinTasteGaugeChainUnphasedForward(Uchain, gammas[g], fullGrid,
+                                               fwd);
         for (int fp = 0; fp < (int)fwdChains.size(); fp++) {
           LatticeColourMatrix chain5d(_grid5d.get());
           promoteField5d(chain5d, fwdChains[fp], fullGrid, _grid5d.get());
@@ -524,6 +702,37 @@ public:
     }
   }
 
+  // J.A local ctor: the caller's Amu fields ARE the per-channel site phase
+  // (4D full grid, pointer-identical to fullGrid; any coefficient
+  // convention already folded caller-side -- nothing is added here). Each
+  // channel is a zero-displacement operator (single identity endpoint, no
+  // gauge field: U == nullptr is legal, all specs nActive == 0). Arbitrary
+  // channel count (the ASlash stochastic-field pattern). Output mu axis:
+  // nAmu*nMom g-major -- RowMajor (nAmu, nMom, Nt, [2]L, R), mf(a, p, t, l, r).
+  A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
+                          const std::vector<ComplexField> &Amu,
+                          const std::vector<ComplexField> &mom,
+                          std::shared_ptr<GridCartesian> grid5d = nullptr)
+      : A2ATaskSpinTasteStencil(
+            fullGrid, orthogDir, jaLocalSpecs((int)Amu.size()), nullptr,
+            mom, grid5d, &Amu) {}
+
+  // J.A one-link ctor: exactly Nd (4) photon fields, Amu[k] dressing the
+  // direction-k gauge links (W̃_k(x) = A_k(x)·U_k(x); the kernel's backward
+  // read adj(W̃)(x-ê_k) carries A*_k(x-ê)U†_k(x-ê) -- link-symmetric
+  // placement, zero kernel changes). The standard pc1 spin-taste
+  // coefficient η_k(x)·(1/2) is baked into the phase slot (spec gamma
+  // (gmu[k], G1)): the operator is the standard one-link bilinear with
+  // photon-dressed transport. One output channel per component (J_kA_k);
+  // a 3-vector current passes a zero T-component field.
+  A2ATaskSpinTasteStencil(GridCartesian *fullGrid, int orthogDir,
+                          const std::vector<ComplexField> &Amu,
+                          LatticeGaugeField *U,
+                          const std::vector<ComplexField> &mom,
+                          std::shared_ptr<GridCartesian> grid5d = nullptr)
+      : A2ATaskSpinTasteStencil(fullGrid, orthogDir, jaOneLinkSpecs(), U,
+                                mom, grid5d, nullptr, &Amu) {}
+
   // Teardown is safe-by-construction: members destroy in REVERSE
   // declaration order, and the declaration layout encodes the PaddedCell
   // teardown invariant -- ~PaddedCell -> DeleteGrids reads
@@ -533,14 +742,20 @@ public:
   // Do NOT reorder the data members.
   ~A2ATaskSpinTasteStencil() = default;
 
-  int getNgamma() { return (int)_gammas.size(); }
+  // Flat mu-axis count. With momentum the axis is nSpec*nMom, g-major
+  // (mu = g*nMom + p): execute()/assembleMat stay extent-driven over this
+  // count. Zero momentum (_nMom == 1) reduces to the spec count.
+  int getNgamma() { return _nSpec * _nMom; }
   double getFlops() {
-    // Per (site, l, r) pairing: one W_s ColourMatrix×FermionVec (66 FLOP) + one
-    // innerProduct (22 FLOP) = 88 FLOP × nEndpoints. W*psi is hoisted out of the
-    // per-L loop (computed once per (l_batch,r_batch,site,ep), reused across the
-    // rotation sweep), so actual W*psi FLOPs drop ~Nsimd×; the reported metric is
-    // already sizeL/sizeR-independent, so this per-endpoint value stays valid.
-    return 88.0 * _nEpTotal;
+    // Per (site, l, r) pairing: one W_s ColourMatrix x FermionVec (66 FLOP)
+    // + one innerProduct (22 FLOP) = 88 FLOP x nEndpoints, computed ONCE
+    // per spec gamma and shared across all momenta (the kernel hoists
+    // W*psi*innerProduct out of the momentum loop); each extra momentum
+    // adds one complex multiply-accumulate (8 FLOP) per endpoint. W*psi is
+    // hoisted out of the per-L loop as before (computed once per
+    // (l_batch, r_batch, site, ep), reused across the rotation sweep), so
+    // the reported metric stays sizeL/sizeR-independent.
+    return (88.0 + 8.0 * (_nMom - 1)) * _nEpTotal;
   }
   // The worker reads the 4D full grid (to size full-grid input temporaries);
   // _fullGrid is protected, so expose it.
@@ -760,11 +975,21 @@ public:
     {
       GRID_TRACE("A2AStencil/VectorSum5d");
       for (int p = 0; p < nParity; p++) {
-        for (int mu = 0; mu < nGamma; mu += MF_SUM_ARRAY_MAX) {
-          int nGammaBlock = std::min(nGamma - mu, MF_SUM_ARRAY_MAX);
-          vectorSum5d(shm_p + (size_t)p * nGamma * gammaStride, mu,
-                      nGammaBlock, localOrthogDimSize, localSpatialVolume,
-                      gammaStride, _siteParity.data(), cbSplit ? p : -1);
+        // g-major flat blocking: each block covers nG spec gammas x nP
+        // momenta with nG*nP <= MF_SUM_ARRAY_MAX (the per-thread sum[]
+        // bound), taking FULL p-ranges per block so the hoisted inner
+        // product is shared across every momentum of its gammas. For
+        // _nMom == 1 this degenerates to the previous 16-gamma blocks.
+        int nPBlock = std::min(_nMom, MF_SUM_ARRAY_MAX);
+        int nGBlockMax = std::max(1, MF_SUM_ARRAY_MAX / nPBlock);
+        for (int g0 = 0; g0 < _nSpec; g0 += nGBlockMax) {
+          int nG = std::min(_nSpec - g0, nGBlockMax);
+          for (int p0 = 0; p0 < _nMom; p0 += nPBlock) {
+            int nP = std::min(_nMom - p0, nPBlock);
+            vectorSum5d(shm_p + (size_t)p * nGamma * gammaStride, g0, nG,
+                        p0, nP, localOrthogDimSize, localSpatialVolume,
+                        gammaStride, _siteParity.data(), cbSplit ? p : -1);
+          }
         }
       }
     }
@@ -862,28 +1087,27 @@ public:
   }
 
   //....................................................................
-  // vectorSum5d: fused kernel, shared by the Full and CB half/mixed modes
-  // (the name drops "Full" accordingly). Ordinary coalesced (nsimd=Nsimd)
-  // launch. Loop order: (lt_batch=[l_batch,rt], r_batch) parallel; (mu, ep,
-  // so) serial.
+  // vectorSum5d: fused kernel, shared by the Full and CB half/mixed modes.
+  // Ordinary coalesced (nsimd=Nsimd) launch. Loop order: (lt_batch =
+  // [l_batch, rt], r_batch) parallel; (g, ep, so) serial, MOMENTUM
+  // innermost at the accumulate site. The expensive W*psi*innerProduct is
+  // computed once per (gamma, endpoint, site) and each momentum of the
+  // block multiply-accumulates the SAME inner product into its own
+  // accumulator slot sum[s][gb*nP+pb] (g-major flat mu = g*nMom + p) --
+  // momentum projection costs one complex MAC + one phase read per extra
+  // momentum, never a redone inner product. _momView == nullptr (no
+  // momentum) skips the momentum multiply entirely: the arithmetic is
+  // identical to the pre-momentum kernel.
   //
-  // The time-slice index rt is folded into the first parallel dimension so that
-  // each (l_batch, rt, r_batch) triple gets its own block. For pc=0 this gives
-  // nBatchesL * Nt * nBatchesR = 3 * 48 * 38 = 5472 blocks vs the previous 114,
-  // filling the 108 SMs and allowing the GPU scheduler to hide L2 latency via
-  // warp switching. Each rt writes to a distinct shm slot so no reduction is
-  // needed.
-  //
-  // ep and mu remain outside the so loop so that for fixed (ep, mu) the psi
-  // gather reads traverse the padded RHS buffer sequentially
-  // (paddedSS = offsets[ep][ss] is a uniform displacement as ss increments),
-  // enabling hardware prefetching.
-  //
-  // wantParity: -1 (Full) accumulates every source site; 0/1 (half/mixed)
-  // keep only even/odd-parity sites, so two passes give the assemble step
-  // separate even/odd partial sums from the same kernel.
+  // The time-slice index rt is folded into the first parallel dimension so
+  // each (l_batch, rt, r_batch) triple gets its own block (SM occupancy via
+  // warp switching; each rt writes a distinct shm slot so no reduction is
+  // needed). ep and g remain outside the so loop so that for fixed (ep, g)
+  // the psi gather reads traverse the padded RHS buffer sequentially,
+  // enabling hardware prefetching. wantParity: -1 (Full) accumulates every
+  // source site; 0/1 (half/mixed) keep only even/odd-parity sites.
   //....................................................................
-  void vectorSum5d(cobj *shm_p, int mu_offset, int nGamma,
+  void vectorSum5d(cobj *shm_p, int g_offset, int nG, int p_offset, int nP,
                    int localOrthogDimSize, int localSpatialVolume,
                    int gammaStride, const int *siteParity_p, int wantParity) {
     GRID_TRACE("A2AStencil/vectorSum5d");
@@ -892,6 +1116,7 @@ public:
     int Nsimd = _Nsimd;
     int osites = _osites;
     int paddedOsites = _paddedOsites;
+    int nMom = _nMom; // flat-axis momentum stride (g-major: mu = g*nMom+p)
 
     // Scalar W store: bind a local Lattice& before autoView -- the
     // macro expands w.View(mode) verbatim, so a unique_ptr must be dereferenced
@@ -901,7 +1126,9 @@ public:
     ColourMatrix *wsScalar_p = &wsGrid_v[0];   // [globalFwdEp][paddedOsites]
     FermView *lhsView_p = _lhsView->getView(); // [l_batch][ss]
     FermView *rhsView_p = _paddedRhsView->getView(); // [r_batch][paddedSS]
-    ComplexView *phaseView_p = _phaseView->getView() + mu_offset; // [mu][ss]
+    ComplexView *phaseView_p = _phaseView->getView(); // [g][ss] per-spec phase
+    ComplexView *momView_p =
+        _momView ? _momView->getView() : nullptr; // [p][ss]; null == x1
 
     auto offsets_p = _allOffsets.data(); // [(epStart+ep)*osites + ss]
     auto nEp_p = _nEpDev.data();
@@ -916,13 +1143,14 @@ public:
       int l_batch = lt_batch / localOrthogDimSize;
       int rt = lt_batch % localOrthogDimSize;
 
-      calcScalar sum[vobj::Nsimd()][MF_SUM_ARRAY_MAX];
+      calcScalar sum[vobj::Nsimd()][MF_SUM_ARRAY_MAX]; // [s][gb*nP+pb]
+      calcScalar ip[vobj::Nsimd()]; // hoisted inner products
       for (int s = 0; s < Nsimd; s++)
-        for (int mu = 0; mu < nGamma; mu++)
-          sum[s][mu] = Zero();
+        for (int m = 0; m < nG * nP; m++)
+          sum[s][m] = Zero();
 
-      for (int mu = 0; mu < nGamma; mu++) {
-        int g = mu_offset + mu;
+      for (int gb = 0; gb < nG; gb++) {
+        int g = g_offset + gb; // spec gamma (endpoint tables per spec)
         int nEp = nEp_p[g];
         int epStart = epStart_p[g];
         for (int ep = 0; ep < nEp; ep++) {
@@ -944,27 +1172,50 @@ public:
             if (!isFwd)
               W = adj(W);
             auto Wpsi = W * psi;
-            // Follana phase + scaling at the SOURCE site x. W is unphased
-            // so the {s,-s} pairing hermiticity is exact (corr == +1). Phase is
-            // ep-independent; applied per-ep here (the ep-outside-so
-            // loop order keeps the RHS buffer sequentially-accessible;
-            // mathematically phase * sum_ep IP == sum_ep phase*IP).
-            calcScalar gamma_phase = coalescedRead(phaseView_p[mu][ss]);
+            // Per-spec phase (Follana / later external Amu) at the SOURCE
+            // site x. W is unphased so the {s,-s} pairing hermiticity is
+            // exact (corr == +1). Phase is ep-independent; applied per-ep
+            // here (the ep-outside-so loop order keeps the RHS buffer
+            // sequentially-accessible; mathematically phase * sum_ep IP ==
+            // sum_ep phase*IP).
+            calcScalar gamma_phase = coalescedRead(phaseView_p[g][ss]);
+            // HOISTED inner product: computed once per (gamma, endpoint,
+            // site, s) and shared by every momentum of the block.
             for (int s = 0; s < Nsimd; s++)
-              sum[s][mu] = sum[s][mu] + gamma_phase * innerProduct(
+              ip[s] = innerProduct(
                   coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
+            if (momView_p) {
+              for (int pb = 0; pb < nP; pb++) {
+                calcScalar gm = gamma_phase *
+                    coalescedRead(momView_p[p_offset + pb][ss]);
+                for (int s = 0; s < Nsimd; s++)
+                  sum[s][gb * nP + pb] =
+                      sum[s][gb * nP + pb] + gm * ip[s];
+              }
+            } else {
+              for (int s = 0; s < Nsimd; s++)
+                sum[s][gb * nP] = sum[s][gb * nP] + gamma_phase * ip[s];
+            }
           }
         }
       }
 
       for (int s = 0; s < Nsimd; s++)
-        for (int mu = 0; mu < nGamma; mu++) {
-          int shm_idx =
-              rt +
-              localOrthogDimSize * (s + Nsimd * (l_batch + nBatchesL * r_batch)) +
-              (mu_offset + mu) * gammaStride;
-          coalescedWrite(shm_p[shm_idx], sum[s][mu]);
-        }
+        for (int gb = 0; gb < nG; gb++)
+          for (int pb = 0; pb < nP; pb++) {
+            // g-major mu; size_t discipline (8badfad6): every product
+            // feeding shm_idx is computed in size_t -- mu*gammaStride and
+            // the batch-index product can exceed INT_MAX on large runs.
+            int mu = (g_offset + gb) * nMom + (p_offset + pb); // g-major
+            size_t shm_idx =
+                (size_t)rt +
+                (size_t)localOrthogDimSize *
+                    ((size_t)s +
+                     (size_t)Nsimd * ((size_t)l_batch +
+                                      (size_t)nBatchesL * r_batch)) +
+                (size_t)mu * gammaStride;
+            coalescedWrite(shm_p[shm_idx], sum[s][gb * nP + pb]);
+          }
     });
   }
 };
