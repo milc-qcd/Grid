@@ -606,7 +606,17 @@ void StagGamma::applyCoeffsAndPhase(Lattice<obj> &lhs, const Lattice<obj> &rhs) 
   if (grid->_isCheckerBoarded) {
     stag_dirs.Checkerboard() = cb; // += coor above may have reset it
   }
-  temp = where(mod(stag_dirs, 2) == 0, _scaling * rhs, -_scaling * rhs);
+  // mod() and the comparison eagerly materialise fresh result lattices
+  // whose checkerboard defaults to Even (LSComparison/mod build their
+  // results with the default CB), dropping stag_dirs's re-applied cb.
+  // Reapply cb to the predicate so where() sees a CB-conformant
+  // expression when rhs is Odd -- otherwise CBFromExpression trips the
+  // conformance assert (Lattice_ET.h). No-op on full grids (cb == Even).
+  auto parity = mod(stag_dirs, 2) == 0;
+  if (grid->_isCheckerBoarded) {
+    parity.Checkerboard() = cb;
+  }
+  temp = where(parity, _scaling * rhs, -_scaling * rhs);
 
   lhs = std::move(temp);
 }

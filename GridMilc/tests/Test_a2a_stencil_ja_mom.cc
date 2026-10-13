@@ -545,34 +545,63 @@ int main(int argc, char **argv) {
           compareMomentumVsOracles(op, oorc), 1e-12);
   }
 
-  // (7) physics: with momentum, CB LeftHalf M0+M1 == Full ---------------
+  // (7) physics: with momentum, CB interleaved slots vs Full --------------
+  // (Post-merge contract: the CB modes emit the LEGACY INTERLEAVED (M,
+  // M-dagger) layout -- raw (2L,R) parity partials from the task,
+  // sigma-combined in the worker's finishMatOutput host pass. The
+  // (even row, even col) slot is M0+M1 = the Full contraction; the
+  // sigma-carrying slots are sig*(M0-M1) / sig*(M0+M1) with sig = -1 for
+  // odd popcount(spin^taste), replicated per momentum through the flat
+  // g-major sigma table -- the odd-odd BothHalf slot exercises exactly
+  // that table under momentum.)
   {
     auto gammas = makeOps(momTestGammas(), U);
     int nG = (int)gammas.size();
     Eigen::Tensor<ComplexD, 5, Eigen::RowMajor>
         full(nG, nMom, Nt, nevec, nevec),
-        cb(nG, nMom, Nt, 2 * nevec, nevec);
+        cb(nG, nMom, Nt, 2 * nevec, nevec),
+        bb(nG, nMom, Nt, 2 * nevec, 2 * nevec);
     full.setZero();
     cb.setZero();
+    bb.setZero();
     {
       A2AWorkerSpinTasteStencil<FImpl> w(grid, ph, gammas, &U, orthogDir);
       w.StagMesonField(full, vecsL.data(), vecsR.data(), nevec, nevec);
       w.StagMesonField(cb, vecsL.data(), vecsR.data(), nevec, nevec,
                        ContractType::LeftHalf);
+      w.StagMesonField(bb, vecsL.data(), vecsR.data(), nevec, nevec,
+                       ContractType::BothHalf);
     }
     double err = 0.0;
-    for (int g = 0; g < nG; g++)
+    for (int g = 0; g < nG; g++) {
+      RealD sig = (StagGamma::popcountShift(gammas[g]._spin,
+                                            gammas[g]._taste) & 1)
+                      ? -1.0
+                      : 1.0;
       for (int p = 0; p < nMom; p++)
         for (int t = 0; t < Nt; t++)
           for (int i = 0; i < nevec; i++)
             for (int j = 0; j < nevec; j++) {
-              ComplexD s = cb(g, p, t, i, j) + cb(g, p, t, nevec + i, j);
-              double den = std::max(std::abs(s),
-                                    std::abs(full(g, p, t, i, j)));
-              double d = std::abs(s - full(g, p, t, i, j));
+              ComplexD f = full(g, p, t, i, j);
+              // LeftHalf (2l, r) = M0+M1 = Full.
+              ComplexD y = cb(g, p, t, 2 * i, j);
+              double den = std::max(std::abs(y), std::abs(f));
+              double d = std::abs(y - f);
+              err = std::max(err, den > 0 ? d / den : d);
+              // BothHalf (2l, 2r) = M0+M1 = Full; (2l+1, 2r+1) =
+              // sig*(M0+M1) = sig*Full (flat sigma table under momentum).
+              y = bb(g, p, t, 2 * i, 2 * j);
+              den = std::max(std::abs(y), std::abs(f));
+              d = std::abs(y - f);
+              err = std::max(err, den > 0 ? d / den : d);
+              ComplexD ys = sig * f;
+              y = bb(g, p, t, 2 * i + 1, 2 * j + 1);
+              den = std::max(std::abs(y), std::abs(ys));
+              d = std::abs(y - ys);
               err = std::max(err, den > 0 ? d / den : d);
             }
-    check("momentum CB M0+M1 == Full", err, 1e-10);
+    }
+    check("momentum CB interleaved slots == Full (+sigma table)", err, 1e-10);
   }
 
   bool ok = (nFail == 0);
