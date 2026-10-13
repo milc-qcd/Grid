@@ -109,23 +109,30 @@ static void foldConj(const ComplexField &c, const FermionField *L,
 }
 
 // Run the mom-empty stencil oracle once per folded momentum and return the
-// per-p (nSpec, 1, ...) tensors.
+// per-p (nSpec, 1, ...) tensors (dims 3/4 sized per ct: Full (L, R), CB
+// interleaved (2L, R) / (2L, 2R)).
 static std::vector<Eigen::Tensor<ComplexD, 5, Eigen::RowMajor>>
 runFoldOracles(GridCartesian *grid, const std::vector<ComplexField> &phIn,
                const std::vector<StagGamma> &gammas, LatticeGaugeField *U,
                const std::vector<FermionField> &vecsL,
                const std::vector<FermionField> &vecsR, int nevec, int Nt,
-               int orthogDir) {
+               int orthogDir,
+               ContractType ct = ContractType::Full) {
+  int rowMult = (ct == ContractType::Full) ? 1 : 2;
+  int colMult = (ct == ContractType::BothHalf ||
+                 ct == ContractType::RightHalf)
+                    ? 2
+                    : 1;
   std::vector<ComplexField> emptyMom;
   std::vector<Eigen::Tensor<ComplexD, 5, Eigen::RowMajor>> orc(phIn.size());
   std::vector<FermionField> foldL(nevec, grid);
   for (int p = 0; p < (int)phIn.size(); p++) {
     orc[p] = Eigen::Tensor<ComplexD, 5, Eigen::RowMajor>(
-        (int)gammas.size(), 1, Nt, nevec, nevec);
+        (int)gammas.size(), 1, Nt, rowMult * nevec, colMult * nevec);
     orc[p].setZero();
     foldConj(phIn[p], vecsL.data(), foldL.data(), nevec);
     A2AWorkerSpinTasteStencil<FImpl> w(grid, emptyMom, gammas, U, orthogDir);
-    w.StagMesonField(orc[p], foldL.data(), vecsR.data(), nevec, nevec);
+    w.StagMesonField(orc[p], foldL.data(), vecsR.data(), nevec, nevec, ct);
   }
   return orc;
 }
@@ -236,6 +243,26 @@ int main(int argc, char **argv) {
                               orthogDir);
     check("momentum conj-fold vs existing stencil (pc0-4)",
           compareMomentumVsOracles(mf, orc), 1e-13);
+
+    // (1b) the same fold comparison under ContractType::LeftHalf: both
+    // sides emit the legacy interleaved (2L, R) slots post-merge, so the
+    // comparison is element-for-element (no M0+M1 reconstruction).
+    // Restored 2026-10-13 — the suspected CB deferred-write defect that
+    // deferred this check is gone after 62e9fec5 (probe: 3.6e-14).
+    Eigen::Tensor<ComplexD, 5, Eigen::RowMajor> mfl(
+        (int)gammas.size(), nMom, Nt, 2 * nevec, nevec);
+    mfl.setZero();
+    {
+      A2AWorkerSpinTasteStencil<FImpl> w(grid, ph, gammas, &U, orthogDir);
+      w.StagMesonField(mfl, vecsL.data(), vecsR.data(), nevec, nevec,
+                       ContractType::LeftHalf);
+    }
+    auto orcl = runFoldOracles(grid, ph, gammas, &U, vecsL, vecsR, nevec, Nt,
+                               orthogDir, ContractType::LeftHalf);
+    // 1e-12 (not 1e-13): the odd (partial-batch) nevec run reaches
+    // 1.7e-13 — same rounding-scale adaptation as the Cshift reference.
+    check("momentum conj-fold under LeftHalf (1b)",
+          compareMomentumVsOracles(mfl, orcl), 1e-12);
   }
 
   // (2) explicit lattice-expression reference (pc0) ---------------------
