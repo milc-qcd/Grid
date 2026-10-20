@@ -987,9 +987,16 @@ public:
           int nG = std::min(_nSpec - g0, nGBlockMax);
           for (int p0 = 0; p0 < _nMom; p0 += nPBlock) {
             int nP = std::min(_nMom - p0, nPBlock);
-            vectorSum5d(shm_p + (size_t)p * nGamma * gammaStride, g0, nG,
-                        p0, nP, localOrthogDimSize, localSpatialVolume,
-                        gammaStride, _siteParity.data(), cbSplit ? p : -1);
+            if (_momView)
+              vectorSum5d<true>(shm_p + (size_t)p * nGamma * gammaStride, g0,
+                                nG, p0, nP, localOrthogDimSize,
+                                localSpatialVolume, gammaStride,
+                                _siteParity.data(), cbSplit ? p : -1);
+            else
+              vectorSum5d<false>(shm_p + (size_t)p * nGamma * gammaStride, g0,
+                                 nG, p0, nP, localOrthogDimSize,
+                                 localSpatialVolume, gammaStride,
+                                 _siteParity.data(), cbSplit ? p : -1);
           }
         }
       }
@@ -1086,9 +1093,13 @@ public:
   // block multiply-accumulates the SAME inner product into its own
   // accumulator slot sum[s][gb*nP+pb] (g-major flat mu = g*nMom + p) --
   // momentum projection costs one complex MAC + one phase read per extra
-  // momentum, never a redone inner product. _momView == nullptr (no
-  // momentum) skips the momentum multiply entirely: the arithmetic is
-  // identical to the pre-momentum kernel.
+  // momentum, never a redone inner product.
+  //
+  // HasMom selects the kernel at compile time. HasMom == false (no
+  // momentum, nP == 1) is the pre-momentum (143f74b) kernel body: no
+  // momentum branch and no runtime-strided sum[] slot in the compiled
+  // code. A single kernel holding both branches measured 57 ps per
+  // (endpoint, site, pair) at zero momentum against 45 ps for 143f74b.
   //
   // The time-slice index rt is folded into the first parallel dimension so
   // each (l_batch, rt, r_batch) triple gets its own block (SM occupancy via
@@ -1098,6 +1109,7 @@ public:
   // enabling hardware prefetching. wantParity: -1 (Full) accumulates every
   // source site; 0/1 (half/mixed) keep only even/odd-parity sites.
   //....................................................................
+  template <bool HasMom>
   void vectorSum5d(cobj *shm_p, int g_offset, int nG, int p_offset, int nP,
                    int localOrthogDimSize, int localSpatialVolume,
                    int gammaStride, const int *siteParity_p, int wantParity) {
@@ -1108,6 +1120,7 @@ public:
     int osites = _osites;
     int paddedOsites = _paddedOsites;
     int nMom = _nMom; // flat-axis momentum stride (g-major: mu = g*nMom+p)
+    assert(HasMom == (_momView != nullptr) && (HasMom || nP == 1));
 
     // Scalar W store: bind a local Lattice& before autoView -- the
     // macro expands w.View(mode) verbatim, so a unique_ptr must be dereferenced
@@ -1119,7 +1132,7 @@ public:
     FermView *rhsView_p = _paddedRhsView->getView(); // [r_batch][paddedSS]
     ComplexView *phaseView_p = _phaseView->getView(); // [g][ss] per-spec phase
     ComplexView *momView_p =
-        _momView ? _momView->getView() : nullptr; // [p][ss]; null == x1
+        HasMom ? _momView->getView() : nullptr; // [p][ss]
 
     auto offsets_p = _allOffsets.data(); // [(epStart+ep)*osites + ss]
     auto nEp_p = _nEpDev.data();
@@ -1135,9 +1148,8 @@ public:
       int rt = lt_batch % localOrthogDimSize;
 
       calcScalar sum[vobj::Nsimd()][MF_SUM_ARRAY_MAX]; // [s][gb*nP+pb]
-      calcScalar ip[vobj::Nsimd()]; // hoisted inner products
       for (int s = 0; s < Nsimd; s++)
-        for (int m = 0; m < nG * nP; m++)
+        for (int m = 0; m < (HasMom ? nG * nP : nG); m++)
           sum[s][m] = Zero();
 
       for (int gb = 0; gb < nG; gb++) {
@@ -1170,22 +1182,26 @@ public:
             // sequentially-accessible; mathematically phase * sum_ep IP ==
             // sum_ep phase*IP).
             calcScalar gamma_phase = coalescedRead(phaseView_p[g][ss]);
-            // HOISTED inner product: computed once per (gamma, endpoint,
-            // site, s) and shared by every momentum of the block.
-            for (int s = 0; s < Nsimd; s++)
-              ip[s] = innerProduct(
-                  coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
-            if (momView_p) {
-              for (int pb = 0; pb < nP; pb++) {
-                calcScalar gm = gamma_phase *
-                    coalescedRead(momView_p[p_offset + pb][ss]);
-                for (int s = 0; s < Nsimd; s++)
+            // Plain if, not if constexpr: nvcc rejects an extended
+            // __host__ __device__ lambda that first captures a variable
+            // inside a constexpr-if branch. HasMom is a template constant,
+            // so the dead branch folds away either way.
+            if (HasMom) {
+              // Phased inner product computed once per (gamma, endpoint,
+              // site, s) into a per-lane scalar and shared by every
+              // momentum of the block.
+              for (int s = 0; s < Nsimd; s++) {
+                calcScalar ip = gamma_phase * innerProduct(
+                    coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
+                for (int pb = 0; pb < nP; pb++)
                   sum[s][gb * nP + pb] =
-                      sum[s][gb * nP + pb] + gm * ip[s];
+                      sum[s][gb * nP + pb] +
+                      coalescedRead(momView_p[p_offset + pb][ss]) * ip;
               }
             } else {
               for (int s = 0; s < Nsimd; s++)
-                sum[s][gb * nP] = sum[s][gb * nP] + gamma_phase * ip[s];
+                sum[s][gb] = sum[s][gb] + gamma_phase * innerProduct(
+                    coalescedReadRotate(lhsView_p[l_batch][ss], s), Wpsi);
             }
           }
         }
@@ -1193,7 +1209,7 @@ public:
 
       for (int s = 0; s < Nsimd; s++)
         for (int gb = 0; gb < nG; gb++)
-          for (int pb = 0; pb < nP; pb++) {
+          for (int pb = 0; pb < (HasMom ? nP : 1); pb++) {
             // g-major mu; size_t discipline (8badfad6): every product
             // feeding shm_idx is computed in size_t -- mu*gammaStride and
             // the batch-index product can exceed INT_MAX on large runs.
@@ -1205,7 +1221,7 @@ public:
                      (size_t)Nsimd * ((size_t)l_batch +
                                       (size_t)nBatchesL * r_batch)) +
                 (size_t)mu * gammaStride;
-            coalescedWrite(shm_p[shm_idx], sum[s][gb * nP + pb]);
+            coalescedWrite(shm_p[shm_idx], sum[s][HasMom ? gb * nP + pb : gb]);
           }
     });
   }
