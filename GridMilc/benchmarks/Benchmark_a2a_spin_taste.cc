@@ -8,6 +8,9 @@
  *   Onelink    -- A2AWorkerOnelink (popcount 1: single covariant hop)
  *   SpinTaste  -- A2AWorkerSpinTaste   (cshift-based general spin-taste)
  *   Stencil    -- A2AWorkerSpinTasteStencil (5D padded-gather spin-taste)
+ *   StencilMom -- A2AWorkerSpinTasteStencil + momentum projection
+ *   JALocal    -- A2AWorkerSpinTasteStencil J.A local (Amu-as-phase) path
+ *   JA1link    -- A2AWorkerSpinTasteStencil J.A one-link (A-dressed links)
  *
  * Each path is run for one representative gamma (one per popcount 0-4) and
  * timed over NWARM warmup + NREP measured repetitions.  Throughput is
@@ -22,9 +25,13 @@
  *                            [--stencil]  run Stencil (5D padded-gather) path
  *                            [--pc N]     run only the popcount-N gamma batch
  *                                         (0-4; default: all)
+ *                            [--nmom N]   number of momentum phase fields
+ *                                         (default: 4)
+ *                            [--mom]      run the Stencil momentum path
+ *                            [--ja]       run the J.A local + one-link paths
  *
- * If none of --legacy/--cshift/--stencil are given, all three run (original
- * behaviour).
+ * If none of --legacy/--cshift/--stencil/--mom/--ja are given, all run
+ * (original behaviour extended).
  */
 #include <Grid/Grid.h>
 #include <Grid/qcd/utils/SpaceTimeGrid.h>
@@ -115,9 +122,13 @@ int main(int argc, char **argv) {
   bool flagLegacy  = GridCmdOptionExists(argv, argv + argc, "--legacy");
   bool flagCshift  = GridCmdOptionExists(argv, argv + argc, "--cshift");
   bool flagStencil = GridCmdOptionExists(argv, argv + argc, "--stencil");
-  // if none specified, run everything
-  if (!flagLegacy && !flagCshift && !flagStencil)
-    flagLegacy = flagCshift = flagStencil = true;
+  std::string nmomStr = GridCmdOptionPayload(argv, argv + argc, "--nmom");
+  int nmom = nmomStr.empty() ? 4 : std::stoi(nmomStr);
+  bool flagMom = GridCmdOptionExists(argv, argv + argc, "--mom");
+  bool flagJA  = GridCmdOptionExists(argv, argv + argc, "--ja");
+  // if none specified, run everything (existing behaviour extended)
+  if (!flagLegacy && !flagCshift && !flagStencil && !flagMom && !flagJA)
+    flagLegacy = flagCshift = flagStencil = flagMom = flagJA = true;
 
   std::string pcStr = GridCmdOptionPayload(argv, argv + argc, "--pc");
   int pcFilter = pcStr.empty() ? -1 : std::stoi(pcStr); // -1 = all
@@ -154,6 +165,27 @@ int main(int argc, char **argv) {
 
   // ---- output tensor ----
   std::vector<ComplexField>  emptyMom;
+
+  // Momentum phases (the Test_a2a_stencil_ja_mom / MesonField pattern):
+  // ph = exp(2 pi i p·x / L), spatial momenta cycling small integer
+  // patterns. Content is irrelevant to throughput; the phases exercise the
+  // momView read path.
+  std::vector<ComplexField> ph;
+  if (nmom > 0) {
+    for (int k = 0; k < nmom; k++) {
+      Coordinate p({k % 3, (k / 3) % 3, (k / 9) % 3, 0});
+      ph.emplace_back(grid);
+      ComplexField &f = ph.back();
+      Complex i(0.0, 1.0);
+      ComplexField coor(grid);
+      f = Zero();
+      for (int mu = 0; mu < Nd - 1; mu++) {
+        LatticeCoordinate(coor, mu);
+        f = f + ((Real)p[mu] / (Real)fdim[mu]) * coor;
+      }
+      f = exp((Real)(2 * M_PI) * i * f);
+    }
+  }
 
   typedef StagGamma::StagAlgebra A;
 
@@ -299,6 +331,86 @@ int main(int argc, char **argv) {
       double flops = totalFlops(fp, volume, nevec, nevec);
 
       auto res = runBench(blabel("Stencil", b), flops, 0, nrep, [&] {
+        worker.resetCache();
+        mat.setZero();
+        worker.StagMesonField(mat, vecs.data(), vecs.data(), nevec, nevec);
+      });
+      printResult(res);
+    }
+  }
+
+  // ====================================================================
+  // 5. Stencil + momentum (--mom)
+  // The task's getFlops carries the momentum factor ((88 + 8*(nMom-1)) *
+  // nEpTotal per (site,l,r)), so GFlop/s stays honest across nMom. The
+  // output tensor needs no semantic (g,p) split: the (1, nGamma*nmom)
+  // product shape passes the worker's dims-0/1 gate.
+  // ====================================================================
+  if (flagMom && nmom > 0) {
+    for (auto &b : batches) {
+      Eigen::Tensor<ComplexD, 5> mat(1, (int)b.gammas.size() * nmom, Nt,
+                                     nevec, nevec);
+      A2AWorkerSpinTasteStencil<FImpl> worker(grid, ph, b.gammas, &U,
+                                              orthogDir);
+
+      double fp = worker._stencil_task->getFlops();
+      double flops = totalFlops(fp, volume, nevec, nevec);
+
+      std::ostringstream lbl;
+      lbl << "StencilMom/" << b.label << "[" << b.gammas.size() << "γ]["
+          << nmom << "p]";
+      auto res = runBench(lbl.str(), flops, 0, nrep, [&] {
+        worker.resetCache();
+        mat.setZero();
+        worker.StagMesonField(mat, vecs.data(), vecs.data(), nevec, nevec);
+      });
+      printResult(res);
+    }
+  }
+
+  // ====================================================================
+  // 6. J.A local + one-link (--ja)
+  // Random stand-in fields (throughput only; channel content is
+  // irrelevant). J.A local: 4 channels, no gauge field. J.A one-link: the
+  // same 4 fields dressing the X,Y,Z,T links. Both run with momentum when
+  // --mom is also active.
+  // ====================================================================
+  if (flagJA) {
+    std::vector<ComplexField> chan(4, grid);
+    {
+      GridParallelRNG rng(grid);
+      rng.SeedFixedIntegers(std::vector<int>{41, 42, 43, 44});
+      for (auto &f : chan) { f = Zero(); random(rng, f); }
+    }
+    int nMomEff = (flagMom && nmom > 0) ? nmom : 1;
+
+    // J.A local.
+    {
+      Eigen::Tensor<ComplexD, 5> mat(1, 4 * nMomEff, Nt, nevec, nevec);
+      A2AWorkerSpinTasteStencil<FImpl> worker(
+          grid, (flagMom && nmom > 0) ? ph : emptyMom, chan, orthogDir);
+
+      double fp = worker._stencil_task->getFlops();
+      double flops = totalFlops(fp, volume, nevec, nevec);
+
+      auto res = runBench("JALocal[4ch]", flops, 0, nrep, [&] {
+        worker.resetCache();
+        mat.setZero();
+        worker.StagMesonField(mat, vecs.data(), vecs.data(), nevec, nevec);
+      });
+      printResult(res);
+    }
+
+    // J.A one-link.
+    {
+      Eigen::Tensor<ComplexD, 5> mat(1, 4 * nMomEff, Nt, nevec, nevec);
+      A2AWorkerSpinTasteStencil<FImpl> worker(
+          grid, (flagMom && nmom > 0) ? ph : emptyMom, chan, &U, orthogDir);
+
+      double fp = worker._stencil_task->getFlops();
+      double flops = totalFlops(fp, volume, nevec, nevec);
+
+      auto res = runBench("JA1link[4ch]", flops, 0, nrep, [&] {
         worker.resetCache();
         mat.setZero();
         worker.StagMesonField(mat, vecs.data(), vecs.data(), nevec, nevec);

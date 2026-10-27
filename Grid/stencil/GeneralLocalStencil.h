@@ -88,6 +88,9 @@ public:
     this->_entries.resize(npoints* osites);
     this->_entries_p = &_entries[0];
 
+    int nentries = this->_entries.size();
+    std::vector<GeneralStencilEntry> hostEntries(nentries); // host-side storage for stencil entries
+
     thread_for(site, osites, {
 	Coordinate Coor;
 	Coordinate NbrCoor;
@@ -145,9 +148,11 @@ public:
 	  ////////////////////////////////////////////////
 	  // Store in look up table
 	  ////////////////////////////////////////////////
-	  acceleratorPut(this->_entries[lex],SE);
+	  hostEntries[lex] = SE;
 	}
       });
+    // Bulk copy the lookup table to the device
+    acceleratorCopyToDevice(&hostEntries[0], this->_entries_p, nentries*sizeof(GeneralStencilEntry));
   }
   
 };
