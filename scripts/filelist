@@ -86,10 +86,11 @@ for f in $TESTS; do
 done
 cd ..
 
-# GridMilc Make.inc (exclude tests/ from the static archive sources)
+# GridMilc Make.inc (exclude tests/ and benchmarks/ from the static archive
+# sources; both build their own executables)
 cd $home/GridMilc
-HFILES=`find . -type f -name '*.h' -not -path './tests/*'`
-CCFILES=`find . -type f -name '*.cc' -not -path './tests/*'`
+HFILES=`find . -type f -name '*.h' -not -path './tests/*' -not -path './benchmarks/*'`
+CCFILES=`find . -type f -name '*.cc' -not -path './tests/*' -not -path './benchmarks/*'`
 echo HFILES=$HFILES > Make.inc
 echo >> Make.inc
 echo CCFILES=$CCFILES >> Make.inc

@@ -848,8 +848,10 @@ case ${ac_COMMS} in
 	echo MPI_CFLAGS $MPI_CFLAGS
         AM_CXXFLAGS="$MPI_CXXFLAGS $AM_CXXFLAGS"
         AM_CFLAGS="$MPI_CFLAGS $AM_CFLAGS"
-        AM_LDFLAGS="`echo $MPI_CXXLDFLAGS | sed -E 's/-l@<:@^ @:>@+//g'` $AM_LDFLAGS"
-        LIBS="`echo $MPI_CXXLDFLAGS | sed -E 's/-L@<:@^ @:>@+//g'` $LIBS";;
+        # Match -l/-L only at the start of a token, so combined flags such as
+        # Cray's -Wl,--whole-archive,-lhugetlbfs,--no-whole-archive stay intact.
+        AM_LDFLAGS="`echo $MPI_CXXLDFLAGS | sed -E 's/(^| )-l@<:@^ @:>@+//g'` $AM_LDFLAGS"
+        LIBS="`echo $MPI_CXXLDFLAGS | sed -E 's/(^| )-L@<:@^ @:>@+//g'` $LIBS";;
     *)
         ;;
 esac
