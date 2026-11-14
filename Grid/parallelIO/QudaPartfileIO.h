@@ -178,6 +178,51 @@ static inline int64_t qudaIoSite(GridBase *grid, int cb, int s, Coordinate &lful
   return gs;
 }
 
+// Return the global site index used by QUDA/QIO for checksum and sitelist:
+// lex_index(gcoor, fdims) where gcoor is the rb-grid global coordinate
+// (x in [0, X/2)) and fdims are the FULL-lattice dimensions.
+// This maps the rb-grid coordinate directly onto the lower half of the
+// full-lattice index space WITHOUT adding the parity bit to x, matching
+// how QUDA and QudaPartfileWriter tag each storage position.
+static inline int64_t qudaIoFdimsGs(GridBase *grid, int s)
+{
+  int nd = grid->_ndimension;
+  const Coordinate &io_ldims  = grid->LocalDimensions();
+  const Coordinate &io_lstart = grid->LocalStarts();
+  const Coordinate &fdims     = grid->_fdimensions;
+  Coordinate lcoor(nd), gcoor(nd);
+  Lexicographic::CoorFromIndex(lcoor, s, io_ldims);
+  for (int d = 0; d < nd; d++) gcoor[d] = lcoor[d] + io_lstart[d];
+  int64_t gs;
+  Lexicographic::IndexFromCoor(gcoor, gs, fdims);
+  return gs;
+}
+
+// Like qudaIoSite but returns qudaIoFdimsGs (full-lattice strides on
+// rb-grid coordinate, no parity reconstruction) for checksum compatibility
+// with files written by QUDA.  Sets lfull the same way as qudaIoSite
+// (local full-lattice coordinate for pokeLocalSite).
+static inline int64_t qudaIoSiteFullGs(GridBase *grid, int cb, int s, Coordinate &lfull)
+{
+  int nd = grid->_ndimension;
+  const Coordinate &io_ldims  = grid->LocalDimensions();
+  const Coordinate &io_lstart = grid->LocalStarts();
+
+  Coordinate lcoor(nd), gcoor(nd);
+  Lexicographic::CoorFromIndex(lcoor, s, io_ldims);
+  for (int d = 0; d < nd; d++) gcoor[d] = lcoor[d] + io_lstart[d];
+
+  lfull = lcoor;
+  GRID_ASSERT(grid->_isCheckerBoarded && grid->CheckerBoarded(0));
+  int psum = cb;
+  for (int d = 1; d < nd; d++) psum += gcoor[d];
+  lfull[0] = 2 * lcoor[0] + (psum & 1);   // local full-x for pokeLocalSite
+
+  // gs uses rb-grid gcoor with full-lattice strides (no parity bit added to x).
+  // This matches the sitelist written by QudaPartfileWriter and read by QUDA.
+  return qudaIoFdimsGs(grid, s);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // QudaPartfileWriter
 //
@@ -250,7 +295,13 @@ public:
 
     // scidac-private-file-xml (MB=1, ME=0)
     scidacFile sf(grid);
-    sf.setDimensions(grid->GlobalDimensions());   // X/2 for red-black grids
+    // For a checkerboard grid write the full-lattice dimensions so the reader
+    // detects legacyDims=true and uses fdims-strides for checksum verification,
+    // matching the fdims-strides used by qudaIoFdimsGs in writeEvecFieldRecord.
+    if (grid->_isCheckerBoarded)
+      sf.setDimensions(grid->_fdimensions);
+    else
+      sf.setDimensions(grid->GlobalDimensions());
     sf.volfmt = GRID_IO_MULTIFILE;
     writeLimeObject(1, 0, sf, std::string("scidacFile"), SCIDAC_PRIVATE_FILE_XML);
 
@@ -421,8 +472,8 @@ public:
       // Byte-swap to BE and checksum, one site at a time.
       // After this loop the chunk is in BE order, ready to write.
       for (int ds = 0; ds < ns; ds++) {
-        Coordinate lcoor(nd);
-        int64_t gs = qudaIoSite(grid, cb, s0 + ds, lcoor);
+        // gs uses fdims-based formula to match the sitelist (QUDA convention).
+        int64_t gs = qudaIoFdimsGs(grid, s0 + ds);
 
         int    base        = ds * Nvec * vlen;
         size_t site_bytes  = (size_t)Nvec * vlen * elem_bytes;
@@ -460,15 +511,15 @@ private:
   // Write scidac-sitelist: lsites big-endian uint64_t global site indices.
   void writeSitelistRecord(GridBase *grid, int MB, int ME)
   {
-    int nd     = grid->_ndimension;
     int lsites = grid->lSites();
 
-    // The global index does not depend on the parity, so cb=0 is fine here.
+    // Use fdims-based gs (qudaIoFdimsGs) so the sitelist matches QUDA's
+    // convention: gs = lex_index(gcoor, fdims) with gcoor from the rb-grid
+    // and fdims = full-lattice dimensions.  This is consistent with the
+    // checksum computation in writeEvecFieldRecord.
     std::vector<uint64_t> sitelist(lsites);
-    for (int s = 0; s < lsites; s++) {
-      Coordinate lfull(nd);
-      sitelist[s] = (uint64_t)qudaIoSite(grid, 0, s, lfull);
-    }
+    for (int s = 0; s < lsites; s++)
+      sitelist[s] = (uint64_t)qudaIoFdimsGs(grid, s);
     uint64_t nbytes = (uint64_t)lsites * sizeof(uint64_t);
     htobe64_v(sitelist.data(), (uint32_t)nbytes);
     writeLimeBinaryRecord(sitelist.data(), nbytes, MB, ME, SCIDAC_SITELIST);
@@ -546,15 +597,16 @@ public:
     int Nvec = (int)evecs.size();
     open(stem, grid);
 
-    // hdr = {singlePrec, cb, have_evals, Nfile}, parsed by the master and
-    // broadcast.
-    int hdr[4] = {1, Even, 0, Nvec};
+    // hdr = {singlePrec, cb, have_evals, Nfile, legacyDims}, parsed by the
+    // master and broadcast.
+    int hdr[5] = {1, Even, 0, Nvec, 0};  // last element: legacyDims flag
     if (master) readMasterHeader(evals, grid, nColor, nSpin, hdr);
     grid->Broadcast(qudaMasterRank(grid), (void *)hdr, sizeof(hdr));
     bool singlePrec = hdr[0];
     int  cb         = hdr[1];
     bool have_evals = hdr[2];
     int  Nfile      = hdr[3];
+    bool legacyDims = hdr[4];
 
     if (Nfile < Nvec) {
       std::cerr << "QudaPartfileReader: file " << qudaPartfileName(stem, 0)
@@ -564,7 +616,7 @@ public:
     }
 
     // -- Read binary eigenvector data (chunked, de-interleave, checksum).
-    readEvecBinaryData<vobj>(evecs, grid, cb, nColor, nSpin, singlePrec, Nfile);
+    readEvecBinaryData<vobj>(evecs, grid, cb, nColor, nSpin, singlePrec, Nfile, legacyDims);
 
     // -- Current order: optional eigenvalue record follows the field record.
     if (master && !have_evals) {
@@ -603,24 +655,47 @@ private:
   // (write_spinor_field via QIO), whose record XML differ.
   // -------------------------------------------------------------------------
   void readMasterHeader(std::vector<ComplexD> &evals, GridBase *grid,
-                        int nColor, int nSpin, int hdr[4])
+                        int nColor, int nSpin, int hdr[5])
   {
     // -- Message 1: check the lattice dimensions in the private file XML.
     // Sitelist and file-xml follow; they are skipped by the next scan.
     {
       std::string pfx;
       readLimeObject(pfx, std::string(SCIDAC_PRIVATE_FILE_XML));
-      std::istringstream ds(qudaXmlTag(pfx, "dims"));
+      std::string dims_str = qudaXmlTag(pfx, "dims");
       Coordinate gdims = grid->GlobalDimensions();
-      bool ok = true;
-      for (int d = 0; d < grid->_ndimension; d++) {
-        int n = -1;
-        ds >> n;
-        if (n != gdims[d]) ok = false;
+      // Also accept full-lattice dims for a checkerboard grid: files written
+      // by older code (and by QUDA itself) store the full lattice dimensions
+      // in the header even when the binary data covers only one parity.
+      // The on-disk site indices always use the checkerboard dimensions.
+      bool match_g = true, match_f = false;
+      {
+        std::istringstream ds(dims_str);
+        for (int d = 0; d < grid->_ndimension; d++) {
+          int n = -1; ds >> n;
+          if (n != gdims[d]) { match_g = false; break; }
+        }
       }
-      if (!ok) {
+      if (!match_g && grid->_isCheckerBoarded) {
+        const Coordinate &fdims = grid->_fdimensions;
+        match_f = true;
+        std::istringstream ds(dims_str);
+        for (int d = 0; d < grid->_ndimension; d++) {
+          int n = -1; ds >> n;
+          if (n != fdims[d]) { match_f = false; break; }
+        }
+        if (match_f) {
+	  std::cerr << GridLogMessage
+		    << "QudaPartfileReader: file has full-lattice dims "
+		    << fdims << " for a checkerboard grid (legacy/QUDA "
+		    << "format); binary site indices use checkerboard "
+		    << "dims " << gdims << ".\n";
+          hdr[4] = 1;   // legacy: use full-lattice gs for checksum
+        }
+      }
+      if (!match_g && !match_f) {
         std::cerr << "QudaPartfileReader: lattice dimensions in file ("
-                  << qudaXmlTag(pfx, "dims") << ") do not match grid "
+                  << dims_str << ") do not match grid "
                   << gdims << ". Aborting.\n";
         GRID_ASSERT(0);
       }
@@ -670,13 +745,24 @@ private:
       std::string subset = qudaXmlTag(rxml_str, "subset");
       std::string parity = qudaXmlTag(rxml_str, "parity");
       if (grid->_isCheckerBoarded) {
-        if (subset != "parity" || (parity != "even" && parity != "odd")) {
+        if (subset == "parity" && (parity == "even" || parity == "odd")) {
+          cb = (parity == "even") ? Even : Odd;
+        } else if (subset == "full" && parity == "full") {
+          // Legacy/QUDA files for a checkerboard grid may carry subset=full
+          // parity=full in the record XML.  QUDA's staggered preconditioned
+          // eigensolver operates on the Even checkerboard, so default to Even.
+          cb = Even;
+	  std::cerr << GridLogMessage
+		    << "QudaPartfileReader: record XML has subset=full"
+		    << " parity=full for a checkerboard grid (legacy/QUDA"
+		    << " format); assuming Even parity.\n";
+        } else {
           std::cerr << "QudaPartfileReader: red-black grid requires subset=parity"
-                    << " and parity=even|odd; file has subset=" << subset
+                    << " and parity=even|odd (or legacy subset=full parity=full);"
+                    << " file has subset=" << subset
                     << " parity=" << parity << ". Aborting.\n";
           GRID_ASSERT(0);
         }
-        cb = (parity == "even") ? Even : Odd;
       } else if (subset != "full") {
         std::cerr << "QudaPartfileReader: full grid requires subset=full;"
                   << " file has subset=" << subset << ". Aborting.\n";
@@ -737,6 +823,7 @@ private:
                           GridBase *grid, int cb,
                           int nColor, int nSpin,
                           bool singlePrec, int Nfile,
+                          bool legacyDims = false,
                           int chunk_sites = 1024)
   {
     typedef typename vobj::scalar_object sobj;
@@ -777,7 +864,9 @@ private:
       // Process site by site: checksum on BE, byte-swap, poke into Grid.
       for (int ds = 0; ds < ns; ds++) {
         Coordinate lcoor(nd);
-        int64_t gs = qudaIoSite(grid, cb, s0 + ds, lcoor);
+        int64_t gs = legacyDims
+          ? qudaIoSiteFullGs(grid, cb, s0 + ds, lcoor)
+          : qudaIoSite(grid, cb, s0 + ds, lcoor);
 
         size_t base        = (size_t)ds * Nfile * vlen;
         size_t site_bytes  = (size_t)Nfile * vlen * elem_bytes;
